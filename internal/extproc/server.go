@@ -34,6 +34,7 @@ import (
 
 	"github.com/kubescape/sandbox-gateway/internal/eventstream"
 	"github.com/kubescape/sandbox-gateway/internal/sse"
+	"github.com/kubescape/sandbox-gateway/internal/streamfmt"
 	"github.com/kubescape/sandbox-gateway/internal/wsframe"
 	"github.com/kubescape/sandbox-gateway/pkg/plugin"
 )
@@ -140,19 +141,19 @@ func New(cfg Config) *Server {
 
 // txn is the per-stream state. One ext_proc stream is one HTTP transaction.
 type txn struct {
-	rec        Record
-	scan       plugin.Scan // request body, scanned as it streams (no buffering); nil when not inspected
-	held       []byte      // enforce: the newest request chunk, not yet forwarded
-	holding    bool
-	wsIn       wsframe.Decoder
-	wsOut      wsframe.Decoder
-	reqEOSAt   time.Time
-	parser     sse.Parser
-	es         *eventstream.Decoder // set when the response is a Bedrock event stream
-	procTotal  time.Duration
-	openBlocks map[int]bool
-	eosSent    bool
-	emitted    bool
+	rec       Record
+	scan      plugin.Scan // request body, scanned as it streams (no buffering); nil when not inspected
+	held      []byte      // enforce: the newest request chunk, not yet forwarded
+	holding   bool
+	wsIn      wsframe.Decoder
+	wsOut     wsframe.Decoder
+	reqEOSAt  time.Time
+	parser    sse.Parser
+	es        *eventstream.Decoder // set when the response is a Bedrock event stream
+	procTotal time.Duration
+	track     streamfmt.Tracker // items and stop reason of the response stream
+	eosSent   bool
+	emitted   bool
 
 	// Shared with the watchdog goroutine.
 	inflightSince atomic.Int64 // unix nanos a response chunk started; 0 when none
@@ -210,7 +211,7 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 	s.Active.Add(1)
 	s.Total.Add(1)
 	defer s.Active.Add(-1)
-	t := &txn{openBlocks: map[int]bool{}}
+	t := &txn{}
 	// gRPC forbids Send once the handler has returned. Taking sendMu here waits
 	// for a watchdog Send in flight and stops any later one.
 	defer func() {
@@ -524,7 +525,7 @@ func (s *Server) responseChunk(stream extprocv3.ExternalProcessor_ProcessServer,
 func (t *txn) sseChunk(s *Server, chunk []byte, forward *[]byte, eos *bool) {
 	for _, ev := range t.parser.Feed(chunk) {
 		t.rec.SSEEvents++
-		t.track(ev)
+		t.trackEvent(ev)
 		if n := s.cfg.Faults.EarlyEOSAfterEvents; n > 0 && t.rec.SSEEvents >= n && !t.eosSent {
 			// Hostile test 3: cut here at an event boundary and close the
 			// turn with synthetic terminal events.
@@ -555,7 +556,7 @@ func (t *txn) eventStreamChunk(chunk []byte) error {
 		}
 		if json.Unmarshal(f.Payload, &p) == nil && len(p.Bytes) > 0 {
 			t.rec.SSEEvents++
-			t.track(sse.Event{Data: string(p.Bytes)})
+			t.trackEvent(sse.Event{Data: string(p.Bytes)})
 		}
 	}
 	return err
@@ -605,31 +606,12 @@ func denyResponse(reason string) *extprocv3.ImmediateResponse {
 	}
 }
 
-// track follows content blocks and stop_reason in Anthropic stream events.
-func (t *txn) track(ev sse.Event) {
-	var m struct {
-		Type  string `json:"type"`
-		Index *int   `json:"index"`
-		Delta struct {
-			StopReason string `json:"stop_reason"`
-		} `json:"delta"`
-	}
-	if json.Unmarshal([]byte(ev.Data), &m) != nil {
-		return
-	}
-	switch m.Type {
-	case "content_block_start":
-		if m.Index != nil {
-			t.openBlocks[*m.Index] = true
-		}
-	case "content_block_stop":
-		if m.Index != nil {
-			delete(t.openBlocks, *m.Index)
-		}
-	case "message_delta":
-		if m.Delta.StopReason != "" {
-			t.rec.StopReason = m.Delta.StopReason
-		}
+// trackEvent follows the items and the stop reason of the response stream, in
+// whichever of the known formats it arrives.
+func (t *txn) trackEvent(ev sse.Event) {
+	t.track.Event(ev)
+	if t.track.StopReason != "" {
+		t.rec.StopReason = t.track.StopReason
 	}
 }
 
@@ -637,7 +619,7 @@ func (t *txn) track(ev sse.Event) {
 // Anthropic API does, so SDKs finish the turn instead of raising.
 func (t *txn) terminalEvents() []byte {
 	var b strings.Builder
-	for idx := range t.openBlocks {
+	for _, idx := range t.track.Open() {
 		fmt.Fprintf(&b, "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":%d}\n\n", idx)
 	}
 	b.WriteString("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n")

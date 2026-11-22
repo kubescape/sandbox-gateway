@@ -38,7 +38,7 @@ func TestEventStreamChunkTracksAnthropicEvents(t *testing.T) {
 	} {
 		wire = append(wire, bedrockChunk(t, ev)...)
 	}
-	tx := &txn{openBlocks: map[int]bool{}, es: &eventstream.Decoder{}}
+	tx := &txn{es: &eventstream.Decoder{}}
 	// Split mid-frame to check reassembly across ext_proc chunks.
 	for _, part := range [][]byte{wire[:37], wire[37:200], wire[200:]} {
 		if err := tx.eventStreamChunk(part); err != nil {
@@ -48,8 +48,8 @@ func TestEventStreamChunkTracksAnthropicEvents(t *testing.T) {
 	if tx.rec.EventStreamFrames != 6 || tx.rec.SSEEvents != 6 {
 		t.Fatalf("frames=%d events=%d, want 6 and 6", tx.rec.EventStreamFrames, tx.rec.SSEEvents)
 	}
-	if tx.rec.StopReason != "end_turn" || len(tx.openBlocks) != 0 {
-		t.Fatalf("stop=%q open=%v", tx.rec.StopReason, tx.openBlocks)
+	if tx.rec.StopReason != "end_turn" || len(tx.track.Open()) != 0 {
+		t.Fatalf("stop=%q open=%v", tx.rec.StopReason, tx.track.Open())
 	}
 	if tx.es.Pending() != 0 {
 		t.Fatalf("pending %d bytes", tx.es.Pending())
@@ -59,7 +59,7 @@ func TestEventStreamChunkTracksAnthropicEvents(t *testing.T) {
 func TestEventStreamChunkBadCRC(t *testing.T) {
 	b := bedrockChunk(t, `{"type":"message_stop"}`)
 	b[9] ^= 0xff // corrupt the prelude CRC
-	tx := &txn{openBlocks: map[int]bool{}, es: &eventstream.Decoder{}}
+	tx := &txn{es: &eventstream.Decoder{}}
 	if err := tx.eventStreamChunk(b); err == nil {
 		t.Fatal("want a CRC error")
 	}
