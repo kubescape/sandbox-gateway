@@ -27,7 +27,7 @@ Envoy 1.40 is the minimum version. CI runs 1.40.2.
 
 ## Build and test
 
-You need Go 1.25 or newer. The integration test also needs Docker.
+You need Go 1.26 or newer. The integration test also needs Docker.
 
 ```bash
 go build ./...
