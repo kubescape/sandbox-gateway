@@ -36,8 +36,8 @@ The ticket leaves these open. Each is small, and each is stated here so a review
 1. Wire layout of the pinned maps. C1 gives the fields and their order, not the padding. This plan fixes natural C alignment: `conns` key 18 bytes (16-byte address, `u16` port, host byte order), `conns` value 40 bytes (`u64` cgroup, `u32` pid, `u32` binding, 16-byte address, `u16` port, 6 bytes of padding), `bindings` value 8 bytes (`u32` binding, `u8` posture, `u8` gate, 2 bytes of padding). `Open` checks the key and value sizes of the pinned maps and refuses to start on a mismatch. The node-agent redirect work has to match this or tell us.
 2. How a build links an evaluator. `pkg/plugin.Register` is called from an `init` function. `pkg/processor.Main()` is the whole program; a build with an evaluator is a `main` package that imports its evaluator and calls `Main`. `cmd/processor` does the same with no import.
 3. Health and evaluator state. The processor serves `GET /healthz/processor` on the unix socket `/run/kubescape-sandbox/processor-health.sock`. It answers 503 until the first informer sync, then 200 with `{"evaluator":"available|unavailable","degradedDecisions":N}`. C4 fixes only the path and the 200; the body is how the node controller learns the two values it writes into the node status.
-4. What runs without an evaluator. Identity and the decrypt-list guard still run. Nothing else decides.
-5. The decrypt-list guard blocks in every mode. A request whose host is not in the workload's decrypt list means traffic was decrypted that no policy names. It fails with a plain 403 from the framework, whatever the rule modes say, unless the decision is degraded on an `allow` pod.
+4. What runs without an evaluator. Identity and the decrypt-list guard still run. Nothing else decides: in particular a `deny` pod with no cached policy is not blocked, because with no evaluator nothing is enforced for any pod.
+5. The decrypt-list guard blocks in every mode. A request whose host is not in the workload's decrypt list means traffic was decrypted that no policy names. It fails with a plain 403 from the framework, whatever the rule modes say, unless the decision is degraded on an `allow` pod. This refuses on `allow` pods too, on purpose: the fail posture is for the gateway being unavailable, and this is the gateway having decrypted something it should have passed through, a fault in the chain match. A degraded decision on an `allow` pod passes, because there the decrypt list itself may be out of date.
 6. A slow evaluator fails the request. `Evaluate` gets a context that ends at the watchdog budget. Past it the request is refused with the evaluator's `DenyResponse`, rule `framework.evaluator-timeout`. A panic in the evaluator is recovered and treated the same way.
 7. `fail_open_window` and `destination_state`. `fail_open_window` is true when the binding's gate is not `redirecting` at request time. The processor only sees decrypted traffic, so it writes `inspected` or `blocked`; `passthrough` and `none` are written by other components.
 8. Removal has no rule and no flag. The editor runs only when a filter is set in `app.Config`, which only the test program does.
@@ -45,7 +45,7 @@ The ticket leaves these open. Each is small, and each is stated here so a review
 
 ## Open items that need an answer
 
-1. `HTTPSection` does not exist yet. C6 and C11 use `v1alpha1.HTTPSection` from `kubescape/storage`. On 2026-11-22 the storage `main` branch has no `http` section and SUB-9943 is in To Do. PRs 2 and 3 below do not need the type. PRs 4, 5 and 6 do. The recommendation is to land the storage types first and pin PR 4 to that commit. The fallback, if the storage change slips, is to pin a pseudo-version of its branch. A local stand-in type would guess field names that are not fixed yet, so this plan does not use one.
+1. `HTTPSection` does not exist yet. C6 and C11 use `v1alpha1.HTTPSection` from `kubescape/storage`. On 2026-11-22 the storage `main` branch has no `http` section and SUB-9943 is in To Do. PRs 2 and 3 below do not need the type. PRs 4, 5 and 6 do. The recommendation is to land the storage types first and pin PR 4 to that commit. The fallback, if the storage change slips, is to pin a pseudo-version of its branch. That is temporary: it is not a reproducible build and breaks if the branch is rewritten, so it is replaced by the merge commit on storage `main` as soon as the change merges, before PR 4 leaves draft. A local stand-in type would guess field names that are not fixed yet, so this plan does not use one.
 2. `request_position` on HTTP/2. C7 asks for the HTTP/2 stream id. Envoy's ext_proc attributes do not obviously carry it. Task 6.1 is a short spike. If Envoy cannot supply it, work stops there and the question goes back to the contract owner, because the backend join depends on that field.
 
 ## Pull requests
@@ -227,10 +227,10 @@ The cache is keyed on the cgroup id only (review focus 1). An entry older than `
 
 **Produces:** in `extproc.Config`, `Conns conntable.Table` and `Lookup func(ctx context.Context, cgroupID uint64) (lookup.Workload, time.Time, error)` replace `AttrLookup`. `app.Config{Listen string; Conns conntable.Table; Lookup ...; ChunkBudget time.Duration; ...}` and `app.Run(ctx context.Context, c app.Config) error`.
 
-Behaviour at request headers: parse `source.address`, look up `conns`, then `bindings`, then the workload. A parse failure, a `conns` miss, a missing binding or `ErrNotBound` ends the request with an immediate 403, `Details: "no_connection_entry"`, and a record with `Ended: "rejected"`. An identity in the `kubescape.sandbox.attribution` metadata is never used; the record gets `ppv2_ignored`.
+Behaviour at request headers: parse `source.address`, look up `conns`, then `bindings`, then the workload. A parse failure, a `conns` miss, a missing binding or `ErrNotBound` ends the request with an immediate 403 and a record with `Ended: "rejected"`. Each cause has its own reason in `Details` and on the record (`no_source_address`, `no_connection_entry`, `not_bound`, ...); the list is in `docs/features/processor.md`. A lookup that fails with nothing cached does not reject: the record carries the kernel half of the identity and the error. An identity in the `kubescape.sandbox.attribution` metadata is never used; the record gets `ppv2_ignored`.
 
 - [ ] Write failing tests in `server_test.go` with fake `Table` and lookup: `TestConnsMissRejected`; `TestUnboundCgroupRejected` (review focus 3); `TestNoSourceAddressRejected`; `TestIdentityFromTable` (the record carries namespace, pod, container, controller, binding id, posture, original destination); `TestPPv2IgnoredAndFlagged` (a forged identity in the metadata does not change the record's workload); `TestSecondRequestSameConnection` (same key twice: one `Conn` call per request, lookup served from its cache).
-- [ ] Implement. Move flag parsing and wiring from `cmd/processor/main.go` into `internal/app`; `cmd/processor` opens `conntable.Open(conntable.DefaultDir)` and the lookup socket and exits non-zero if either is missing.
+- [ ] Implement. Move flag parsing and wiring from `cmd/processor/main.go` into `internal/app`; `cmd/processor` opens `conntable.Open(conntable.DefaultDir)` and exits non-zero if the maps are missing. It does not require the lookup socket at start: a node-agent restart must not stop the processor, and lookups are cached for that case.
 - [ ] `test/processor-it/main.go`: `app.Run` with an in-memory `Table` that answers any source address with one fixed connection and binding (posture from `--posture`, default `allow`), and a lookup stub that returns one fixed workload. Build it into the fixtures image. Point the `processor` service in `test/integration/compose.yaml` at it, and add a second run with `--reject-all` that asserts the client gets a 403.
 - [ ] Run `go test -race ./...` and `test/integration/run.sh`. Commit. Open PR 3.
 
@@ -331,8 +331,8 @@ The table `decide` implements, first match wins:
 
 | Condition | Evaluate | Block | Degraded |
 |---|---|---|---|
-| No covering section cached, posture `deny` | no | yes, rule `framework.no-cached-policy` | yes |
-| No covering section cached, posture `allow` | no | no | yes |
+| No covering section cached, evaluator present, posture `deny` | no | yes, rule `framework.no-cached-policy` | yes |
+| No covering section cached (posture `allow`, or no evaluator) | no | no | yes |
 | Host not in the decrypt list, not degraded or posture `deny` | no | yes, rule `framework.host-not-decrypted` | as computed |
 | Host not in the decrypt list, degraded, posture `allow` | no | no | yes |
 | No evaluator | no | no | as computed |
@@ -341,10 +341,10 @@ The table `decide` implements, first match wins:
 | Verdict deny and enforce, degraded, posture `allow` | yes | no, recorded as would-deny | yes |
 | Anything else | yes | no | as computed |
 
-Degraded is true when the tracker says so, or when some but not all references resolved. The decrypt list is the union over the cached sections of `decrypt.exactHosts` and the names matching `decrypt.hostPatterns`, minus `decrypt.passthrough`.
+Degraded is true when the tracker says so. A reference that does not resolve starts the tracker's clock (`unresolved`), so a workload with some of its references missing is decided from the ones that resolve and is degraded five minutes later, as for any other lost source. Only the nothing-cached rows are degraded at once. With no evaluator the only row that can block is the decrypt-list guard (decision 4). The decrypt list is the union over the cached sections of `decrypt.exactHosts` and the names matching `decrypt.hostPatterns`, minus `decrypt.passthrough`.
 
 - [ ] Write failing tests for `stale`: `TestFreshIsNotDegraded`; `TestDegradedAfterFiveMinutes` (4m59s no, 5m yes, for each of the three causes); `TestUnresolvedClockStartsAtFirstMiss`; `TestRecoveryResets`.
-- [ ] Write `decide_test.go` as one table test with a row per line above, plus `TestPostureFromBindingNotSections` (sections say `onUnavailable: deny`, posture `allow`, degraded: not blocked; and the reverse: blocked).
+- [ ] Write `decide_test.go` as one table test with a row per line above, plus `TestPostureFromBindingNotSections` (sections say `onUnavailable: deny`, posture `allow`, degraded: not blocked; and the reverse: blocked), `TestNoEvaluatorDenyPodNothingCachedPasses`, and `TestOneMissingReferenceOfTwoNotDegradedAtOnce`.
 - [ ] Implement both. Commit.
 
 ### Task 5.3: wire it in, and the health path
