@@ -1,0 +1,27 @@
+FROM --platform=$BUILDPLATFORM golang:1.27.4-trixie AS builder
+
+ENV GO111MODULE=on CGO_ENABLED=0
+WORKDIR /work
+ARG TARGETOS TARGETARCH
+
+RUN --mount=target=. \
+    --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /out/node-controller -ldflags="-s -w" ./cmd/node-controller \
+    && mkdir /out/empty
+
+# static-debian13:nonroot, pinned by digest so a rebuild gets the same base.
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931
+
+COPY --from=builder /out/node-controller /usr/bin/node-controller
+# The socket directory: owned by this image's user (65532), readable by Envoy's
+# group (101). Run the container with 101 as a supplementary group so it can
+# hand its socket to that group.
+COPY --from=builder --chown=65532:101 --chmod=0750 /out/empty /run/kubescape-sandbox
+COPY --from=builder --chown=65532:65532 --chmod=0755 /out/empty /certs
+
+ARG image_version
+ENV RELEASE=$image_version
+
+USER 65532:65532
+ENTRYPOINT ["node-controller"]

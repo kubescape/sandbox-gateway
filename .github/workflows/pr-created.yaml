@@ -1,0 +1,88 @@
+name: pull_request_created
+permissions: read-all
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+    paths-ignore:
+      - '*.md'
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '*.md'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.27.4"
+  ENVOY_VERSION: v1.40.2
+
+jobs:
+  # Unit tests with the race detector, plus the org's license, secret and vulnerability scans.
+  pr-created:
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+      security-events: write
+    # Called directly, not through incluster-comp-pr-created.yaml: that wrapper sets its
+    # own job permissions without contents: read, which the checkout step needs here.
+    uses: kubescape/workflows/.github/workflows/go-basic-tests.yaml@30daba1a0d0c401f161f60ab16daa75325291601 # v1.0.208
+    with:
+      CGO_ENABLED: 0
+      GO_VERSION: "1.27.4"
+    # Only the two secrets the workflow declares, not everything the repo can see.
+    secrets:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      GITGUARDIAN_API_KEY: ${{ secrets.GITGUARDIAN_API_KEY }}
+
+  build-and-lint:
+    name: Build and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0
+          args: --timeout 10m
+
+  images:
+    name: Image build (${{ matrix.component }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [node-controller, processor]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      # Build only. Publishing to quay.io starts with the first release.
+      - name: Build image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: build/Dockerfile.${{ matrix.component }}
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: quay.io/${{ github.repository_owner }}/sandbox-gateway-${{ matrix.component }}:ci
+          build-args: image_version=ci
+
+  integration:
+    name: Integration (Envoy v1.40.2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # Envoy with deploy/envoy/envoy.yaml, the two images and the mock provider: one streamed call.
+      - name: Streamed call through Envoy
+        run: test/integration/run.sh
