@@ -112,10 +112,11 @@ static_resources:
                   # With PPv2 this is the original destination the pod dialled.
                   orig_dst: "%DOWNSTREAM_LOCAL_ADDRESS%"
                   upstream_host: "%UPSTREAM_HOST%"
-                  # PPv2 identity is connection-level metadata, which this formatter can't
-                  # read (checked 2026-11-08); ext_proc copies it into kubescape.sandbox.audit.
-                  pod_uid: "%DYNAMIC_METADATA(kubescape.sandbox.audit:pod_uid)%"
-                  pid: "%DYNAMIC_METADATA(kubescape.sandbox.audit:pid)%"
+                  # The pod, from the kernel connection table and node-agent's lookup. ext_proc
+                  # writes it into kubescape.sandbox.audit; a PPv2 identity is never used.
+                  namespace: "%DYNAMIC_METADATA(kubescape.sandbox.audit:namespace)%"
+                  pod: "%DYNAMIC_METADATA(kubescape.sandbox.audit:pod)%"
+                  fail_posture: "%DYNAMIC_METADATA(kubescape.sandbox.audit:fail_posture)%"
                   rule_id: "%DYNAMIC_METADATA(kubescape.sandbox.audit:rule_id)%"
                   action: "%DYNAMIC_METADATA(kubescape.sandbox.audit:action)%"
                   model: "%DYNAMIC_METADATA(kubescape.sandbox.audit:model)%"

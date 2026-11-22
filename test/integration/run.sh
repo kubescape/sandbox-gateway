@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # One streamed call through Envoy to the mock provider.
 # Pass: the client, trusting only the gateway CA, reads the whole stream (end_turn), and the
-# processor's transaction record shows it parsed the same stream. Two refusals are checked
-# too: a Host header that is not the decrypted name, and a passthrough name that resolves
-# to loopback.
+# processor's transaction record shows it parsed the same stream and named the pod. Refusals
+# checked too: a Host header that is not the decrypted name, a passthrough name that
+# resolves to loopback, and a connection that is not in the connection table. The shipped
+# processor image must refuse to start without the kernel tables.
 set -euo pipefail
 cd "$(dirname "$0")"
 export ENVOY_VERSION="${ENVOY_VERSION:-v1.40.2}"
@@ -21,6 +22,7 @@ trap cleanup EXIT
 
 ./make-envoy-config.sh
 "${COMPOSE[@]}" build
+"${COMPOSE[@]}" --profile tools build processor-image
 "${COMPOSE[@]}" up -d
 echo "--- envoy version"
 "${COMPOSE[@]}" exec -T envoy envoy --version | grep -F "/${ENVOY_VERSION#v}/"
@@ -35,6 +37,7 @@ sleep 1
 "${COMPOSE[@]}" logs --no-color --no-log-prefix processor | grep '"msg":"transaction"' | tail -1 | tee generated/record.json
 grep -q '"stop_reason":"end_turn"' generated/record.json
 grep -Eq '"sse_events":[1-9]' generated/record.json
+grep -q '"pod":"it-pod"' generated/record.json
 
 echo "--- a Host header that differs from the decrypted name is refused"
 "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt \
@@ -49,6 +52,21 @@ sleep 3
 hops=$("${COMPOSE[@]}" logs --no-color --no-log-prefix envoy | grep -c '"kind":"passthrough"' || true)
 echo "passthrough connections logged: $hops"
 [ "$hops" -le 5 ]
+
+echo "--- a connection that is not in the connection table is refused"
+PROCESSOR_MODE=--reject-all "${COMPOSE[@]}" up -d --force-recreate processor
+# --no-deps: otherwise compose sees the processor's changed command and recreates it.
+"${COMPOSE[@]}" run --rm -T --no-deps client streamcheck --addr envoy:443 --ca /certs/ca.crt --expect-status 403 --wait 30s
+"${COMPOSE[@]}" logs --no-color --no-log-prefix processor | grep '"msg":"transaction"' | tail -1 | tee generated/rejected.json
+grep -q '"reject_reason":"no_connection_entry"' generated/rejected.json
+"${COMPOSE[@]}" up -d --force-recreate processor
+
+echo "--- the shipped processor image does not start without the kernel tables"
+if out=$(docker run --rm sandbox-gateway/processor:it 2>&1); then
+  echo "FAIL: the processor started with no connection tables"; exit 1
+fi
+echo "$out" | tail -1
+echo "$out" | grep -q 'open the connection tables'
 
 echo "--- envoy access log"
 "${COMPOSE[@]}" logs --no-color --no-log-prefix envoy | grep '"kind":"access"' | tail -1
