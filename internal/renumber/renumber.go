@@ -10,16 +10,40 @@
 //
 // The stop reason is left as the provider sent it, also when the removed item
 // was the reason the provider stopped.
+//
+// An event too large to parse cannot be edited, and forwarding it as it came
+// could leak a removed item or a stale index. So the editor fails closed: Feed
+// returns ErrEventTooLarge, forwards nothing more, and the caller ends the
+// stream.
 package renumber
 
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"strings"
 
 	"github.com/kubescape/sandbox-gateway/internal/sse"
 	"github.com/kubescape/sandbox-gateway/internal/streamfmt"
 )
+
+// Parser limits. An event is at most maxEvent bytes of data and no line is
+// longer than maxLine; the editor holds at most maxPending bytes of an event
+// that has not ended.
+const (
+	maxLine    = 1 << 20
+	maxEvent   = 4 << 20
+	maxPending = maxEvent + maxLine
+)
+
+// ErrEventTooLarge means the stream had an event over the parser's limits. The
+// editor could not read it, so it stopped forwarding; the caller must end the
+// stream.
+var ErrEventTooLarge = errors.New("renumber: streamed event too large to edit")
+
+// itemKey names an item. Choice is the OpenAI chat choice; it is 0 for the
+// formats that have one item list.
+type itemKey struct{ choice, index int }
 
 // Filter decides whether an item is removed. It is asked once per item, at the
 // item's first event.
@@ -31,20 +55,34 @@ type Editor struct {
 	parser  sse.Parser
 	pending []byte // bytes received that do not yet end an event
 	format  streamfmt.Format
-	seen    map[int]bool // item index -> removed
-	dropped int          // events dropped so far (Responses sequence numbers)
+	seen    map[itemKey]bool // item -> removed
+	dropped int              // events dropped so far (Responses sequence numbers)
+	err     error            // set once the editor has failed closed
 }
 
 // New returns an editor that removes the items remove picks.
 func New(remove Filter) *Editor {
-	return &Editor{remove: remove, seen: map[int]bool{}}
+	e := &Editor{remove: remove, seen: map[itemKey]bool{}}
+	e.parser.MaxLine, e.parser.MaxEvent = maxLine, maxEvent
+	return e
 }
 
 // Feed takes the next chunk of the response body and returns the bytes to
 // forward for it. It holds back an incomplete trailing event, so the result
 // can be shorter than the chunk, or empty.
-func (e *Editor) Feed(chunk []byte) []byte {
+//
+// When the stream has an event too large to parse, Feed returns
+// ErrEventTooLarge, and returns it again on every later call with nothing to
+// forward.
+func (e *Editor) Feed(chunk []byte) ([]byte, error) {
+	if e.err != nil {
+		return nil, e.err
+	}
+	droppedBefore := e.parser.Dropped
 	events := e.parser.Feed(chunk)
+	if e.parser.Dropped != droppedBefore {
+		return nil, e.fail()
+	}
 	carried := len(e.pending)
 	e.pending = append(e.pending, chunk...)
 	var out []byte
@@ -55,11 +93,20 @@ func (e *Editor) Feed(chunk []byte) []byte {
 		start = end
 	}
 	e.pending = append(e.pending[:0], e.pending[start:]...)
-	return out
+	if len(e.pending) > maxPending {
+		return nil, e.fail()
+	}
+	return out, nil
+}
+
+// fail stops the editor: what it holds is dropped and nothing more is forwarded.
+func (e *Editor) fail() error {
+	e.err, e.pending = ErrEventTooLarge, nil
+	return e.err
 }
 
 // Flush returns what is still held when the stream ends: the bytes of an
-// event that never completed.
+// event that never completed. After a failure it returns nothing.
 func (e *Editor) Flush() []byte {
 	out := e.pending
 	e.pending = nil
@@ -80,8 +127,9 @@ func (e *Editor) event(ev sse.Event, raw []byte) []byte {
 		return raw
 	}
 	for _, it := range p.Starts {
-		if _, ok := e.seen[it.Index]; !ok {
-			e.seen[it.Index] = e.remove(it)
+		k := itemKey{it.Choice, it.Index}
+		if _, ok := e.seen[k]; !ok {
+			e.seen[k] = e.remove(it)
 		}
 	}
 	switch e.format {
@@ -95,11 +143,12 @@ func (e *Editor) event(ev sse.Event, raw []byte) []byte {
 	return raw
 }
 
-// shift is how far item idx moves down: the number of removed items before it.
-func (e *Editor) shift(idx int) int {
+// shift is how far an item moves down: the number of removed items before it
+// in the same list.
+func (e *Editor) shift(k itemKey) int {
 	n := 0
 	for i, removed := range e.seen {
-		if removed && i < idx {
+		if removed && i.choice == k.choice && i.index < k.index {
 			n++
 		}
 	}
@@ -111,11 +160,12 @@ func (e *Editor) indexed(ev sse.Event, raw []byte, p streamfmt.Event, key string
 	if !p.HasIndex {
 		return raw
 	}
-	if e.seen[p.Index] {
+	k := itemKey{0, p.Index}
+	if e.seen[k] {
 		e.dropped++
 		return nil
 	}
-	sh := e.shift(p.Index)
+	sh := e.shift(k)
 	if sh == 0 {
 		return raw
 	}
@@ -127,12 +177,13 @@ func (e *Editor) indexed(ev sse.Event, raw []byte, p streamfmt.Event, key string
 
 func (e *Editor) chat(ev sse.Event, raw []byte, p streamfmt.Event) []byte {
 	touched := false
-	for _, i := range p.ToolIndexes {
-		if _, ok := e.seen[i]; !ok {
+	for _, tc := range p.ToolCalls {
+		k := itemKey{tc.Choice, tc.Index}
+		if _, ok := e.seen[k]; !ok {
 			// A tool call whose first chunk carried neither id nor name.
-			e.seen[i] = e.remove(streamfmt.Item{Format: streamfmt.OpenAIChat, Index: i, Kind: "function"})
+			e.seen[k] = e.remove(streamfmt.Item{Format: streamfmt.OpenAIChat, Choice: tc.Choice, Index: tc.Index, Kind: "function"})
 		}
-		if e.seen[i] || e.shift(i) > 0 {
+		if e.seen[k] || e.shift(k) > 0 {
 			touched = true
 		}
 	}
@@ -144,6 +195,12 @@ func (e *Editor) chat(ev sse.Event, raw []byte, p streamfmt.Event) []byte {
 		choices, _ := m["choices"].([]any)
 		for _, c := range choices {
 			choice, _ := c.(map[string]any)
+			ci := 0
+			if n, ok := choice["index"].(json.Number); ok {
+				if v, err := n.Int64(); err == nil {
+					ci = int(v)
+				}
+			}
 			delta, _ := choice["delta"].(map[string]any)
 			calls, _ := delta["tool_calls"].([]any)
 			kept := calls[:0]
@@ -155,11 +212,11 @@ func (e *Editor) chat(ev sse.Event, raw []byte, p streamfmt.Event) []byte {
 					kept = append(kept, tc)
 					continue
 				}
-				i := int(i64)
-				if e.seen[i] {
+				k := itemKey{ci, int(i64)}
+				if e.seen[k] {
 					continue
 				}
-				call["index"] = i - e.shift(i)
+				call["index"] = k.index - e.shift(k)
 				kept = append(kept, tc)
 			}
 			if len(kept) > 0 {
@@ -176,15 +233,14 @@ func (e *Editor) chat(ev sse.Event, raw []byte, p streamfmt.Event) []byte {
 }
 
 func (e *Editor) responses(ev sse.Event, raw []byte, p streamfmt.Event) []byte {
-	if p.HasIndex {
-		if e.seen[p.Index] {
-			e.dropped++
-			return nil
-		}
+	k := itemKey{0, p.Index}
+	if p.HasIndex && e.seen[k] {
+		e.dropped++
+		return nil
 	}
 	sh := 0
 	if p.HasIndex {
-		sh = e.shift(p.Index)
+		sh = e.shift(k)
 	}
 	anyRemoved := false
 	for _, removed := range e.seen {
@@ -208,7 +264,7 @@ func (e *Editor) responses(ev sse.Event, raw []byte, p streamfmt.Event) []byte {
 			if output, ok := resp["output"].([]any); ok {
 				kept := make([]any, 0, len(output))
 				for i, item := range output {
-					if !e.seen[i] {
+					if !e.seen[itemKey{0, i}] {
 						kept = append(kept, item)
 					}
 				}

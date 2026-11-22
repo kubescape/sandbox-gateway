@@ -615,11 +615,22 @@ func (t *txn) trackEvent(ev sse.Event) {
 	}
 }
 
+// anthropicOpen returns the open Anthropic content blocks, or none when the
+// stream is in another format.
+func (t *txn) anthropicOpen() []int {
+	if t.track.Format != streamfmt.Anthropic {
+		return nil
+	}
+	return t.track.Open()
+}
+
 // terminalEvents closes open content blocks and ends the message the way the
 // Anthropic API does, so SDKs finish the turn instead of raising.
 func (t *txn) terminalEvents() []byte {
 	var b strings.Builder
-	for _, idx := range t.track.Open() {
+	// The tracker also holds open items of other formats; only Anthropic
+	// content blocks are closed with content_block_stop.
+	for _, idx := range t.anthropicOpen() {
 		fmt.Fprintf(&b, "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":%d}\n\n", idx)
 	}
 	b.WriteString("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n")

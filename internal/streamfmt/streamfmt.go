@@ -41,6 +41,9 @@ func (f Format) String() string {
 // content block, an OpenAI chat tool call, or an OpenAI Responses output item.
 type Item struct {
 	Format Format
+	// Choice is the OpenAI chat choice the tool call belongs to; tool call
+	// indexes are counted per choice. It is 0 for the other formats.
+	Choice int
 	Index  int
 	Kind   string // "text", "tool_use", "function", "function_call", "message", ...
 	Name   string // the tool or function name, when the item has one
@@ -53,16 +56,20 @@ type Event struct {
 	// Index is the item this event belongs to: the Anthropic "index" or the
 	// Responses "output_index". HasIndex is false for events about the whole
 	// message, and always for OpenAI chat, whose chunks can carry several
-	// tool calls (see Starts and ToolIndexes).
+	// tool calls (see Starts and ToolCalls).
 	Index    int
 	HasIndex bool
 	Starts   []Item // items whose first event this is
 	Stops    bool   // this event ends item Index
-	// ToolIndexes are the tool call indexes an OpenAI chat chunk carries.
-	ToolIndexes []int
-	StopReason  string
-	Done        bool // the stream is complete
+	// ToolCalls are the tool calls an OpenAI chat chunk carries.
+	ToolCalls  []ToolRef
+	StopReason string
+	Done       bool // the stream is complete
 }
+
+// ToolRef names one OpenAI chat tool call: its choice and its index in that
+// choice.
+type ToolRef struct{ Choice, Index int }
 
 // payload is the union of the fields read from the three formats.
 type payload struct {
@@ -83,6 +90,7 @@ type payload struct {
 		Status string `json:"status"`
 	} `json:"response"`
 	Choices []struct {
+		Index        int     `json:"index"`
 		FinishReason *string `json:"finish_reason"`
 		Delta        struct {
 			ToolCalls []struct {
@@ -158,14 +166,14 @@ func chatEvent(p payload) Event {
 			e.StopReason = *c.FinishReason
 		}
 		for _, tc := range c.Delta.ToolCalls {
-			e.ToolIndexes = append(e.ToolIndexes, tc.Index)
+			e.ToolCalls = append(e.ToolCalls, ToolRef{Choice: c.Index, Index: tc.Index})
 			// Only the first chunk of a tool call carries its id and name.
 			if tc.ID != "" || tc.Function.Name != "" {
 				kind := tc.Type
 				if kind == "" {
 					kind = "function"
 				}
-				e.Starts = append(e.Starts, Item{Format: OpenAIChat, Index: tc.Index, Kind: kind, Name: tc.Function.Name})
+				e.Starts = append(e.Starts, Item{Format: OpenAIChat, Choice: c.Index, Index: tc.Index, Kind: kind, Name: tc.Function.Name})
 			}
 		}
 	}
