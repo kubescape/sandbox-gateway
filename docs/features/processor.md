@@ -34,7 +34,20 @@ A PROXY protocol identity that arrives in the `kubescape.sandbox.attribution` me
 
 When node-agent's socket does not answer, the last answer for that cgroup is served from a cache, and the record carries `lookup_failing_since`. With no cached answer the record carries `lookup_error` and only the kernel half of the identity. Neither case is refused.
 
-The pod's namespace, pod name, container, binding id and fail posture are also written to the `kubescape.sandbox.audit` metadata, so Envoy's access log shows them.
+The lookup runs while the request headers wait, so it is kept short. One request per cgroup is in flight at a time; while it is, other requests for that cgroup get the cached answer at once. After a failed request the cgroup is not asked about again for one second. A request the client abandoned does not count as a failure.
+
+The pod's namespace, pod name, container, binding id, fail posture and original destination are also written to the `kubescape.sandbox.audit` metadata, so Envoy's access log shows them.
+
+### What the Envoy config must do
+
+The identity is only as good as `source.address`, so the listener must report the socket's own address. `deploy/envoy/envoy.yaml` does two things for that, and a config that drops either lets a pod be taken for another pod:
+
+- It has no `proxy_protocol` listener filter. That filter replaces the remote address with the one in the PROXY header, which the pod writes.
+- The HTTP connection manager sets `use_remote_address: true`. Without it Envoy takes the remote address from an `X-Forwarded-For` header.
+
+`test/integration/run.sh` sends both a forged `X-Forwarded-For` header and a PROXY protocol line and fails if the processor sees the forged address.
+
+The explicit-proxy listener (`explicit_proxy`, port 3128) cannot serve decrypted hosts with this processor. A connection that arrives through it has no socket address to look up and no `conns` entry, so every request on its decrypting chain is refused with `no_source_address`.
 
 ### Map layout
 
@@ -76,4 +89,4 @@ The record's `stop_reason` comes from `streamfmt`: Anthropic's `stop_reason`, Op
 
 `go test -race ./...` covers the packages. The pinned-map test in `internal/conntable` needs root and runs as root in CI.
 
-`test/integration/run.sh` runs Envoy with `test/processor-it`, which is the same server against an in-memory table that names one fixed pod, because the stack has no eBPF redirect. It checks a streamed call end to end, that the record names the pod, that an empty table refuses the request, and that the shipped processor image will not start without the maps.
+`test/integration/run.sh` runs Envoy with `test/processor-it`, which is the same server against an in-memory table that names one fixed pod, because the stack has no eBPF redirect. It checks a streamed call end to end, that the record names the pod, that a client cannot change the address the processor sees, that an empty table refuses the request, and that the shipped processor image will not start without the maps.

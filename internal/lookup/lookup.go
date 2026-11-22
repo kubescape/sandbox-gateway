@@ -55,10 +55,28 @@ type Workload struct {
 	Policies  []PolicyRef `json:"policies"`
 }
 
+// retryAfter is how long a cgroup's lookup is left alone after it failed.
+// Without it every request would ask a socket that is not answering, and each
+// would wait for the client timeout.
+const retryAfter = time.Second
+
+// entry is what the client knows about one cgroup.
 type entry struct {
 	w        Workload
+	have     bool // w holds an answer
 	fetched  time.Time
 	lastUsed time.Time
+	retryAt  time.Time // after a failed fetch: do not fetch again before this
+	lastErr  error     // the failure that set retryAt
+	inflight *call     // the fetch in progress, if any
+}
+
+// call is one fetch that several requests may be waiting for.
+type call struct {
+	done         chan struct{}
+	w            Workload
+	failingSince time.Time
+	err          error
 }
 
 // Client looks workloads up and caches the answers. It is safe for concurrent
@@ -95,40 +113,81 @@ func New(socket string, refresh time.Duration, now func() time.Time) *Client {
 // failed request since the socket last answered; with nothing cached the
 // error is returned. ErrNotBound is an answer, not a failure: it removes the
 // cached entry.
+//
+// At most one request per cgroup is in flight. While it is, a call for the
+// same cgroup gets the cached answer at once, or waits for the result when
+// nothing is cached. After a failure the cgroup is not asked about again for
+// retryAfter.
 func (c *Client) Workload(ctx context.Context, cgroupID uint64) (w Workload, failingSince time.Time, err error) {
 	now := c.now()
 	c.mu.Lock()
-	if e, ok := c.cache[cgroupID]; ok && now.Sub(e.fetched) < c.refresh {
-		e.lastUsed = now
-		w, failingSince = e.w, c.failingSince
-		c.mu.Unlock()
-		return w, failingSince, nil
+	e, ok := c.cache[cgroupID]
+	if !ok {
+		e = &entry{}
+		c.cache[cgroupID] = e
 	}
+	e.lastUsed = now
+	switch {
+	case e.have && now.Sub(e.fetched) < c.refresh:
+		defer c.mu.Unlock()
+		return e.w, c.failingSince, nil
+	case now.Before(e.retryAt):
+		defer c.mu.Unlock()
+		if e.have {
+			return e.w, c.failingSince, nil
+		}
+		return Workload{}, c.failingSince, e.lastErr
+	case e.inflight != nil && e.have:
+		defer c.mu.Unlock()
+		return e.w, c.failingSince, nil
+	case e.inflight != nil:
+		cl := e.inflight
+		c.mu.Unlock()
+		select {
+		case <-cl.done:
+			return cl.w, cl.failingSince, cl.err
+		case <-ctx.Done():
+			return Workload{}, time.Time{}, fmt.Errorf("lookup: %w", ctx.Err())
+		}
+	}
+	cl := &call{done: make(chan struct{})}
+	e.inflight = cl
 	c.mu.Unlock()
 
 	fresh, ferr := c.fetch(ctx, cgroupID)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	defer close(cl.done)
+	e.inflight = nil
 	c.prune(now)
 	switch {
 	case ferr == nil:
 		c.failingSince = time.Time{}
-		c.cache[cgroupID] = &entry{w: fresh, fetched: now, lastUsed: now}
-		return fresh, time.Time{}, nil
+		*e = entry{w: fresh, have: true, fetched: now, lastUsed: now}
+		c.cache[cgroupID] = e
+		cl.w = fresh
 	case errors.Is(ferr, ErrNotBound):
 		c.failingSince = time.Time{}
 		delete(c.cache, cgroupID)
-		return Workload{}, time.Time{}, ErrNotBound
+		cl.err = ErrNotBound
+	default:
+		// A caller that went away says nothing about the socket, so it starts
+		// no retry interval and does not mark the socket as failing.
+		if ctx.Err() == nil {
+			if c.failingSince.IsZero() {
+				c.failingSince = now
+			}
+			e.retryAt, e.lastErr = now.Add(retryAfter), ferr
+		}
+		cl.failingSince = c.failingSince
+		if e.have {
+			cl.w = e.w
+		} else {
+			cl.err = ferr
+		}
 	}
-	if c.failingSince.IsZero() {
-		c.failingSince = now
-	}
-	if e, ok := c.cache[cgroupID]; ok {
-		e.lastUsed = now
-		return e.w, c.failingSince, nil
-	}
-	return Workload{}, c.failingSince, ferr
+	return cl.w, cl.failingSince, cl.err
 }
 
 // prune drops entries nothing has asked for in a while. Called with mu held.

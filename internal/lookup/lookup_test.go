@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,6 +26,27 @@ type fakeAgent struct {
 	hits  atomic.Int64
 	query atomic.Value // last raw query
 	body  atomic.Value // response body; "" means 404
+	fail  atomic.Bool  // answer 500
+	hold  atomic.Value // chan struct{}: when set, a request waits for it to close
+}
+
+// block makes every request wait until the returned func is called.
+func (a *fakeAgent) block() (release func()) {
+	ch := make(chan struct{})
+	a.hold.Store(ch)
+	return func() { close(ch) }
+}
+
+// waitHits waits until the agent has seen n requests.
+func (a *fakeAgent) waitHits(t *testing.T, n int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for a.hits.Load() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("agent saw %d requests, want %d", a.hits.Load(), n)
+		}
+		runtime.Gosched()
+	}
 }
 
 func newAgent(t *testing.T) *fakeAgent {
@@ -50,6 +73,17 @@ func (a *fakeAgent) start(t *testing.T) {
 	mux.HandleFunc("GET /v1/workload", func(w http.ResponseWriter, r *http.Request) {
 		a.hits.Add(1)
 		a.query.Store(r.URL.RawQuery)
+		if ch, ok := a.hold.Load().(chan struct{}); ok {
+			select {
+			case <-ch:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		if a.fail.Load() {
+			http.Error(w, "broken", http.StatusInternalServerError)
+			return
+		}
 		body := a.body.Load().(string)
 		if body == "" {
 			http.NotFound(w, r)
@@ -198,5 +232,142 @@ func TestBadAnswerIsAFailure(t *testing.T) {
 	c := New(a.sock, 5*time.Second, time.Now)
 	if _, _, err := c.Workload(context.Background(), 1); err == nil || errors.Is(err, ErrNotBound) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// A failing socket is asked again once per retry interval, not by every
+// request, and the cached answer is served in between.
+func TestFailingSocketIsNotAskedOnEveryCall(t *testing.T) {
+	a := newAgent(t)
+	clk := newClock()
+	c := New(a.sock, 5*time.Second, clk.now)
+	if _, _, err := c.Workload(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	a.fail.Store(true)
+	clk.advance(6 * time.Second)
+	for range 3 {
+		w, failing, err := c.Workload(context.Background(), 1)
+		if err != nil || w.Pod != "coder-7d9f" || failing.IsZero() {
+			t.Fatalf("%+v failing=%v err=%v", w, failing, err)
+		}
+	}
+	if n := a.hits.Load(); n != 2 {
+		t.Fatalf("%d requests, want 2: the first answer and one failed retry", n)
+	}
+	clk.advance(retryAfter)
+	if _, _, err := c.Workload(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if n := a.hits.Load(); n != 3 {
+		t.Fatalf("%d requests after the retry interval, want 3", n)
+	}
+}
+
+// The same holds with nothing cached: the error is returned without a new request.
+func TestFailingSocketNothingCached(t *testing.T) {
+	a := newAgent(t)
+	a.fail.Store(true)
+	clk := newClock()
+	c := New(a.sock, 5*time.Second, clk.now)
+	for range 3 {
+		if _, failing, err := c.Workload(context.Background(), 1); err == nil || failing.IsZero() {
+			t.Fatalf("failing=%v err=%v", failing, err)
+		}
+	}
+	if n := a.hits.Load(); n != 1 {
+		t.Fatalf("%d requests, want 1", n)
+	}
+	// Another cgroup is not held back by this one's failure.
+	_, _, _ = c.Workload(context.Background(), 2)
+	if n := a.hits.Load(); n != 2 {
+		t.Fatalf("%d requests after asking for another cgroup, want 2", n)
+	}
+}
+
+// Requests that arrive together for one cgroup share one fetch.
+func TestOneFetchPerCgroupAtATime(t *testing.T) {
+	a := newAgent(t)
+	release := a.block()
+	c := New(a.sock, 5*time.Second, time.Now)
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w, _, err := c.Workload(context.Background(), 1)
+			if err == nil && w.Pod != "coder-7d9f" {
+				err = fmt.Errorf("workload %+v", w)
+			}
+			errs <- err
+		}()
+	}
+	a.waitHits(t, 1)
+	release()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := a.hits.Load(); n != 1 {
+		t.Fatalf("%d requests for eight concurrent calls, want 1", n)
+	}
+}
+
+// While one request refreshes an entry, the others get the cached answer at once.
+func TestCachedAnswerServedWhileRefreshing(t *testing.T) {
+	a := newAgent(t)
+	clk := newClock()
+	c := New(a.sock, 5*time.Second, clk.now)
+	if _, _, err := c.Workload(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(6 * time.Second)
+	release := a.block()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, _ = c.Workload(context.Background(), 1)
+	}()
+	a.waitHits(t, 2)
+	w, _, err := c.Workload(context.Background(), 1) // must not wait for release
+	if err != nil || w.Pod != "coder-7d9f" {
+		t.Fatalf("%+v %v", w, err)
+	}
+	release()
+	<-done
+	if n := a.hits.Load(); n != 2 {
+		t.Fatalf("%d requests, want 2", n)
+	}
+}
+
+// A caller that goes away mid-fetch says nothing about the socket.
+func TestCancelledCallerIsNotASocketFailure(t *testing.T) {
+	a := newAgent(t)
+	clk := newClock()
+	c := New(a.sock, 5*time.Second, clk.now)
+	if _, _, err := c.Workload(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(6 * time.Second)
+	release := a.block()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for a.hits.Load() < 2 {
+			runtime.Gosched()
+		}
+		cancel()
+	}()
+	w, failing, err := c.Workload(ctx, 1)
+	if err != nil || w.Pod != "coder-7d9f" || !failing.IsZero() {
+		t.Fatalf("%+v failing=%v err=%v", w, failing, err)
+	}
+	release()
+	// No retry interval was started: the next call asks again and succeeds.
+	if _, failing, err := c.Workload(context.Background(), 1); err != nil || !failing.IsZero() || a.hits.Load() != 3 {
+		t.Fatalf("failing=%v err=%v hits=%d", failing, err, a.hits.Load())
 	}
 }
