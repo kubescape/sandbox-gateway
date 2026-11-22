@@ -1,6 +1,6 @@
 # Per-node egress gateway, PoC config (audit only). Target: Envoy 1.38+ (tested image: 1.40.2).
 #
-# Flow: redirected pod connection -> PROXY v2 (identity TLVs) -> tls_inspector reads the SNI.
+# Flow: redirected pod connection -> tls_inspector reads the SNI.
 #   - SNI in the exact AI-host list: TLS terminated with a per-SNI leaf from the Go SDS server
 #     (on_demand_secret) -> ext_proc (Go, FULL_DUPLEX_STREAMED, audit only) -> dynamic forward
 #     proxy -> TLS re-originated to the real upstream.
@@ -34,19 +34,11 @@ static_resources:
   - name: egress_tls
     address: { socket_address: { address: 0.0.0.0, port_value: 443 } }
     listener_filters:
-    # Stage 1: the agent's connect4 redirect prepends PPv2 with the original destination and
-    # pod identity. Local runs connect directly, hence allow_requests_without_proxy_protocol.
-    # TLV types 0xE0-0xEF are the PPv2 custom range; the numbering is ours.
-    - name: envoy.filters.listener.proxy_protocol
-      typed_config:
-        "@type": type.googleapis.com/envoy.extensions.filters.listener.proxy_protocol.v3.ProxyProtocol
-        allow_requests_without_proxy_protocol: true
-        stat_prefix: egress_pp
-        rules:
-        - { tlv_type: 0xE0, on_tlv_present: { metadata_namespace: kubescape.sandbox.attribution, key: pod_uid } }
-        - { tlv_type: 0xE1, on_tlv_present: { metadata_namespace: kubescape.sandbox.attribution, key: pid } }
-        - { tlv_type: 0xE2, on_tlv_present: { metadata_namespace: kubescape.sandbox.attribution, key: proc_start_ns } }
-        - { tlv_type: 0xE3, on_tlv_present: { metadata_namespace: kubescape.sandbox.attribution, key: cgroup_id } }
+    # No proxy_protocol filter here, on purpose. That filter replaces the connection's remote
+    # address with the one in the PROXY header, and the pod writes the first bytes of the
+    # connection. The processor keys the pod's identity on the remote address
+    # (source.address), so with the filter a pod could name another pod's address and port
+    # and be taken for it.
     - name: envoy.filters.listener.tls_inspector
       typed_config:
         "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
@@ -90,6 +82,11 @@ static_resources:
           "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
           stat_prefix: egress
           codec_type: AUTO
+          # The remote address is the socket's, never the X-Forwarded-For header's. Without
+          # this Envoy takes it from the header, and the processor keys identity on it.
+          # skip_xff_append keeps the pod's address out of the request to the provider.
+          use_remote_address: true
+          skip_xff_append: true
           upgrade_configs: [{ upgrade_type: websocket }]   # S5: does ext_proc see post-upgrade bytes?
           stream_idle_timeout: 300s
           access_log:
@@ -109,11 +106,10 @@ static_resources:
                   ttfb_ms: "%RESPONSE_DURATION%"
                   sni: "%REQUESTED_SERVER_NAME%"
                   downstream: "%DOWNSTREAM_REMOTE_ADDRESS%"
-                  # With PPv2 this is the original destination the pod dialled.
-                  orig_dst: "%DOWNSTREAM_LOCAL_ADDRESS%"
                   upstream_host: "%UPSTREAM_HOST%"
-                  # The pod, from the kernel connection table and node-agent's lookup. ext_proc
-                  # writes it into kubescape.sandbox.audit; a PPv2 identity is never used.
+                  # The pod and where it was connecting to, from the kernel connection table
+                  # and node-agent's lookup. ext_proc writes them into kubescape.sandbox.audit.
+                  orig_dst: "%DYNAMIC_METADATA(kubescape.sandbox.audit:orig_dst)%"
                   namespace: "%DYNAMIC_METADATA(kubescape.sandbox.audit:namespace)%"
                   pod: "%DYNAMIC_METADATA(kubescape.sandbox.audit:pod)%"
                   fail_posture: "%DYNAMIC_METADATA(kubescape.sandbox.audit:fail_posture)%"
@@ -138,9 +134,12 @@ static_resources:
                 response_body_mode: FULL_DUPLEX_STREAMED
                 request_trailer_mode: SEND
                 response_trailer_mode: SEND
-              # Stage 1 5-tuple path: ext_proc looks the downstream address up in the
-              # redirector's pinned map.
+              # ext_proc looks the downstream remote address up in the pinned conns map to
+              # find the pod.
               request_attributes: [source.address]
+              # kubescape.sandbox.attribution is empty with this config. It stays forwarded so
+              # that, if a proxy_protocol filter is ever added back, the processor flags the
+              # identity a client claims (ppv2_ignored) and does not use it.
               metadata_options:
                 forwarding_namespaces: { untyped: [kubescape.sandbox.attribution] }
                 receiving_namespaces: { untyped: [kubescape.sandbox.audit] }
@@ -164,6 +163,9 @@ static_resources:
             request_headers_to_add:
             - header: { key: accept-encoding, value: identity }
               append_action: OVERWRITE_IF_EXISTS_OR_ADD
+            # use_remote_address can add this header with the pod's address. The provider
+            # has no use for it.
+            request_headers_to_remove: [x-envoy-external-address]
             # The dynamic forward proxy picks the upstream from the Host header, which the
             # client controls and which need not match the SNI it was decrypted for. Only the
             # decrypted names are routable: any other Host gets a 404 and never reaches an
@@ -176,8 +178,9 @@ static_resources:
                 route: { cluster: dfp, timeout: 0s, idle_timeout: 300s }
 
     # Everything else: no TLS termination, no SDS. Forwarded by SNI and logged.
-    # Production would use an ORIGINAL_DST cluster (the PPv2 destination) instead of trusting
-    # the SNI; the PoC uses SNI DFP because local runs have no PPv2 and would loop to Envoy.
+    # Production would forward to the original destination the kernel recorded instead of
+    # trusting the SNI; this config uses SNI DFP because local runs have no redirect and
+    # would loop to Envoy.
     #
     # Loop guard: the SNI is the client's, and a name that resolves to loopback makes Envoy
     # connect to this same listener, which would pass the same ClientHello through again
@@ -222,7 +225,7 @@ static_resources:
                   start: "%START_TIME%"
                   sni: "%REQUESTED_SERVER_NAME%"
                   downstream: "%DOWNSTREAM_REMOTE_ADDRESS%"
-                  orig_dst: "%DOWNSTREAM_LOCAL_ADDRESS%"
+                  listener: "%DOWNSTREAM_LOCAL_ADDRESS%"
                   upstream_host: "%UPSTREAM_HOST%"
                   flags: "%RESPONSE_FLAGS%"
                   bytes_sent: "%BYTES_SENT%"
@@ -230,8 +233,12 @@ static_resources:
 
   # S6: explicit proxy mode (HTTPS_PROXY=http://<node>:3128) as an alternative to the eBPF
   # redirect. Envoy terminates CONNECT and sends the tunnel to mitm_internal, which runs the
-  # same SNI-gated MITM and passthrough chains as egress_tls. There is no PPv2 here: the pod
-  # is known only by its source IP.
+  # same SNI-gated MITM and passthrough chains as egress_tls.
+  #
+  # Decrypted requests do not work through this listener today. A connection that reaches
+  # mitm_internal has no socket address the processor can look up and no entry in the conns
+  # table, so the processor refuses every request on the MITM chain with a 403
+  # (no_source_address). Passthrough names still work.
   - name: explicit_proxy
     address: { socket_address: { address: 0.0.0.0, port_value: 3128 } }
     filter_chains:

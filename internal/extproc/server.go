@@ -434,6 +434,7 @@ func identityFields(id *Identity) map[string]any {
 	return map[string]any{
 		"namespace": id.Namespace, "pod": id.Pod, "container": id.Container,
 		"binding_id": float64(id.BindingID), "fail_posture": id.Posture,
+		"orig_dst": id.OrigDst,
 	}
 }
 

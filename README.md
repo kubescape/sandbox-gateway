@@ -37,7 +37,7 @@ go build ./...
 go test -race ./...
 ```
 
-The integration test builds the images, starts the node controller and a processor build with a stub connection table (`test/processor-it`) next to Envoy 1.40.2 and a mock provider, and makes one streamed call through the gateway. The client trusts only the gateway's CA, so the call fails unless Envoy served a certificate the node controller minted. It also checks refusals: a request whose `Host` header is not a decrypted name, a passthrough name that resolves to loopback, and a connection that is not in the connection table. It checks that the shipped processor image will not start without the tables.
+The integration test builds the images, starts the node controller and a processor build with a stub connection table (`test/processor-it`) next to Envoy 1.40.2 and a mock provider, and makes one streamed call through the gateway. The client trusts only the gateway's CA, so the call fails unless Envoy served a certificate the node controller minted. It also checks refusals: a request whose `Host` header is not a decrypted name, a passthrough name that resolves to loopback, and a connection that is not in the connection table. It sends a forged `X-Forwarded-For` header and a PROXY protocol line and checks that the processor still sees the socket's own address. It checks that the shipped processor image will not start without the tables.
 
 ```bash
 test/integration/run.sh

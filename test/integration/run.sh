@@ -3,8 +3,10 @@
 # Pass: the client, trusting only the gateway CA, reads the whole stream (end_turn), and the
 # processor's transaction record shows it parsed the same stream and named the pod. Refusals
 # checked too: a Host header that is not the decrypted name, a passthrough name that
-# resolves to loopback, and a connection that is not in the connection table. The shipped
-# processor image must refuse to start without the kernel tables.
+# resolves to loopback, and a connection that is not in the connection table. A client
+# must not be able to choose the address the processor looks it up by, with an
+# X-Forwarded-For header or a PROXY protocol header. The shipped processor image must
+# refuse to start without the kernel tables.
 set -euo pipefail
 cd "$(dirname "$0")"
 export ENVOY_VERSION="${ENVOY_VERSION:-v1.40.2}"
@@ -52,6 +54,20 @@ sleep 3
 hops=$("${COMPOSE[@]}" logs --no-color --no-log-prefix envoy | grep -c '"kind":"passthrough"' || true)
 echo "passthrough connections logged: $hops"
 [ "$hops" -le 5 ]
+
+echo "--- the address the processor sees is the socket's, whatever the client claims"
+forged=198.51.100.77
+"${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt --x-forwarded-for "$forged" >/dev/null
+# With a PROXY line in front, the bytes are not a TLS ClientHello, so the call must fail.
+if "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt --wait 0 \
+    --proxy-header "PROXY TCP4 $forged 192.0.2.1 4242 443" >/dev/null 2>&1; then
+  echo "FAIL: a connection that starts with a PROXY protocol header was served"; exit 1
+fi
+sleep 1
+"${COMPOSE[@]}" logs --no-color --no-log-prefix processor | grep '"msg":"transaction"' > generated/records.jsonl
+if grep -F "$forged" generated/records.jsonl; then
+  echo "FAIL: the processor saw the address the client claimed"; exit 1
+fi
 
 echo "--- a connection that is not in the connection table is refused"
 PROCESSOR_MODE=--reject-all "${COMPOSE[@]}" up -d --force-recreate processor
