@@ -1,22 +1,15 @@
 #!/usr/bin/env bash
-# Writes generated/envoy.yaml: deploy/envoy/envoy.yaml plus one route and one cluster that
-# send the AI hosts to the mock provider over plain HTTP. Nothing else changes, so the
+# Writes generated/envoy.yaml: deploy/envoy/envoy.yaml with the AI hosts' route pointed at a
+# cluster for the mock provider, over plain HTTP. Nothing else changes, so the
 # integration run exercises the shipped listener, TLS and ext_proc config.
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p generated
 python3 - <<'PY'
 s = open('../../deploy/envoy/envoy.yaml').read()
-old = """            - name: all
-              domains: ["*"]"""
-new = """            - name: anthropic_mock
-              domains: [api.anthropic.com, api.openai.com]
-              routes:
-              - match: { prefix: "/" }
-                route: { cluster: mock_anthropic, timeout: 0s, idle_timeout: 300s }
-            - name: all
-              domains: ["*"]"""
-assert s.count(old) >= 1, "route anchor not found in envoy.yaml"
+old = "                route: { cluster: dfp, timeout: 0s, idle_timeout: 300s }"
+new = "                route: { cluster: mock_anthropic, timeout: 0s, idle_timeout: 300s }"
+assert s.count(old) == 1, "route anchor not found exactly once in envoy.yaml"
 s = s.replace(old, new).rstrip() + """
 
   - name: mock_anthropic

@@ -103,3 +103,48 @@ func TestCapAndProtocolErrors(t *testing.T) {
 		t.Fatal("continuation without a start: no error")
 	}
 }
+
+// A frame may declare a huge payload. The decoder must not buffer it.
+func TestHugeFrameIsNotBuffered(t *testing.T) {
+	var d Decoder
+	hdr := []byte{0x82, 127, 0, 0, 0, 1, 0, 0, 0, 0} // FIN, binary, 2^32 bytes, unmasked
+	if _, err := d.Feed(hdr); err != nil {
+		t.Fatal(err)
+	}
+	chunk := make([]byte, 1<<20)
+	for i := 0; i < 16; i++ {
+		if msgs, err := d.Feed(chunk); err != nil || len(msgs) != 0 {
+			t.Fatalf("chunk %d: msgs=%d err=%v", i, len(msgs), err)
+		}
+	}
+	if got := d.Buffered(); got > d.MaxMessage {
+		t.Fatalf("buffered %d bytes after 16 MiB, cap is %d", got, d.MaxMessage)
+	}
+}
+
+// After a protocol error the decoder drops everything it is given.
+func TestDeadDecoderKeepsNothing(t *testing.T) {
+	var d Decoder
+	if _, err := d.Feed([]byte{0x80, 0x01, 'x'}); err != ErrProtocol { // continuation with no message open
+		t.Fatalf("err = %v, want ErrProtocol", err)
+	}
+	if !d.Dead() {
+		t.Fatal("decoder not dead after a protocol error")
+	}
+	for i := 0; i < 1000; i++ {
+		if _, err := d.Feed(make([]byte, 1024)); err != ErrProtocol {
+			t.Fatalf("feed %d: err = %v", i, err)
+		}
+	}
+	if got := d.Buffered(); got != 0 {
+		t.Fatalf("dead decoder holds %d bytes", got)
+	}
+}
+
+// A control frame larger than RFC 6455 allows is a protocol error, not a buffer.
+func TestOversizeControlFrameRejected(t *testing.T) {
+	var d Decoder
+	if _, err := d.Feed([]byte{0x89, 126, 0x01, 0x00}); err != ErrProtocol { // ping declaring 256 bytes
+		t.Fatalf("err = %v, want ErrProtocol", err)
+	}
+}

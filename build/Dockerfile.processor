@@ -7,13 +7,20 @@ ARG TARGETOS TARGETARCH
 RUN --mount=target=. \
     --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg \
-    GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /out/processor -ldflags="-s -w" ./cmd/processor
+    GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /out/processor -ldflags="-s -w" ./cmd/processor \
+    && mkdir /out/empty
 
-FROM gcr.io/distroless/static-debian13:latest
+# static-debian13:nonroot, pinned by digest so a rebuild gets the same base.
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931
 
 COPY --from=builder /out/processor /usr/bin/processor
+# The socket directory: owned by this image's user (65532), readable by Envoy's
+# group (101). Run the container with 101 as a supplementary group so it can
+# hand its socket to that group.
+COPY --from=builder --chown=65532:101 --chmod=0750 /out/empty /run/kubescape-sandbox
 
 ARG image_version
 ENV RELEASE=$image_version
 
+USER 65532:65532
 ENTRYPOINT ["processor"]

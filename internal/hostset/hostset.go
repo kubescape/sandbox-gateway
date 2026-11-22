@@ -145,6 +145,29 @@ func normalize(h string) string {
 	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(h), "."))
 }
 
+// validHostname reports whether name is a plain DNS hostname: letters, digits
+// and hyphens in dot-separated labels. A wildcard label in a pattern matches
+// any bytes, so a learned name is checked here before it joins the set that
+// Envoy's listener is built from.
+func validHostname(name string) bool {
+	if name == "" || len(name) > 253 {
+		return false
+	}
+	for _, l := range strings.Split(name, ".") {
+		if l == "" || len(l) > 63 || l[0] == '-' || l[len(l)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(l); i++ {
+			switch c := l[i]; {
+			case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-':
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // Contains reports whether name is in the set now (exact or learned). The SDS
 // server mints only for names this returns true for.
 func (s *Set) Contains(name string) bool {
@@ -164,6 +187,9 @@ func (s *Set) Contains(name string) bool {
 // a name that matches no pattern, or is already exact, is ignored.
 func (s *Set) Observe(name string) (changed bool) {
 	name = normalize(name)
+	if !validHostname(name) {
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.exact[name] {

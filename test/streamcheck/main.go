@@ -35,12 +35,14 @@ func main() {
 	host := flag.String("host", "api.anthropic.com", "SNI and Host to ask for")
 	caPath := flag.String("ca", "/certs/ca.crt", "the only CA to trust (PEM)")
 	model := flag.String("model", "claude-haiku-5-5", "model in the request")
-	wait := flag.Duration("wait", 60*time.Second, "keep retrying this long while the gateway starts")
+	wait := flag.Duration("wait", 60*time.Second, "keep retrying this long while the gateway starts; 0 tries once")
+	hostHeader := flag.String("host-header", "", "send this Host header instead of -host, to check that the gateway refuses a mismatch")
+	expect := flag.Int("expect-status", 0, "pass when the response has this status, without reading a stream")
 	flag.Parse()
 
 	deadline := time.Now().Add(*wait)
 	for {
-		res, err := call(*addr, *host, *caPath, *model)
+		res, err := call(*addr, *host, *hostHeader, *caPath, *model, *expect)
 		if err == nil {
 			_ = json.NewEncoder(os.Stdout).Encode(res)
 			return
@@ -54,7 +56,7 @@ func main() {
 	}
 }
 
-func call(addr, host, caPath, model string) (result, error) {
+func call(addr, host, hostHeader, caPath, model string, expect int) (result, error) {
 	var res result
 	pem, err := os.ReadFile(caPath)
 	if err != nil {
@@ -82,6 +84,9 @@ func call(addr, host, caPath, model string) (result, error) {
 		return res, err
 	}
 	req.Header.Set("content-type", "application/json")
+	if hostHeader != "" {
+		req.Host = hostHeader
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return res, err
@@ -90,6 +95,12 @@ func call(addr, host, caPath, model string) (result, error) {
 	res.Status, res.Proto = resp.StatusCode, resp.Proto
 	if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
 		res.Issuer = resp.TLS.PeerCertificates[0].Issuer.CommonName
+	}
+	if expect != 0 {
+		if resp.StatusCode != expect {
+			return res, fmt.Errorf("status %d, want %d", resp.StatusCode, expect)
+		}
+		return res, nil
 	}
 	if resp.StatusCode != http.StatusOK {
 		return res, fmt.Errorf("status %d", resp.StatusCode)

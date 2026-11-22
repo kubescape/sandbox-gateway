@@ -22,14 +22,19 @@ type Parser struct {
 	data     []byte
 	haveData bool
 	MaxLine  int // lines longer than this are dropped; default 1 MiB
-	Dropped  int // count of dropped over-long lines
+	MaxEvent int // an event whose data lines add up to more than this is dropped; default 4 MiB
+	Dropped  int // count of dropped over-long lines and over-size events
 	skipping bool
+	dropping bool // the event in progress went over MaxEvent
 }
 
 // Feed adds a chunk and returns the events it completed.
 func (p *Parser) Feed(chunk []byte) []Event {
 	if p.MaxLine == 0 {
 		p.MaxLine = 1 << 20
+	}
+	if p.MaxEvent == 0 {
+		p.MaxEvent = 4 << 20
 	}
 	carried := len(p.buf) // bytes from earlier chunks still in the buffer
 	p.buf = append(p.buf, chunk...)
@@ -79,6 +84,10 @@ func (p *Parser) Feed(chunk []byte) []Event {
 
 func (p *Parser) line(line []byte) (Event, bool) {
 	if len(line) == 0 {
+		if p.dropping { // over-size event: end it without dispatching
+			p.name, p.data, p.haveData, p.dropping = "", p.data[:0], false, false
+			return Event{}, false
+		}
 		if !p.haveData && p.name == "" {
 			return Event{}, false
 		}
@@ -100,6 +109,16 @@ func (p *Parser) line(line []byte) (Event, bool) {
 	case "event":
 		p.name = string(value)
 	case "data":
+		if p.dropping {
+			break
+		}
+		// A stream that never sends the blank line would otherwise grow p.data
+		// without limit, one in-bounds line at a time.
+		if len(p.data)+len(value)+1 > p.MaxEvent {
+			p.data, p.dropping = p.data[:0], true
+			p.Dropped++
+			break
+		}
 		if p.haveData {
 			p.data = append(p.data, '\n')
 		}

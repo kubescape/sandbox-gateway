@@ -98,9 +98,18 @@ func (s *Server) DeltaSecrets(stream secretv3.SecretDiscoveryService_DeltaSecret
 
 	var mu sync.Mutex           // guards sent and stream.Send
 	sent := map[string]string{} // subscribed name -> version last sent
+	closed := false             // set under mu when the handler returns; no Send after that
+	defer func() {
+		mu.Lock()
+		closed = true
+		mu.Unlock()
+	}()
 	send := func(names []string, renewOnly bool) error {
 		mu.Lock()
 		defer mu.Unlock()
+		if closed {
+			return nil
+		}
 		resp := &discoveryv3.DeltaDiscoveryResponse{TypeUrl: SecretTypeURL, Nonce: s.nextNonce()}
 		for _, name := range names {
 			sec, version, err := s.secretFor(name)

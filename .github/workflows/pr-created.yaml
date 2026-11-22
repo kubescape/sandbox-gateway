@@ -29,11 +29,14 @@ jobs:
       security-events: write
     # Called directly, not through incluster-comp-pr-created.yaml: that wrapper sets its
     # own job permissions without contents: read, which the checkout step needs here.
-    uses: kubescape/workflows/.github/workflows/go-basic-tests.yaml@547a98f361e0713832308e3f34165bb89fd9b08c # main
+    uses: kubescape/workflows/.github/workflows/go-basic-tests.yaml@30daba1a0d0c401f161f60ab16daa75325291601 # v1.0.208
     with:
       CGO_ENABLED: 0
       GO_VERSION: "1.27.4"
-    secrets: inherit
+    # Only the two secrets the workflow declares, not everything the repo can see.
+    secrets:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      GITGUARDIAN_API_KEY: ${{ secrets.GITGUARDIAN_API_KEY }}
 
   build-and-lint:
     name: Build and lint
@@ -50,7 +53,7 @@ jobs:
       - name: Lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: latest
+          version: v2.15.0
           args: --timeout 10m
 
   images:

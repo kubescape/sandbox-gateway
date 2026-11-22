@@ -31,7 +31,7 @@ func main() {
 	cacheSize := flag.Int("cache-size", 1024, "max leaves cached")
 	ttl := flag.Duration("leaf-ttl", 24*time.Hour, "leaf validity")
 	renew := flag.Duration("renew-every", time.Minute, "how often each Envoy stream is checked for renewed leaves to push (gap 4); 0 disables")
-	debug := flag.String("debug-addr", ":9101", "debug HTTP address (/stats, /debug/vars); empty disables")
+	debug := flag.String("debug-addr", "127.0.0.1:9101", "debug HTTP address (/stats, /debug/vars, and /observe with -host-patterns); it has no authentication, so keep it on loopback; empty disables")
 	flag.Parse()
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(log)

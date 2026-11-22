@@ -25,7 +25,9 @@ bootstrap_extensions:
     "@type": type.googleapis.com/envoy.extensions.bootstrap.internal_listener.v3.InternalListener
 
 admin:
-  address: { socket_address: { address: 0.0.0.0, port_value: 9901 } }   # container-local; used by the hostile tests
+  # Loopback only. The admin interface has no authentication and can stop Envoy
+  # (/quitquitquit), so nothing a pod can reach may serve it.
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
 
 static_resources:
   listeners:
@@ -161,9 +163,13 @@ static_resources:
             request_headers_to_add:
             - header: { key: accept-encoding, value: identity }
               append_action: OVERWRITE_IF_EXISTS_OR_ADD
+            # The dynamic forward proxy picks the upstream from the Host header, which the
+            # client controls and which need not match the SNI it was decrypted for. Only the
+            # decrypted names are routable: any other Host gets a 404 and never reaches an
+            # upstream. Keep this list equal to server_names above.
             virtual_hosts:
-            - name: all
-              domains: ["*"]
+            - name: ai_hosts
+              domains: ["api.anthropic.com", "api.anthropic.com:443", "api.openai.com", "api.openai.com:443"]
               routes:
               - match: { prefix: "/" }
                 route: { cluster: dfp, timeout: 0s, idle_timeout: 300s }
@@ -171,8 +177,24 @@ static_resources:
     # Everything else: no TLS termination, no SDS. Forwarded by SNI and logged.
     # Production would use an ORIGINAL_DST cluster (the PPv2 destination) instead of trusting
     # the SNI; the PoC uses SNI DFP because local runs have no PPv2 and would loop to Envoy.
+    #
+    # Loop guard: the SNI is the client's, and a name that resolves to loopback makes Envoy
+    # connect to this same listener, which would pass the same ClientHello through again
+    # without end. A connection that arrives from loopback can only be Envoy itself, so it is
+    # refused. This stops the loop; it does not stop a name that resolves to another address
+    # on the node or the cluster. Forwarding to the recorded original destination closes that.
     default_filter_chain: &passthrough_chain
       filters:
+      - name: envoy.filters.network.rbac
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC
+          stat_prefix: passthrough_loop_guard
+          rules:
+            action: DENY
+            policies:
+              from_loopback:
+                permissions: [{ any: true }]
+                principals: [{ direct_remote_ip: { address_prefix: 127.0.0.0, prefix_len: 8 } }]
       - name: envoy.filters.network.sni_dynamic_forward_proxy
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.filters.network.sni_dynamic_forward_proxy.v3.FilterConfig

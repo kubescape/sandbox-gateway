@@ -37,7 +37,7 @@ go build ./...
 go test -race ./...
 ```
 
-The integration test builds both images, starts them next to Envoy 1.40.2 and a mock provider, and makes one streamed call through the gateway. The client trusts only the gateway's CA, so the call fails unless Envoy served a certificate the node controller minted.
+The integration test builds both images, starts them next to Envoy 1.40.2 and a mock provider, and makes one streamed call through the gateway. The client trusts only the gateway's CA, so the call fails unless Envoy served a certificate the node controller minted. It also checks two refusals: a request whose `Host` header is not a decrypted name, and a passthrough name that resolves to loopback.
 
 ```bash
 test/integration/run.sh
@@ -53,7 +53,15 @@ docker build -f build/Dockerfile.node-controller -t sandbox-gateway-node-control
 docker build -f build/Dockerfile.processor -t sandbox-gateway-processor .
 ```
 
+## Running the images
+
+Both images run as a non-root user (uid 65532). Each creates its unix socket with mode 0660 and, when `SANDBOX_GATEWAY_SOCKET_GID` is set, hands it to that group so Envoy can connect. Envoy's official image runs with gid 101, so set the variable to `101` and add 101 as a supplementary group of the container. `test/integration/compose.yaml` shows the full setup.
+
+The debug HTTP servers (`-debug-addr`) have no authentication and listen on loopback by default. Keep them there.
+
 ## Envoy notes
+
+The admin interface is bound to loopback. It has no authentication and can stop Envoy, so do not expose it on an address a pod can reach.
 
 Set `node.id` and `node.cluster` in the bootstrap. Without them Envoy 1.40.2 passes `--mode validate` and then aborts on the first TLS handshake, when the on-demand certificate lookup opens its SDS subscription.
 

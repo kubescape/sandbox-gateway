@@ -56,9 +56,10 @@ type Config struct {
 	// Evaluator decides inspected requests. nil means this build has no rule
 	// evaluator: nothing is scanned, no decision is recorded and nothing is blocked.
 	Evaluator plugin.Evaluator
-	// Enforce turns would_deny into a block: the final request chunk is not
-	// forwarded (the upstream only ever saw an incomplete body, then a reset) and
-	// the client gets a provider-shaped 403. A degraded decision never blocks.
+	// Enforce turns would_deny into a block: the request body is forwarded one
+	// chunk behind, so the last chunk with data is never sent (the upstream only
+	// ever saw an incomplete body, then a reset) and the client gets a
+	// provider-shaped 403. A degraded decision never blocks.
 	Enforce bool
 	Faults  Faults
 	// ChunkBudget is the AC6 watchdog: if answering one response chunk takes
@@ -141,6 +142,8 @@ func New(cfg Config) *Server {
 type txn struct {
 	rec        Record
 	scan       plugin.Scan // request body, scanned as it streams (no buffering); nil when not inspected
+	held       []byte      // enforce: the newest request chunk, not yet forwarded
+	holding    bool
 	wsIn       wsframe.Decoder
 	wsOut      wsframe.Decoder
 	reqEOSAt   time.Time
@@ -187,9 +190,11 @@ func (s *Server) watch(stream extprocv3.ExternalProcessor_ProcessServer, t *txn,
 			}
 			s.cfg.Log.Warn("watchdog: chunk over budget, ending response fail-closed", "budget", budget)
 			t.sendMu.Lock()
-			_ = stream.Send(&extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ResponseBody{
-				ResponseBody: streamed(watchdogErrorEvent, true)}})
-			t.closed = true
+			if !t.closed { // Process may have returned while this goroutine waited
+				_ = stream.Send(&extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ResponseBody{
+					ResponseBody: streamed(watchdogErrorEvent, true)}})
+				t.closed = true
+			}
 			t.sendMu.Unlock()
 			return
 		}
@@ -206,6 +211,13 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 	s.Total.Add(1)
 	defer s.Active.Add(-1)
 	t := &txn{openBlocks: map[int]bool{}}
+	// gRPC forbids Send once the handler has returned. Taking sendMu here waits
+	// for a watchdog Send in flight and stops any later one.
+	defer func() {
+		t.sendMu.Lock()
+		t.closed = true
+		t.sendMu.Unlock()
+	}()
 	if b := s.cfg.ChunkBudget; b > 0 {
 		done := make(chan struct{})
 		defer close(done)
@@ -275,6 +287,40 @@ func (s *Server) inspects(t *txn) bool {
 	return true
 }
 
+// RuleUnevaluatedUpgrade is the rule id on a request the framework refuses to
+// pass unexamined: a WebSocket upgrade on a path the evaluator inspects. The
+// body of such a request is frames, which the evaluator cannot read.
+const RuleUnevaluatedUpgrade = "framework.websocket-on-inspected-path"
+
+// verdict records a decision on the transaction and returns the audit metadata
+// for the access log. denied is true when enforce mode blocks the request: a
+// would_deny that is not degraded.
+func (s *Server) verdict(t *txn, d plugin.Decision) (meta *structpb.Struct, denied bool) {
+	if s.cfg.Enforce && d.Action == plugin.WouldDeny && !d.Degraded {
+		d.Action = plugin.Deny
+		denied = true
+		t.rec.Ended = "denied"
+	}
+	t.rec.Decision = &d
+	fields := map[string]any{
+		"rule_id": d.RuleID, "action": string(d.Action), "model": d.Model, "reason": d.Reason,
+		"class_version": d.ClassVersion, "degraded": d.Degraded,
+	}
+	// The access log can't read the connection-level PPv2 metadata,
+	// so the identity rides along in the request's kubescape.sandbox.audit.
+	for k, v := range t.rec.Attribution {
+		fields[k] = v
+	}
+	return auditMetadata(fields), denied
+}
+
+func deny(d *plugin.Decision, meta *structpb.Struct) *extprocv3.ProcessingResponse {
+	return &extprocv3.ProcessingResponse{
+		Response:        &extprocv3.ProcessingResponse_ImmediateResponse{ImmediateResponse: denyResponse(d.Reason)},
+		DynamicMetadata: meta,
+	}
+}
+
 func (s *Server) handle(stream extprocv3.ExternalProcessor_ProcessServer, t *txn, req *extprocv3.ProcessingRequest) (*extprocv3.ProcessingResponse, error) {
 	switch v := req.Request.(type) {
 	case *extprocv3.ProcessingRequest_RequestHeaders:
@@ -314,52 +360,80 @@ func (s *Server) handle(stream extprocv3.ExternalProcessor_ProcessServer, t *txn
 		if v.RequestHeaders.GetEndOfStream() {
 			t.reqEOSAt = time.Now()
 		}
-		return &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_RequestHeaders{
-			RequestHeaders: &extprocv3.HeadersResponse{}}}, nil
+		resp := &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_RequestHeaders{
+			RequestHeaders: &extprocv3.HeadersResponse{}}}
+		// The client sets the upgrade header, so it must not be a way around the
+		// evaluator: the request is decided here, without its body.
+		if t.rec.WebSocket != nil && s.cfg.Evaluator != nil && s.cfg.Evaluator.Inspects(t.rec.Path) {
+			meta, denied := s.verdict(t, plugin.Decision{RuleID: RuleUnevaluatedUpgrade, Action: plugin.WouldDeny,
+				Reason: "websocket upgrade on an inspected path cannot be evaluated"})
+			if denied {
+				return deny(t.rec.Decision, meta), nil
+			}
+			resp.DynamicMetadata = meta
+		}
+		return resp, nil
 
 	case *extprocv3.ProcessingRequest_RequestBody:
 		chunk := v.RequestBody.GetBody()
 		eos := v.RequestBody.GetEndOfStream()
 		t.rec.RequestBytes += len(chunk)
+		inspected := t.rec.WebSocket == nil && s.inspects(t)
 		if t.rec.WebSocket != nil {
 			t.wsChunk(&t.wsIn, chunk, true)
-		} else if s.inspects(t) {
+		} else if inspected {
 			t.scan.Feed(chunk)
 		}
-		resp := &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_RequestBody{
-			RequestBody: streamed(chunk, eos)}}
-		if eos {
-			t.reqEOSAt = time.Now()
-			if s.inspects(t) {
-				d := t.scan.Decide()
-				t.rec.Decision = &d
-				fields := map[string]any{
-					"rule_id": d.RuleID, "action": string(d.Action), "model": d.Model, "reason": d.Reason,
-					"class_version": d.ClassVersion, "degraded": d.Degraded,
-				}
-				// The access log can't read the connection-level PPv2 metadata,
-				// so the identity rides along in the request's kubescape.sandbox.audit.
-				for k, v := range t.rec.Attribution {
-					fields[k] = v
-				}
-				if s.cfg.Enforce && d.Action == plugin.WouldDeny && !d.Degraded {
-					d.Action = plugin.Deny
-					t.rec.Decision = &d
-					fields["action"] = string(d.Action)
-					t.rec.Ended = "denied"
-					return &extprocv3.ProcessingResponse{
-						Response:        &extprocv3.ProcessingResponse_ImmediateResponse{ImmediateResponse: denyResponse(d.Reason)},
-						DynamicMetadata: auditMetadata(fields),
-					}, nil
-				}
-				resp.DynamicMetadata = auditMetadata(fields)
+		if !eos {
+			if !inspected || !s.cfg.Enforce {
+				return bodyResponse(chunk, false), nil
 			}
+			// Enforce: forward one chunk behind. The newest chunk stays here until
+			// the decision, so a denied request never reaches the upstream whole,
+			// even when the client ends it with an empty chunk or with trailers.
+			prev, had := t.held, t.holding
+			t.held, t.holding = chunk, true
+			if !had {
+				return nil, nil
+			}
+			return bodyResponse(prev, false), nil
+		}
+		t.reqEOSAt = time.Now()
+		if t.holding {
+			chunk = append(t.held, chunk...)
+			t.held, t.holding = nil, false
+		}
+		resp := bodyResponse(chunk, true)
+		if inspected {
+			meta, denied := s.verdict(t, t.scan.Decide())
+			if denied {
+				return deny(t.rec.Decision, meta), nil
+			}
+			resp.DynamicMetadata = meta
 		}
 		return resp, nil
 
 	case *extprocv3.ProcessingRequest_RequestTrailers:
-		return &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_RequestTrailers{
-			RequestTrailers: &extprocv3.TrailersResponse{}}}, nil
+		resp := &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_RequestTrailers{
+			RequestTrailers: &extprocv3.TrailersResponse{}}}
+		// A request that ends in trailers never has a body chunk marked end of
+		// stream, so this is where it is decided.
+		if t.rec.WebSocket == nil && t.rec.Decision == nil && s.inspects(t) {
+			t.reqEOSAt = time.Now()
+			meta, denied := s.verdict(t, t.scan.Decide())
+			if denied {
+				return deny(t.rec.Decision, meta), nil
+			}
+			resp.DynamicMetadata = meta
+			if t.holding {
+				held := t.held
+				t.held, t.holding = nil, false
+				if err := t.send(stream, bodyResponse(held, false)); err != nil {
+					return nil, err
+				}
+			}
+		}
+		return resp, nil
 
 	case *extprocv3.ProcessingRequest_ResponseHeaders:
 		h := headerMap(v.ResponseHeaders.GetHeaders())
@@ -489,6 +563,9 @@ func (t *txn) eventStreamChunk(chunk []byte) error {
 
 // wsChunk decodes WebSocket frames in one direction and updates the stats.
 func (t *txn) wsChunk(d *wsframe.Decoder, chunk []byte, in bool) {
+	if d.Dead() { // one protocol error ends decoding for this direction
+		return
+	}
 	msgs, err := d.Feed(chunk)
 	ws := t.rec.WebSocket
 	if err != nil {
@@ -566,6 +643,11 @@ func (t *txn) terminalEvents() []byte {
 	b.WriteString("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n")
 	b.WriteString("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 	return []byte(b.String())
+}
+
+func bodyResponse(body []byte, eos bool) *extprocv3.ProcessingResponse {
+	return &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_RequestBody{
+		RequestBody: streamed(body, eos)}}
 }
 
 func streamed(body []byte, eos bool) *extprocv3.BodyResponse {

@@ -29,7 +29,7 @@ func main() {
 	otlpEndpoint := flag.String("otlp-endpoint", "", "stage 4: OTLP/HTTP endpoint for transaction records (e.g. http://otel-collector:4318)")
 	enforce := flag.Bool("enforce", false, "block would_deny decisions with a provider-shaped 403; has no effect without a rule evaluator")
 	records := flag.String("records", "", "also append transaction records as JSON lines to this file")
-	debug := flag.String("debug-addr", ":9102", "debug HTTP address; empty disables")
+	debug := flag.String("debug-addr", "127.0.0.1:9102", "debug HTTP address; it has no authentication, so keep it on loopback; empty disables")
 	flag.Parse()
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(log)

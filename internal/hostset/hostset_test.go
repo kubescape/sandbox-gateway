@@ -92,3 +92,22 @@ func TestExactMustBeExact(t *testing.T) {
 		t.Fatal("pattern in the exact list must be rejected")
 	}
 }
+
+// A wildcard label matches any bytes, so a sighting is checked as a hostname before it is learned.
+func TestObserveRejectsNonHostnames(t *testing.T) {
+	s, err := New(nil, []string{"*.openai.azure.com"}, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"a b.openai.azure.com", "x\n.openai.azure.com", "a/../b.openai.azure.com", "-x.openai.azure.com", "é.openai.azure.com"} {
+		if s.Observe(bad) {
+			t.Errorf("learned %q", bad)
+		}
+	}
+	if s.Learned() != 0 {
+		t.Fatalf("learned %d names", s.Learned())
+	}
+	if !s.Observe("myres.openai.azure.com") {
+		t.Fatal("a valid name was not learned")
+	}
+}

@@ -1,6 +1,7 @@
 package sse
 
 import (
+	"bytes"
 	"reflect"
 	"testing"
 )
@@ -101,5 +102,27 @@ func TestOverlongLineWithNewlineDropped(t *testing.T) {
 	}
 	if !reflect.DeepEqual(stripEnd(got), []Event{{Name: "x", Data: "y"}}) {
 		t.Fatalf("got %#v", got)
+	}
+}
+
+// An event that never ends must not grow the parser without limit.
+func TestOversizeEventIsDropped(t *testing.T) {
+	p := Parser{MaxEvent: 4096}
+	line := []byte("data: " + string(bytes.Repeat([]byte("x"), 1000)) + "\n")
+	for i := 0; i < 100; i++ {
+		if evs := p.Feed(line); len(evs) != 0 {
+			t.Fatalf("line %d dispatched %d events", i, len(evs))
+		}
+		if len(p.data) > p.MaxEvent {
+			t.Fatalf("line %d: data buffer is %d bytes, cap %d", i, len(p.data), p.MaxEvent)
+		}
+	}
+	if p.Dropped != 1 {
+		t.Fatalf("Dropped = %d, want 1", p.Dropped)
+	}
+	// The blank line ends the dropped event without dispatching it; the next one parses.
+	evs := p.Feed([]byte("\nevent: ok\ndata: fine\n\n"))
+	if len(evs) != 1 || evs[0].Name != "ok" || evs[0].Data != "fine" {
+		t.Fatalf("after the dropped event: %+v", evs)
 	}
 }

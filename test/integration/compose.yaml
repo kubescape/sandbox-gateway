@@ -9,11 +9,13 @@ services:
   node-controller:
     build: { context: ../.., dockerfile: build/Dockerfile.node-controller }
     image: sandbox-gateway/node-controller:it
+    # The images run as a non-root user. Sockets are 0660 and handed to Envoy's group
+    # (gid 101 in the official image), which the process must belong to.
+    group_add: ["101"]
     environment:
-      # Sockets are 0660; give them to Envoy's group (gid 101 in the official image).
       SANDBOX_GATEWAY_SOCKET_GID: "101"
     command: ["--gen-ca", "--listen", "unix:///run/kubescape-sandbox/sds.sock",
-              "--allow-hosts", "api.anthropic.com,api.openai.com", "--debug-addr", ":9101"]
+              "--allow-hosts", "api.anthropic.com,api.openai.com"]
     volumes:
     - run-gateway:/run/kubescape-sandbox
     - certs:/certs
@@ -21,9 +23,10 @@ services:
   processor:
     build: { context: ../.., dockerfile: build/Dockerfile.processor }
     image: sandbox-gateway/processor:it
+    group_add: ["101"]
     environment:
       SANDBOX_GATEWAY_SOCKET_GID: "101"
-    command: ["--listen", "unix:///run/kubescape-sandbox/extproc.sock", "--debug-addr", ":9102"]
+    command: ["--listen", "unix:///run/kubescape-sandbox/extproc.sock"]
     volumes:
     - run-gateway:/run/kubescape-sandbox
 
