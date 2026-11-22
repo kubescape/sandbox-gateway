@@ -1,0 +1,53 @@
+# Integration stack: the two images this repo ships, Envoy at the pinned version, and the
+# mock provider. There is no eBPF redirect here, so the client dials Envoy directly.
+#
+#   test/integration/run.sh
+
+name: sandbox-gateway-it
+
+services:
+  node-controller:
+    build: { context: ../.., dockerfile: build/Dockerfile.node-controller }
+    image: sandbox-gateway/node-controller:it
+    environment:
+      # Sockets are 0660; give them to Envoy's group (gid 101 in the official image).
+      SANDBOX_GATEWAY_SOCKET_GID: "101"
+    command: ["--gen-ca", "--listen", "unix:///run/kubescape-sandbox/sds.sock",
+              "--allow-hosts", "api.anthropic.com,api.openai.com", "--debug-addr", ":9101"]
+    volumes:
+    - run-gateway:/run/kubescape-sandbox
+    - certs:/certs
+
+  processor:
+    build: { context: ../.., dockerfile: build/Dockerfile.processor }
+    image: sandbox-gateway/processor:it
+    environment:
+      SANDBOX_GATEWAY_SOCKET_GID: "101"
+    command: ["--listen", "unix:///run/kubescape-sandbox/extproc.sock", "--debug-addr", ":9102"]
+    volumes:
+    - run-gateway:/run/kubescape-sandbox
+
+  mock-anthropic:
+    build: { context: ../.., dockerfile: test/Dockerfile }
+    image: sandbox-gateway/test-fixtures:it
+    command: ["mock-anthropic", "--listen", ":8080"]
+
+  envoy:
+    image: envoyproxy/envoy:${ENVOY_VERSION:-v1.40.2}
+    depends_on: [node-controller, processor, mock-anthropic]
+    command: ["envoy", "-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
+    volumes:
+    - run-gateway:/run/kubescape-sandbox
+    - ./generated/envoy.yaml:/etc/envoy/envoy.yaml:ro
+
+  client:
+    image: sandbox-gateway/test-fixtures:it
+    profiles: [tools]
+    depends_on: [envoy]
+    command: ["streamcheck", "--addr", "envoy:443", "--ca", "/certs/ca.crt"]
+    volumes:
+    - certs:/certs:ro
+
+volumes:
+  run-gateway: {}
+  certs: {}

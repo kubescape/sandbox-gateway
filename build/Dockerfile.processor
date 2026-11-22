@@ -1,0 +1,19 @@
+FROM --platform=$BUILDPLATFORM golang:1.27.4-trixie AS builder
+
+ENV GO111MODULE=on CGO_ENABLED=0
+WORKDIR /work
+ARG TARGETOS TARGETARCH
+
+RUN --mount=target=. \
+    --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /out/processor -ldflags="-s -w" ./cmd/processor
+
+FROM gcr.io/distroless/static-debian13:latest
+
+COPY --from=builder /out/processor /usr/bin/processor
+
+ARG image_version
+ENV RELEASE=$image_version
+
+ENTRYPOINT ["processor"]

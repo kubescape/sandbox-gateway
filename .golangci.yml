@@ -1,0 +1,19 @@
+version: "2"
+
+# The exclusions below cover findings that came in with the PoC code. The seed moved that
+# code without changing it, so they are listed here and get fixed with the code they are in.
+linters:
+  settings:
+    errcheck:
+      exclude-functions:
+        - (io.Closer).Close
+        - (io.ReadCloser).Close
+        - (net.Listener).Close
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters: [errcheck]
+      - path: ^test/
+        linters: [errcheck]
+      - path: ^internal/sse/sse\.go
+        linters: [ineffassign]
