@@ -15,5 +15,3 @@ linters:
         linters: [errcheck]
       - path: ^test/
         linters: [errcheck]
-      - path: ^internal/sse/sse\.go
-        linters: [ineffassign]

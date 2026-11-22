@@ -44,7 +44,6 @@ func (p *Parser) Feed(chunk []byte) []Event {
 		i := bytes.IndexAny(p.buf, "\r\n")
 		if i < 0 {
 			if len(p.buf) > p.MaxLine {
-				consumed += len(p.buf)
 				p.buf = p.buf[:0]
 				if !p.skipping {
 					p.Dropped++
