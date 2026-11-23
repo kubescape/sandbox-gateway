@@ -126,3 +126,41 @@ func TestOversizeEventIsDropped(t *testing.T) {
 		t.Fatalf("after the dropped event: %+v", evs)
 	}
 }
+
+// A lone CR ends a line. When it is the last byte of the stream, Feed cannot
+// tell it from the first half of a CRLF; Close settles it.
+func TestCloseDispatchesEventEndedByLoneCR(t *testing.T) {
+	var p Parser
+	if evs := p.Feed([]byte("event: a\rdata: 1\r\r")); len(evs) != 0 {
+		t.Fatalf("Feed dispatched %v before the stream ended", evs)
+	}
+	evs := p.Close()
+	if want := []Event{{Name: "a", Data: "1"}}; !reflect.DeepEqual(evs, want) {
+		t.Fatalf("Close = %#v", evs)
+	}
+	if p.Pending() != 0 {
+		t.Fatalf("Pending = %d after Close", p.Pending())
+	}
+}
+
+func TestCloseDiscardsUnfinishedEvent(t *testing.T) {
+	for _, s := range []string{"data: 1\n", "data: 1\r", "data: 1", "data: 1\n\ndata: 2\r"} {
+		var p Parser
+		p.Feed([]byte(s))
+		if evs := p.Close(); len(evs) != 0 {
+			t.Fatalf("%q: Close = %#v", s, evs)
+		}
+		// The parser is reset: nothing of the old event leaks into a new one.
+		if evs := p.Feed([]byte("data: x\n\n")); len(evs) != 1 || evs[0].Data != "x" || evs[0].Name != "" {
+			t.Fatalf("%q: after Close, Feed = %#v", s, evs)
+		}
+	}
+}
+
+func TestCloseAfterCompleteStreamIsEmpty(t *testing.T) {
+	var p Parser
+	p.Feed([]byte(stream))
+	if evs := p.Close(); len(evs) != 0 {
+		t.Fatalf("Close = %#v", evs)
+	}
+}

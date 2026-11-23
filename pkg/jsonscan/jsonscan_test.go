@@ -3,6 +3,7 @@ package jsonscan
 import (
 	"errors"
 	"io"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -62,6 +63,27 @@ func TestLastDuplicateWins(t *testing.T) {
 	}
 	if got["model"] != "b" {
 		t.Fatalf("got %v", got)
+	}
+}
+
+// "" is a valid key. Asking for it must work, and other keys must not be
+// taken for it.
+func TestEmptyKey(t *testing.T) {
+	for doc, want := range map[string]map[string]string{
+		`{"":"a"}`:                      {"": "a"},
+		`{"":"a","":"b"}`:               {"": "b"},
+		`{"":"a","":1}`:                 {},
+		`{"x":"y"}`:                     {},
+		`{"":"a","model":"m","":"c"}`:   {"": "c", "model": "m"},
+		`{"model":"m","":{"":"inner"}}`: {"model": "m"},
+	} {
+		got, err := Fields(strings.NewReader(doc), 256, "", "model")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: got %v, want %v", doc, got, want)
+		}
 	}
 }
 

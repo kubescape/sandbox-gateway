@@ -62,7 +62,8 @@ type scanner struct {
 	started, notObject, done bool
 	depth                    int
 	expectKey                bool   // at depth 1: the next string is a key
-	key                      string // the wanted key whose value comes next; "" otherwise
+	key                      string // the wanted key whose value comes next, when matched
+	matched                  bool   // the last key read is one of the wanted keys
 	valuePending             bool   // at depth 1: a ':' was read and its value has not started
 
 	inStr, esc bool
@@ -105,7 +106,7 @@ func (s *scanner) step(c byte) {
 			s.capture, s.limit = capKey, s.maxKey
 		case s.valuePending:
 			s.valuePending = false
-			if s.key != "" {
+			if s.matched {
 				delete(s.out, s.key)
 				s.capture, s.limit = capValue, s.max
 			}
@@ -116,7 +117,7 @@ func (s *scanner) step(c byte) {
 		}
 	case ',':
 		if s.depth == 1 {
-			s.expectKey, s.key, s.valuePending = true, "", false
+			s.expectKey, s.key, s.matched, s.valuePending = true, "", false, false
 		}
 	case '{', '[':
 		s.otherValue()
@@ -135,7 +136,7 @@ func (s *scanner) step(c byte) {
 func (s *scanner) otherValue() {
 	if s.depth == 1 && s.valuePending {
 		s.valuePending = false
-		if s.key != "" {
+		if s.matched {
 			delete(s.out, s.key)
 		}
 	}
@@ -192,9 +193,9 @@ func (s *scanner) endString() {
 	s.inStr = false
 	switch s.capture {
 	case capKey:
-		s.expectKey, s.key = false, ""
+		s.expectKey, s.key, s.matched = false, "", false
 		if !s.over && s.want[string(s.buf)] {
-			s.key = string(s.buf)
+			s.key, s.matched = string(s.buf), true
 		}
 	case capValue:
 		if !s.over {

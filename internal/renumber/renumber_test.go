@@ -95,7 +95,7 @@ func decode(t *testing.T, stream string) []map[string]any {
 	t.Helper()
 	var p sse.Parser
 	var out []map[string]any
-	for _, ev := range p.Feed([]byte(stream)) {
+	for _, ev := range append(p.Feed([]byte(stream)), p.Close()...) {
 		if ev.Data == "[DONE]" {
 			continue
 		}
@@ -235,11 +235,55 @@ func TestPartialEventHeld(t *testing.T) {
 	}
 }
 
-func TestFlushReturnsUnfinishedTail(t *testing.T) {
+// An event cut off by the end of the stream is one an SSE client discards.
+// The editor drops it rather than forward bytes it could not read.
+func TestFlushDropsUnfinishedEvent(t *testing.T) {
 	e := New(named("bash"))
-	_, _ = e.Feed([]byte(aStart + "event: content_bl"))
-	if out := e.Flush(); string(out) != "event: content_bl" {
+	_, _ = e.Feed([]byte(aStart + "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"name\":\"bash\"}}\n"))
+	if out := e.Flush(); len(out) != 0 {
 		t.Fatalf("flush = %q", out)
+	}
+}
+
+func TestFlushReturnsTailOfUneditedStream(t *testing.T) {
+	e := New(named("bash"))
+	_, _ = e.Feed([]byte(ev("", `{"jsonrpc":"2.0"}`) + "data: partial"))
+	if out := e.Flush(); string(out) != "data: partial" {
+		t.Fatalf("flush = %q", out)
+	}
+}
+
+// SSE allows a lone CR as a line end. When the stream ends right after a CR,
+// only the end shows that the CR was not the first half of a CRLF, so the last
+// event completes in Flush. It must still be edited.
+func TestLoneCRFinalEventIsEdited(t *testing.T) {
+	cr := func(s string) string { return strings.ReplaceAll(s, "\n", "\r") }
+	for _, tc := range []struct {
+		name, stream string
+		want         []int
+	}{
+		// The last event belongs to a kept item after a removed one: renumbered.
+		{"renumbered", cr(aStart + aBlock(0, "tool_use", "bash") + aBlock(1, "text", "")), []int{0, 0, 0}},
+		// The last event belongs to the removed item: dropped.
+		{"removed", cr(aStart + aBlock(0, "text", "") + aBlock(1, "tool_use", "bash")), []int{0, 0, 0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for i := 0; i <= len(tc.stream); i++ {
+				out := run(named("bash"), tc.stream[:i], tc.stream[i:])
+				if strings.Contains(out, "toolu_") {
+					t.Fatalf("split at %d: removed block leaked:\n%q", i, out)
+				}
+				var idx []int
+				for _, m := range decode(t, out) {
+					if v, ok := m["index"]; ok {
+						idx = append(idx, int(v.(float64)))
+					}
+				}
+				if !reflect.DeepEqual(idx, tc.want) {
+					t.Fatalf("split at %d: indexes = %v, want %v\n%q", i, idx, tc.want, out)
+				}
+			}
+		})
 	}
 }
 

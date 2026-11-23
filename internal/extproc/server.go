@@ -523,7 +523,14 @@ func (s *Server) responseChunk(stream extprocv3.ExternalProcessor_ProcessServer,
 // sseChunk parses an SSE response chunk, tracks the Anthropic events, and
 // applies the early-EOS fault (hostile test 3).
 func (t *txn) sseChunk(s *Server, chunk []byte, forward *[]byte, eos *bool) {
-	for _, ev := range t.parser.Feed(chunk) {
+	evs := t.parser.Feed(chunk)
+	if *eos { // an event ended by a lone CR completes only at the end
+		for _, ev := range t.parser.Close() {
+			ev.End = len(chunk) // it ends at the last byte of this chunk
+			evs = append(evs, ev)
+		}
+	}
+	for _, ev := range evs {
 		t.rec.SSEEvents++
 		t.trackEvent(ev)
 		if n := s.cfg.Faults.EarlyEOSAfterEvents; n > 0 && t.rec.SSEEvents >= n && !t.eosSent {

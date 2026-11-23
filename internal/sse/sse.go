@@ -29,7 +29,22 @@ type Parser struct {
 }
 
 // Feed adds a chunk and returns the events it completed.
-func (p *Parser) Feed(chunk []byte) []Event {
+func (p *Parser) Feed(chunk []byte) []Event { return p.feed(chunk, false) }
+
+// Close ends the stream and returns the events that only the end completes.
+// SSE allows a lone CR as a line end, so a CR that Feed held back waiting for a
+// possible LF ends a line here; if that line is the blank line, its event is
+// dispatched. Each returned event's End is 0: the event ends at the last byte
+// fed. An event that never got its blank line is discarded, as the SSE parsing
+// rules say, and so is a final line with no line end. The parser is reset.
+func (p *Parser) Close() []Event {
+	out := p.feed(nil, true)
+	p.buf, p.name, p.data, p.haveData = p.buf[:0], "", p.data[:0], false
+	p.skipping, p.dropping = false, false
+	return out
+}
+
+func (p *Parser) feed(chunk []byte, eof bool) []Event {
 	if p.MaxLine == 0 {
 		p.MaxLine = 1 << 20
 	}
@@ -55,9 +70,10 @@ func (p *Parser) Feed(chunk []byte) []Event {
 		adv := i + 1
 		if p.buf[i] == '\r' {
 			if i+1 == len(p.buf) {
-				return out // CR at chunk end: wait to see if LF follows
-			}
-			if p.buf[i+1] == '\n' {
+				if !eof {
+					return out // CR at chunk end: wait to see if LF follows
+				}
+			} else if p.buf[i+1] == '\n' {
 				adv = i + 2
 			}
 		}

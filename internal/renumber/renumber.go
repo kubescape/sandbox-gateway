@@ -105,10 +105,29 @@ func (e *Editor) fail() error {
 	return e.err
 }
 
-// Flush returns what is still held when the stream ends: the bytes of an
-// event that never completed. After a failure it returns nothing.
+// Flush ends the stream and returns the last bytes to forward. An event that
+// only the end of the stream completes (its blank line is a lone CR, which
+// could have been the start of a CRLF until the stream ended) goes through the
+// editor like any other event.
+//
+// What is left after that is an event that never got its blank line. An SSE
+// client discards such an event, so it is dropped here too, rather than
+// forwarded unread where it could carry a removed item. A stream in a format
+// the editor does not edit gets its tail back unchanged. After a failure Flush
+// returns nothing.
 func (e *Editor) Flush() []byte {
-	out := e.pending
+	if e.err != nil {
+		return nil
+	}
+	var out []byte
+	start := 0
+	for _, ev := range e.parser.Close() {
+		out = append(out, e.event(ev, e.pending[start:])...)
+		start = len(e.pending)
+	}
+	if tail := e.pending[start:]; len(tail) > 0 && e.format == streamfmt.Unknown {
+		out = append(out, tail...)
+	}
 	e.pending = nil
 	return out
 }
