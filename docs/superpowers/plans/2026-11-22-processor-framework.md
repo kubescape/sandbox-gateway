@@ -42,6 +42,8 @@ The ticket leaves these open. Each is small, and each is stated here so a review
 7. `fail_open_window` and `destination_state`. `fail_open_window` is true when the binding's gate is not `redirecting` at request time. The processor only sees decrypted traffic, so it writes `inspected` or `blocked`; `passthrough` and `none` are written by other components.
 8. Removal has no rule and no flag. The editor runs only when a filter is set in `app.Config`, which only the test program does.
 9. The request scanner is written new here, test first. Nothing is copied from the proof of concept's policy package.
+10. Every call into the evaluator is bounded, including one that ignores its context. The server never writes to the `Classify` pipe directly: a feeder goroutine does, and the server waits for it with the chunk budget. On every exit (verdict, timeout, client reset, stream error) the server cancels the request context and calls `CloseWithError` on both ends of the pipe, which unblocks a writer and a reader stuck on it. A call that does not return by its deadline keeps its goroutine, so the number of calls in flight is capped (`--max-evaluator-calls`, default 64). A request that finds no free slot is not sent to the evaluator; it is decided as degraded, by the pod's fail posture, and counted. The health body reports the calls still running past their deadline as `stuckEvaluatorCalls`.
+11. Identity needs the listener to give the processor the socket's address. The `proxy_protocol` listener filter replaces the remote address with one from a PROXY header the pod writes, and without `use_remote_address` the connection manager takes it from `X-Forwarded-For`. So `source.address` can only be trusted once the filter is gone and `use_remote_address` is set with `skip_xff_append`. That listener change is part of PR 3, not a later task, and PR 3 does not leave draft without it.
 
 ## Open items that need an answer
 
@@ -56,7 +58,7 @@ Each PR is a draft against `main` with SUB-9948 in the title. They stack in this
 |---|---|---|---|
 | 1 | `docs/SUB-9948-processor-plan` | This plan | none |
 | 2 | `feat/SUB-9948-stream-parsers` | Request JSON scanner, OpenAI stream tracking, removal and renumbering | none |
-| 3 | `feat/SUB-9948-identity` | `conns` and `bindings` readers, lookup client, `conns` miss rejection, integration stubs | none |
+| 3 | `feat/SUB-9948-identity` | `conns` and `bindings` readers, lookup client, `conns` miss rejection, listener without the PROXY protocol filter, integration stubs | none |
 | 4 | `feat/SUB-9948-plugin` | C6 interface and registry, request-side block, watchdog through the evaluator, `evaluator: unavailable` | PR 3, storage types |
 | 5 | `feat/SUB-9948-policy-source` | C11 informer, staleness, degraded decisions, decrypt-list guard, health path | PR 4 |
 | 6 | `feat/SUB-9948-records` | C7 records, memory test, SDK renumbering job, test evaluator in the integration job, latency bench | PRs 2 and 5 |
@@ -154,9 +156,9 @@ func (e *Editor) Feed(chunk []byte) []byte
 func (e *Editor) Flush() []byte
 ```
 
-Rules. The filter is asked once per item, at `content_block_start`, at the first `tool_calls` delta for an index, or at `response.output_item.added`. Every event of a removed item is dropped. Indexes after it go down by the number removed before them: `index` for Anthropic, `tool_calls[].index` for OpenAI chat, `output_index` for Responses, where `sequence_number` is also rewritten to stay contiguous. An event that needs no change is forwarded byte for byte. The stop reason is not rewritten.
+Rules. The filter is asked once per item, at `content_block_start`, at the first `tool_calls` delta for an index, or at `response.output_item.added`. Every event of a removed item is dropped. Indexes after it go down by the number removed before them: `index` for Anthropic, `tool_calls[].index` for OpenAI chat, `output_index` for Responses, where `sequence_number` is also rewritten to stay contiguous. The Responses closing event (`response.completed` and the other terminal events) repeats the whole `response.output` list; the removed items are filtered out of it too, so the SDK helper's final response does not hold them. An event that needs no change is forwarded byte for byte. The stop reason is not rewritten.
 
-- [ ] Write failing tests: `TestNothingRemovedIsByteIdentical` (all three baselines, split at every offset); `TestAnthropicRemoveMiddle` (text 0, tool 1, text 2 with the tool removed gives text 0, text 1, and equals the mock's `s4-a-renumbered` events); `TestOpenAIChatRemoveFirstCall` (equals `s4-o-renumbered`); `TestResponsesRemoveFunctionCall` (equals `s4-r-renumbered`, sequence numbers contiguous); `TestRemoveTwo` (indexes drop by two); `TestPartialEventHeld` (a chunk that ends mid-event forwards nothing of that event until it completes); `TestUnknownFormatPassesThrough`.
+- [ ] Write failing tests: `TestNothingRemovedIsByteIdentical` (all three baselines, split at every offset); `TestAnthropicRemoveMiddle` (text 0, tool 1, text 2 ending in `tool_use`, with the tool removed: the output is text 0 and text 1, the second text block's events carry index 1, and the stream still ends in `tool_use`. The mock's `s4-a-renumbered` is not the expected output, because it also rewrites the stop reason to `end_turn`); `TestOpenAIChatRemoveFirstCall` (equals `s4-o-renumbered`); `TestResponsesRemoveFunctionCall` (equals `s4-r-renumbered`, sequence numbers contiguous, and the `response.output` list of `response.completed` no longer holds the removed item); `TestRemoveTwo` (indexes drop by two); `TestPartialEventHeld` (a chunk that ends mid-event forwards nothing of that event until it completes); `TestUnknownFormatPassesThrough`.
 - [ ] Implement on top of `sse.Parser` (use `Event.End` to cut the original bytes) and `streamfmt.Detect`. Re-serialise only the events whose index changes.
 - [ ] Fix the `ineffassign` finding in `internal/sse/sse.go` and drop its exclusion from `.golangci.yml`.
 - [ ] Run `go test -race ./...` and the linter. Commit. Open PR 2.
@@ -229,9 +231,11 @@ The cache is keyed on the cgroup id only (review focus 1). An entry older than `
 
 Behaviour at request headers: parse `source.address`, look up `conns`, then `bindings`, then the workload. A parse failure, a `conns` miss, a missing binding or `ErrNotBound` ends the request with an immediate 403 and a record with `Ended: "rejected"`. Each cause has its own reason in `Details` and on the record (`no_source_address`, `no_connection_entry`, `not_bound`, ...); the list is in `docs/features/processor.md`. A lookup that fails with nothing cached does not reject: the record carries the kernel half of the identity and the error. An identity in the `kubescape.sandbox.attribution` metadata is never used; the record gets `ppv2_ignored`.
 
+Prerequisite, in this PR (decision 11): remove the `proxy_protocol` listener filter from `deploy/envoy/envoy.yaml` and set `use_remote_address: true` with `skip_xff_append: true`. Ignoring the metadata is not enough while the filter can still replace the address the processor reads.
+
 - [ ] Write failing tests in `server_test.go` with fake `Table` and lookup: `TestConnsMissRejected`; `TestUnboundCgroupRejected` (review focus 3); `TestNoSourceAddressRejected`; `TestIdentityFromTable` (the record carries namespace, pod, container, controller, binding id, posture, original destination); `TestPPv2IgnoredAndFlagged` (a forged identity in the metadata does not change the record's workload); `TestSecondRequestSameConnection` (same key twice: one `Conn` call per request, lookup served from its cache).
 - [ ] Implement. Move flag parsing and wiring from `cmd/processor/main.go` into `internal/app`; `cmd/processor` opens `conntable.Open(conntable.DefaultDir)` and exits non-zero if the maps are missing. It does not require the lookup socket at start: a node-agent restart must not stop the processor, and lookups are cached for that case.
-- [ ] `test/processor-it/main.go`: `app.Run` with an in-memory `Table` that answers any source address with one fixed connection and binding (posture from `--posture`, default `allow`), and a lookup stub that returns one fixed workload. Build it into the fixtures image. Point the `processor` service in `test/integration/compose.yaml` at it, and add a second run with `--reject-all` that asserts the client gets a 403.
+- [ ] `test/processor-it/main.go`: `app.Run` with an in-memory `Table` that answers any source address with one fixed connection and binding (posture from `--posture`, default `allow`), and a lookup stub that returns one fixed workload. Build it into the fixtures image. Point the `processor` service in `test/integration/compose.yaml` at it, and add a second run with `--reject-all` that asserts the client gets a 403. The integration stack runs the listener from `deploy/envoy/envoy.yaml`, so these checks go through the production listener configuration: `run.sh` also sends a request with a forged `X-Forwarded-For` header and one that starts with a PROXY protocol line, and fails if the processor sees the forged address.
 - [ ] Run `go test -race ./...` and `test/integration/run.sh`. Commit. Open PR 3.
 
 ---
@@ -260,9 +264,9 @@ func Registered() Evaluator
 
 **Consumes:** C6; `lookup.Workload`; `conntable.Binding`.
 
-Flow for one request. At headers the server builds `plugin.Workload` (posture from the binding) and starts `Classify(host, path, body)` in a goroutine, with `body` the read end of an `io.Pipe`. Each request chunk is written to the pipe and forwarded one chunk behind, as the seeded enforce path does. At end of stream, or at trailers, the pipe is closed, `Classify` returns, and `Evaluate` is called with the `Request`. The request is blocked when `Verdict.Action == "deny"` and `Verdict.Mode == "enforce"`: the held chunk is dropped and the answer is an immediate response built from `DenyResponse(provider, verdict)`. Otherwise the held chunk is released. `Sections` is empty and `Degraded` is false until PR 5. With no evaluator none of this runs and chunks are not held.
+Flow for one request. At headers the server builds `plugin.Workload` (posture from the binding) and starts `Classify(host, path, body)` in a goroutine, with `body` the read end of an `io.Pipe`. Each request chunk is written to the pipe and forwarded one chunk behind, as the seeded enforce path does. At end of stream, or at trailers, the pipe is closed, `Classify` returns, and `Evaluate` is called with the `Request`. The request is blocked when `Verdict.Action == "deny"` and `Verdict.Mode == "enforce"`: the held chunk is dropped and the answer is an immediate response built from `DenyResponse(provider, verdict)`. Otherwise the held chunk is released. `Sections` is empty and `Degraded` is false until PR 5. With no evaluator none of this runs and chunks are not held. Cancellation, pipe clean-up and the cap on calls in flight follow decision 10.
 
-- [ ] Write failing tests with a fake evaluator that records its calls: `TestClassifySeesWholeBody` (body split in three chunks); `TestRequestReachesEvaluator` (host, method, path, headers, model, `HasModel`, workload and posture match what was sent); `TestEnforceDenyUsesDenyResponse` (status, headers and body come from the fake, and the last data chunk was never forwarded); `TestAuditDenyPasses` (`Mode: "audit"` forwards everything; the record has `would_deny`); `TestNoBodyStillDecided` and `TestTrailersStillDecided` (review focus 5); `TestWebSocketUpgradeDecidedOnHeaders` (`Classify` gets an empty body and frames are not fed to it); `TestNoEvaluatorPassesEverything` (kept from the seed).
+- [ ] Write failing tests with a fake evaluator that records its calls: `TestClassifySeesWholeBody` (body split in three chunks); `TestRequestReachesEvaluator` (host, method, path, headers, model, `HasModel`, workload and posture match what was sent); `TestEnforceDenyUsesDenyResponse` (status, headers and body come from the fake, and the last data chunk was never forwarded); `TestAuditDenyPasses` (`Mode: "audit"` forwards everything; the record has `would_deny`); `TestNoBodyStillDecided` and `TestTrailersStillDecided` (review focus 5); `TestWebSocketUpgradeDecidedOnHeaders` (`Classify` gets an empty body and frames are not fed to it); `TestNoEvaluatorPassesEverything` (kept from the seed); `TestClassifyStallBounded` (`Classify` stops reading after the first chunk: the request ends within the budget with rule `framework.evaluator-timeout`, and the pipe writer has returned); `TestPipeClosedOnEveryExit` (verdict, timeout, client reset and stream error each leave no goroutine of the request behind, checked with `goleak`).
 - [ ] Implement. Delete `denyResponse`, the `Enforce` config field and `RuleUnevaluatedUpgrade`.
 - [ ] Run `go test -race ./internal/extproc/`. Commit with task 4.1.
 
@@ -270,7 +274,7 @@ Flow for one request. At headers the server builds `plugin.Workload` (posture fr
 
 **Files:** modify `internal/extproc/server.go`, `server_test.go`; create `pkg/processor/processor.go`; modify `cmd/processor/main.go`, `internal/app/app.go`.
 
-- [ ] Write failing tests: `TestWatchdogEndsStallWithStreamError` (stall fault, budget 200 ms: the response ends with the bytes the fake's `StreamError(provider, "watchdog")` returns, within 1 s); `TestWatchdogUnderFiveSecondsAtDefault` (default budget, stream ends in under 5 s); `TestWatchdogNoEvaluatorEndsStream` (end of stream, no frame); `TestSlowEvaluateFailsRequest` and `TestEvaluatorPanicFailsRequest` (review focus 4: the request gets `DenyResponse` with rule `framework.evaluator-timeout`, and a second request on a new stream succeeds).
+- [ ] Write failing tests: `TestWatchdogEndsStallWithStreamError` (stall fault, budget 200 ms: the response ends with the bytes the fake's `StreamError(provider, "watchdog")` returns, within 1 s); `TestWatchdogUnderFiveSecondsAtDefault` (default budget, stream ends in under 5 s); `TestWatchdogNoEvaluatorEndsStream` (end of stream, no frame); `TestSlowEvaluateFailsRequest` and `TestEvaluatorPanicFailsRequest` (review focus 4: the request gets `DenyResponse` with rule `framework.evaluator-timeout`, and a second request on a new stream succeeds); `TestRepeatedEvaluatorTimeoutsCapCalls` (an evaluator that never returns and ignores its context: after `--max-evaluator-calls` timeouts the next request is not sent to it, is decided as degraded by its fail posture, and the health body shows the stuck calls).
 - [ ] Implement. Delete `watchdogErrorEvent`. Set the `--chunk-budget` default to 3s.
 - [ ] `pkg/processor.Main()` parses flags and calls `app.Run` with `plugin.Registered()`. `cmd/processor/main.go` becomes a call to it. The start-up log line and `/debug/vars` report `evaluator` as `available` or `unavailable`; test `TestEvaluatorUnavailableReported` in `internal/app`.
 - [ ] `test/processor-it` gains `--evaluator`, which registers a test evaluator: it denies a request whose model is `denied-model`, in the mode given by `--mode`, with a fixed JSON 403. `run.sh` adds a call with that model and asserts the 403 body.
@@ -290,7 +294,8 @@ Flow for one request. At headers the server builds `plugin.Workload` (posture fr
 func New(client dynamic.Interface, now func() time.Time) *Source
 func (s *Source) Run(ctx context.Context)
 func (s *Source) Synced() bool
-// LostSince is zero while both informers are connected.
+// LostSince is the start of the oldest outage that has not ended, across
+// both informers. It is zero while both are connected.
 func (s *Source) LostSince() time.Time
 // Resolve returns the http section of each referenced object the cache holds.
 // A reference whose UID is cached at another generation yields the cached copy
@@ -298,9 +303,9 @@ func (s *Source) LostSince() time.Time
 func (s *Source) Resolve(refs []plugin.PolicyRef) (sections []plugin.PolicySection, outdated, missing int)
 ```
 
-Two dynamic informers, `sandboxpolicies` and `clustersandboxpolicies`, with the group and version taken from `v1alpha1.SchemeGroupVersion`. Objects are converted with `runtime.DefaultUnstructuredConverter` and indexed by UID. An object with no `http` section resolves to a section with a zero `HTTP` value. `LostSince` is set by the informers' watch error handler and cleared on the next successful list or event.
+Two dynamic informers, `sandboxpolicies` and `clustersandboxpolicies`, with the group and version taken from `v1alpha1.SchemeGroupVersion`. Objects are converted with `runtime.DefaultUnstructuredConverter` and indexed by UID. An object with no `http` section resolves to a section with a zero `HTTP` value. Each informer keeps its own outage start: its watch error handler sets it if it is not already set, and its own next successful list or event clears it. Activity on one informer never clears the other's. `LostSince` returns the earliest outage start still set.
 
-- [ ] Write failing tests with `dynamicfake`: `TestResolveExactlyNamedObjects` (three objects cached, two referenced: exactly those two sections come back, with `Ref` and `Mode` set); `TestOutdatedGeneration`; `TestMissingUID`; `TestNotSyncedBeforeFirstList`; `TestClusterAndNamespacedKinds`; `TestLostSinceSetAndCleared`.
+- [ ] Write failing tests with `dynamicfake`: `TestResolveExactlyNamedObjects` (three objects cached, two referenced: exactly those two sections come back, with `Ref` and `Mode` set); `TestOutdatedGeneration`; `TestMissingUID`; `TestNotSyncedBeforeFirstList`; `TestClusterAndNamespacedKinds`; `TestLostSinceSetAndCleared`; `TestOneInformerRecoveringLeavesOtherLost` (both watches fail, then events arrive on one only: `LostSince` stays at the other's outage start, and past five minutes the decision is degraded).
 - [ ] Implement. Run the tests. Commit.
 
 ### Task 5.2: staleness and the decision table
@@ -355,7 +360,17 @@ Degraded is true when the tracker says so. A reference that does not resolve sta
 
 - [ ] Write failing tests: `TestSectionsOfExactlyTheNamedObjects`; `TestMissingReferenceDegradesAfterFiveMinutes` (fake clock); `TestDegradedDoesNotBlockAllowPod`; `TestDegradedStillBlocksDenyPod`; `TestDenyPodNothingCachedBlocked` and `TestAllowPodNothingCachedPasses` (both records degraded on the first request); `TestPostureComesFromBindings`; `TestHostOutsideDecryptListFails`; in `internal/app`, `TestHealthFailsUntilFirstSync` (503, then 200 with the evaluator state) and `TestDegradedCounterInHealthBody`.
 - [ ] Implement. `test/processor-it` gets a static policy source from a YAML file of policy objects, so the integration job needs no API server; `run.sh` adds a call to a host outside the decrypt list and asserts the 403.
-- [ ] Run all tests and the integration script. Commit. Open PR 5.
+- [ ] Run all tests and the integration script. Commit.
+
+### Task 5.4: production image smoke test
+
+The fixture binary covers behaviour with stub maps and a static policy source. This task checks the shipped image itself.
+
+**Files:** create `test/smoke/pinmaps/main.go`, `test/smoke/run.sh`; modify `.github/workflows/pr-created.yaml`.
+
+- [ ] `test/smoke/pinmaps` runs as root and creates and pins empty `conns` and `bindings` maps of the decision 1 sizes under `/sys/fs/bpf/kubescape-sandbox/http/`, owned so that the processor's UID can read them as the node-agent will set them.
+- [ ] `run.sh` starts a kind cluster, applies the storage CRDs and one `SandboxPolicy`, pins the maps, and runs the shipped processor image as its own UID with the bpffs and a kubeconfig for the cluster mounted. It asserts that the health socket answers 503 before the first sync and 200 after it, with `"evaluator":"unavailable"`, and that the image exits with "open the connection tables" when the maps are absent.
+- [ ] Add a job `Processor image smoke` to the workflow. Run it locally. Commit. Open PR 5.
 
 ---
 
@@ -387,7 +402,7 @@ Degraded is true when the tracker says so. A reference that does not resolve sta
 
 - [ ] `test/processor-it` gains `--remove-first-tool`, which sets a `renumber.Filter` that removes the first tool or function call item of a response.
 - [ ] Port the two S4 scripts, reduced to the baseline scenarios (`s4-a-baseline`, `s4-o-baseline`, `s4-r-baseline`), each in raw-iterator and helper mode. Pin anthropic 2.6.0 and openai 3.46.0 for Python, `@anthropic-ai/sdk` 1.6.0 and `openai` 7.53.0 for Node. The clients reach the mock through Envoy and trust only the gateway CA.
-- [ ] `check.py` asserts every run's outcome is `ok`, that the tool call is gone and that the remaining indexes are contiguous from 0.
+- [ ] `check.py` asserts every run's outcome is `ok`, that the tool call is gone and that the remaining indexes are contiguous from 0. In helper mode it also checks the helper's final object (the final message, or the final response's `output` list) and fails if the removed item is in it.
 - [ ] Add the SDK run to `run.sh` behind `SDK=1` and a job `SDK streams` to the workflow. Run it locally. Commit.
 
 ### Task 6.5: latency
@@ -413,6 +428,6 @@ Degraded is true when the tracker says so. A reference that does not resolve sta
 | Second guard | 5.2, 5.3 |
 | Records C7 | 6.1, 6.2 |
 | Tests in the ticket's list | each named in the task that owns the code; memory 6.3, SDKs 6.4 |
-| Done when: image with a test evaluator against Envoy; latency inside budget | 4.3, 5.3, 6.5 |
+| Done when: image with a test evaluator against Envoy; latency inside budget | 4.3, 5.3, 5.4, 6.5 |
 
-Out of scope here: the Envoy listener changes (health listener, removing the PROXY protocol filter, source restriction), writing `SandboxGatewayNodeStatus`, any real evaluator, and rewriting the stop reason after a removal.
+Out of scope here: the other Envoy listener changes (health listener, source restriction; the PROXY protocol filter removal is in PR 3, decision 11), writing `SandboxGatewayNodeStatus`, any real evaluator, and rewriting the stop reason after a removal.
