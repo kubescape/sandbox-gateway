@@ -168,3 +168,70 @@ func TestSweepDropsOnlyConfirmedGoneWorkloads(t *testing.T) {
 		t.Fatal("a swept workload kept its old clock")
 	}
 }
+
+func fill(tr *Tracker, from, n uint64) {
+	for id := from; id < from+n; id++ {
+		tr.Observe(id, time.Time{}, time.Time{}, true)
+	}
+}
+
+// Review: a workload the full tracker turned away stays degraded once a
+// sweep makes room, rather than getting a fresh clock.
+func TestOverflowWorkloadStaysDegradedAfterRoomOpens(t *testing.T) {
+	clk := newClock()
+	tr := New(5*time.Minute, clk.now)
+	fill(tr, 1, maxEntries)
+	const late = maxEntries + 1
+	if !tr.Observe(late, time.Time{}, time.Time{}, true) {
+		t.Fatal("overflow workload not degraded")
+	}
+	if n := tr.Sweep(func(id uint64) (bool, error) { return id > 10, nil }); n != 10 {
+		t.Fatalf("swept %d", n)
+	}
+	if !tr.Observe(late, time.Time{}, time.Time{}, true) {
+		t.Fatal("the overflow workload got a fresh grace period once a slot opened")
+	}
+	if tr.Observe(late+1, time.Time{}, time.Time{}, true) {
+		t.Fatal("a workload first seen after the sweep was degraded")
+	}
+}
+
+// Past the unknown-age allowance the tracker can no longer tell which
+// workload it dropped, so every workload admitted afterwards is degraded.
+func TestLostTrackDegradesLaterAdmissions(t *testing.T) {
+	clk := newClock()
+	tr := New(5*time.Minute, clk.now)
+	fill(tr, 1, maxEntries+maxUnknown)
+	const dropped = maxEntries + maxUnknown + 1
+	if !tr.Observe(dropped, time.Time{}, time.Time{}, true) {
+		t.Fatal("a workload with no entry was not degraded")
+	}
+	tr.Sweep(func(uint64) (bool, error) { return false, nil }) // everything else gone
+	if !tr.Observe(dropped, time.Time{}, time.Time{}, true) {
+		t.Fatal("the dropped workload got a fresh grace period")
+	}
+	if !tr.Observe(dropped+1, time.Time{}, time.Time{}, true) {
+		t.Fatal("a later admission was not degraded after the tracker lost track")
+	}
+}
+
+// Review: a request that observes a workload while the sweep reads its
+// binding keeps the entry, and its clock.
+func TestSweepKeepsEntryObservedDuringRead(t *testing.T) {
+	clk := newClock()
+	tr := New(5*time.Minute, clk.now)
+	tr.Observe(5, time.Time{}, time.Time{}, true)
+	clk.t = clk.t.Add(time.Minute)
+	removed := tr.Sweep(func(id uint64) (bool, error) {
+		// The binding was gone when read; a request then saw it restored.
+		tr.Observe(id, time.Time{}, time.Time{}, true)
+		return false, nil
+	})
+	if removed != 0 {
+		t.Fatal("the sweep deleted an entry observed after its read")
+	}
+	clk.t = clk.t.Add(4 * time.Minute)
+	if !tr.Observe(5, time.Time{}, time.Time{}, true) {
+		t.Fatal("the workload lost its clock")
+	}
+}

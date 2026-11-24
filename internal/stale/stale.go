@@ -27,13 +27,31 @@ type Tracker struct {
 	now   func() time.Time
 	mu    sync.Mutex
 	since map[uint64]entry
+	// seq numbers observations, so a sweep can tell that an entry was
+	// observed again after it read the bindings table.
+	seq uint64
+	// lostTrack is set once a workload could not be given any entry. From
+	// then on every workload newly admitted may be that one, so each starts
+	// with an unknown age. It lasts until the processor restarts.
+	lostTrack bool
 }
 
-type entry struct{ since time.Time }
+// entry is one workload whose policy does not resolve. unknown is set when
+// the tracker was full as it arrived: its first miss was not recorded, so its
+// decisions are degraded from the start.
+type entry struct {
+	since   time.Time
+	unknown bool
+	seq     uint64
+}
 
-// maxEntries bounds the map. At the bound no entry is dropped to make room:
-// a new workload that cannot be tracked is degraded at once (see Observe).
-const maxEntries = 1 << 16
+// maxEntries is how many workloads the tracker times. Past it no entry is
+// dropped to make room: a workload newly unresolved gets an entry of unknown
+// age, up to as many again (maxUnknown), and is degraded at once.
+const (
+	maxEntries = 1 << 16
+	maxUnknown = maxEntries
+)
 
 // New returns a tracker that degrades a workload stale for limit or more.
 func New(limit time.Duration, now func() time.Time) *Tracker {
@@ -45,28 +63,39 @@ func New(limit time.Duration, now func() time.Time) *Tracker {
 // those sources answer; unresolved is whether a referenced policy is missing
 // from the cache or cached at another generation.
 //
-// With the tracker full, a workload newly unresolved has no entry to hold
-// when its policy first failed. Its decision is degraded at once: its age is
-// unknown, so it is not given a fresh grace period, and the workloads already
-// tracked keep theirs.
+// With the tracker full, a workload newly unresolved gets an entry of unknown
+// age, and its decisions are degraded at once: it is not given a fresh grace
+// period, now or once a slot opens, and the workloads already tracked keep
+// theirs.
 func (t *Tracker) Observe(cgroupID uint64, lookupFailingSince, informerLostSince time.Time, unresolved bool) (degraded bool) {
 	now := t.now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	e, had := t.since[cgroupID]
-	switch {
-	case unresolved && !had && len(t.since) >= maxEntries:
-		return true
-	case unresolved && !had:
-		e = entry{since: now}
-		t.since[cgroupID] = e
-	case unresolved:
-	default:
+	if !unresolved {
 		delete(t.since, cgroupID)
-		e = entry{}
+		since := earliest(lookupFailingSince, informerLostSince)
+		return !since.IsZero() && now.Sub(since) >= t.limit
+	}
+	if !had {
+		switch n := len(t.since); {
+		case n >= maxEntries+maxUnknown:
+			t.lostTrack = true
+			return true
+		case n >= maxEntries || t.lostTrack:
+			e = entry{unknown: true}
+		default:
+			e = entry{since: now}
+		}
+	}
+	t.seq++
+	e.seq = t.seq
+	t.since[cgroupID] = e
+	if e.unknown {
+		return true
 	}
 	since := earliest(lookupFailingSince, informerLostSince, e.since)
-	return !since.IsZero() && now.Sub(since) >= t.limit
+	return now.Sub(since) >= t.limit
 }
 
 // Forget drops a cgroup whose workload is gone: unbound, or no longer in the
@@ -82,19 +111,26 @@ type Bound func(cgroupID uint64) (bool, error)
 
 // Sweep drops every entry whose cgroup bound confirms is gone. A read that
 // fails keeps the entry. The table is read without the lock held, so requests
-// are not held up behind it.
+// are not held up behind it; an entry observed again after its read is kept,
+// since that request saw the workload bound later than the sweep did.
 func (t *Tracker) Sweep(bound Bound) (removed int) {
+	type seen struct{ id, seq uint64 }
 	t.mu.Lock()
-	ids := make([]uint64, 0, len(t.since))
-	for id := range t.since {
-		ids = append(ids, id)
+	snap := make([]seen, 0, len(t.since))
+	for id, e := range t.since {
+		snap = append(snap, seen{id, e.seq})
 	}
 	t.mu.Unlock()
-	for _, id := range ids {
-		if ok, err := bound(id); err == nil && !ok {
-			t.Forget(id)
+	for _, s := range snap {
+		if ok, err := bound(s.id); err != nil || ok {
+			continue
+		}
+		t.mu.Lock()
+		if e, had := t.since[s.id]; had && e.seq == s.seq {
+			delete(t.since, s.id)
 			removed++
 		}
+		t.mu.Unlock()
 	}
 	return removed
 }
