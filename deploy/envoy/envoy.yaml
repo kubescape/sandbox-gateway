@@ -1,8 +1,8 @@
 # Envoy bootstrap for the per-node egress gateway. Floor: Envoy 1.40 (tested image: 1.40.2).
 #
 # This file holds only what never changes while Envoy runs: the clusters and the admin
-# socket. The listeners come from the node controller over LDS, because the set of
-# decrypted hostnames and the pods allowed to reach each one change all the time:
+# socket. The two listeners come from the node controller over LDS, because the set of
+# decrypted hostnames and the pods on the node change all the time. The redirect listener:
 #
 #   redirected pod connection -> tls_inspector reads the SNI
 #     - the pod's policy decrypts that name: the name's own chain terminates TLS with a
@@ -10,6 +10,10 @@
 #     - anything else from a pod on this node: passed through undecrypted, to the
 #       destination the pod was connecting to
 #     - a source that is no pod on this node: no chain, the connection is reset
+#
+# The health listener (port 18444) answers node-agent's probes, from on-node sources only:
+#   /healthz/envoy by Envoy, /healthz/processor by the processor, /healthz/certs by the
+#   node controller.
 #
 # The chains themselves are internal/xds/templates/*.yaml.
 
@@ -95,3 +99,18 @@ static_resources:
     load_assignment:
       cluster_name: ext_proc
       endpoints: [{ lb_endpoints: [{ endpoint: { address: { pipe: { path: /run/kubescape-sandbox/extproc.sock } } } }] }]
+
+  # The health listener's two routed paths. Plain HTTP/1 over each process's unix socket.
+  - name: processor_health
+    type: STATIC
+    connect_timeout: 0.25s
+    load_assignment:
+      cluster_name: processor_health
+      endpoints: [{ lb_endpoints: [{ endpoint: { address: { pipe: { path: /run/kubescape-sandbox/processor-health.sock } } } }] }]
+
+  - name: node_controller
+    type: STATIC
+    connect_timeout: 0.25s
+    load_assignment:
+      cluster_name: node_controller
+      endpoints: [{ lb_endpoints: [{ endpoint: { address: { pipe: { path: /run/kubescape-sandbox/gateway.sock } } } }] }]

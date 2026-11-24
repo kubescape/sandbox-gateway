@@ -73,6 +73,24 @@ fi
 echo "$out" | tail -1
 echo "$out" | grep -Eq 'connection reset|EOF'
 
+echo "--- the health listener: three paths, each answered by its own process"
+# Prints httpget's result line: "<status> <body>", or "000 <error>" with no HTTP answer.
+# --no-deps: a plain "run" would start a service this script stopped on purpose.
+health() { "${COMPOSE[@]}" run --rm -T --no-deps "$1" httpget "http://envoy:18444$2" 2>&1 | grep -E '^[0-9]{3} ' | tail -1 || true; }
+health client /healthz/envoy | tee generated/health-envoy.txt
+grep -q '^200 ok' generated/health-envoy.txt
+health client /healthz/processor | tee generated/health-processor.txt
+grep -q '^200 .*"evaluator":"available"' generated/health-processor.txt
+health client /healthz/certs | tee generated/health-certs.txt
+grep -Eq '^200 \{"canDecrypt":true,"decryptValidUntil":"20[0-9T:.Z-]+","rootFingerprint":"[0-9a-f]{64}"\}' generated/health-certs.txt
+health client /quitquitquit | tee generated/health-other.txt
+grep -q '^404' generated/health-other.txt
+
+echo "--- the health listener refuses a source that is not on the node"
+out=$(health client-unknown /healthz/envoy)
+echo "$out"
+echo "$out" | grep -Eq '^000 .*(connection reset|EOF)'
+
 echo "--- the test evaluator blocks a request for the denied model, with its DenyResponse"
 "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:18443 --ca /certs/ca.crt \
   --model denied-model --expect-status 403 --wait 0 | tee generated/denied.json
@@ -153,6 +171,38 @@ if out=$(docker run --rm "sandbox-gateway/processor:$IT_TAG" 2>&1); then
 fi
 echo "$out" | tail -1
 echo "$out" | grep -q 'open the connection tables'
+
+echo "--- one process down fails its own health path and not the other two"
+"${COMPOSE[@]}" stop processor >/dev/null 2>&1
+health client /healthz/processor | tee generated/health-processor-down.txt
+grep -q '^503' generated/health-processor-down.txt
+health client /healthz/envoy | grep -q '^200 ok'
+health client /healthz/certs | grep -q '^200 '
+"${COMPOSE[@]}" start processor >/dev/null 2>&1
+"${COMPOSE[@]}" stop node-controller >/dev/null 2>&1
+health client /healthz/certs | tee generated/health-certs-down.txt
+grep -q '^503' generated/health-certs-down.txt
+health client /healthz/envoy | grep -q '^200 ok'
+for _ in $(seq 1 20); do health client /healthz/processor | grep -q '^200 ' && break; sleep 1; done
+health client /healthz/processor | grep -q '^200 '
+
+echo "--- an Envoy that starts while the node controller is down opens no listener"
+"${COMPOSE[@]}" stop envoy >/dev/null 2>&1
+# --no-deps, or compose would bring the node controller back with it.
+"${COMPOSE[@]}" up -d --no-deps envoy >/dev/null 2>&1
+sleep 5
+if "${COMPOSE[@]}" ps --status running --services | grep -qx node-controller; then
+  echo "FAIL: the node controller is running; this check needs it down"; exit 1
+fi
+"${COMPOSE[@]}" ps --status running --services | grep -qx envoy
+out=$(health client /healthz/envoy)
+echo "$out"
+echo "$out" | grep -q '^000 ' # no HTTP answer: nothing listens on the health port
+"${COMPOSE[@]}" start node-controller >/dev/null 2>&1
+for _ in $(seq 1 30); do health client /healthz/envoy | grep -q '^200 ok' && break; sleep 1; done
+health client /healthz/envoy | grep -q '^200 ok'
+# The redirect listener is back with it: a decrypted call works again.
+"${COMPOSE[@]}" run --rm -T --no-deps client streamcheck --addr envoy:18443 --ca /certs/ca.crt --wait 30s | tail -1 | grep -q '"stop_reason":"end_turn"'
 
 echo "--- envoy access log"
 "${COMPOSE[@]}" logs --no-color --no-log-prefix envoy | grep '"kind":"access"' | tail -1

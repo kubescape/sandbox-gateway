@@ -2,6 +2,10 @@
 // socket node-agent reaches it by.
 //
 //	POST /v1/sightings   a hostname node-agent saw in a workload's DNS answers
+//	GET  /healthz/certs  whether the node can decrypt, and until when
+//
+// node-agent does not read the second one from this socket: Envoy's health
+// listener routes its /healthz/certs path here.
 package gatewaysock
 
 import (
@@ -10,7 +14,21 @@ import (
 	"log/slog"
 	"net/http"
 	"sync/atomic"
+	"time"
 )
+
+// Certs is the body of GET /healthz/certs.
+type Certs struct {
+	// CanDecrypt is false when the node has no intermediate, or the one it
+	// holds has less than one leaf lifetime left and no renewal has arrived.
+	CanDecrypt bool `json:"canDecrypt"`
+	// DecryptValidUntil is the earliest expiry among the leaves held and the
+	// intermediate. Absent when there is no intermediate.
+	DecryptValidUntil *time.Time `json:"decryptValidUntil,omitempty"`
+	// RootFingerprint is the SHA-256, in hex, of the root the node's
+	// intermediate chains to.
+	RootFingerprint string `json:"rootFingerprint"`
+}
 
 // Sighting is the body of POST /v1/sightings.
 type Sighting struct {
@@ -35,7 +53,9 @@ type Handler struct {
 	// Changed is called after a sighting changed the set or left a name
 	// waiting, so the listener is rebuilt.
 	Changed func()
-	Log     *slog.Logger
+	// Certs returns the certificate state for GET /healthz/certs.
+	Certs func() Certs
+	Log   *slog.Logger
 
 	// Sightings counts requests accepted; Learned counts the ones that
 	// changed the set.
@@ -46,7 +66,20 @@ type Handler struct {
 func (h *Handler) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/sightings", h.sightings)
+	mux.HandleFunc("GET /healthz/certs", h.certs)
 	return mux
+}
+
+// certs always answers 200 when the node controller is up: the body says
+// whether the node can decrypt. A node controller that is down is what a
+// failed probe of this path means.
+func (h *Handler) certs(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("content-type", "application/json")
+	var c Certs
+	if h.Certs != nil {
+		c = h.Certs()
+	}
+	_ = json.NewEncoder(w).Encode(c)
 }
 
 func (h *Handler) sightings(w http.ResponseWriter, r *http.Request) {

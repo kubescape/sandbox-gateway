@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -76,8 +77,11 @@ type Controller struct {
 	Activity *Activity
 	// KickSecrets pushes re-minted leaves at once. *sds.Server.Kick.
 	KickSecrets func()
-	Config      xds.Config
-	Log         *slog.Logger
+	// NodeAddrs returns the node's own addresses, for the health listener's
+	// on-node check. Nil means none beyond the pods' and loopback.
+	NodeAddrs func() []netip.Addr
+	Config    xds.Config
+	Log       *slog.Logger
 	// Every is how often the loop runs with nothing to react to, to sweep
 	// names that went idle. Default 5s.
 	Every time.Duration
@@ -206,7 +210,17 @@ func (c *Controller) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	changed, err := c.Listeners.Set(l)
+	// The health listener takes probes from this node only: its pods (node-agent
+	// is one), the node's own addresses, and loopback.
+	sources := append([]netip.Addr(nil), snap.OnNode...)
+	if c.NodeAddrs != nil {
+		sources = append(sources, c.NodeAddrs()...)
+	}
+	health, err := c.Config.Health(sources)
+	if err != nil {
+		return err
+	}
+	changed, err := c.Listeners.Set(l, health)
 	if err != nil {
 		return err
 	}

@@ -34,14 +34,22 @@ func (v *fakeView) Run(ctx context.Context)     { <-ctx.Done() }
 // fakeListeners keeps what was set. ack copies the current version to acked,
 // as an Envoy that accepted it would.
 type fakeListeners struct {
-	last    *listenerv3.Listener
+	last    *listenerv3.Listener // the redirect listener
+	health  *listenerv3.Listener
 	sets    int
 	version int
 	acked   int
 }
 
 func (f *fakeListeners) Set(ls ...*listenerv3.Listener) (bool, error) {
-	f.last = ls[0]
+	for _, l := range ls {
+		switch l.GetName() {
+		case xds.EgressListener:
+			f.last = l
+		case xds.HealthListener:
+			f.health = l
+		}
+	}
 	f.sets++
 	f.version++
 	return true, nil
@@ -326,4 +334,26 @@ func itoa(i int) string {
 		b = append([]byte{byte('0' + i%10)}, b...)
 	}
 	return string(b)
+}
+
+func TestHealthListenerTakesOnNodeSourcesOnly(t *testing.T) {
+	h := newHarness(t, 8)
+	h.view.snap.OnNode = []netip.Addr{netip.MustParseAddr("10.0.0.1"), netip.MustParseAddr("10.0.0.9")}
+	h.c.NodeAddrs = func() []netip.Addr { return []netip.Addr{netip.MustParseAddr("192.168.1.10")} }
+	h.reconcile(t)
+	if h.out.health == nil {
+		t.Fatal("no health listener was set")
+	}
+	sources := h.out.health.GetFilterChainMatcher().GetMatcherTree().GetExactMatchMap().GetMap()
+	for _, want := range []string{"10.0.0.1", "10.0.0.9", "192.168.1.10", "127.0.0.1"} {
+		if _, ok := sources[want]; !ok {
+			t.Errorf("%s is on the node and must reach the health listener", want)
+		}
+	}
+	if len(sources) != 4 {
+		t.Fatalf("sources = %d, want exactly the four on-node addresses", len(sources))
+	}
+	if h.out.health.GetFilterChainMatcher().GetOnNoMatch() != nil {
+		t.Fatal("a source that is not on the node must get no chain")
+	}
 }

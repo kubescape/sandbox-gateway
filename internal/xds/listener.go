@@ -48,10 +48,12 @@ var templates embed.FS
 
 var chainTemplates = template.Must(template.ParseFS(templates, "templates/*.yaml"))
 
-// Names of the listener and of the chain every undecrypted connection gets.
+// Names of the listeners and of their fixed chains.
 const (
 	EgressListener   = "egress_tls"
 	PassthroughChain = "passthrough"
+	HealthListener   = "health"
+	HealthChain      = "health"
 )
 
 // Config holds what is the same for every build of the listener. These are
@@ -59,8 +61,11 @@ const (
 type Config struct {
 	// Port the redirect listener binds on every IPv4 address. Default 18443.
 	Port uint32
+	// HealthPort is the health listener's port. Default 18444.
+	HealthPort uint32
 	// Clusters defined in Envoy's bootstrap.
 	XDSCluster, ExtProcCluster, DecryptCluster, PassthroughCluster string
+	ProcessorHealthCluster, NodeControllerCluster                  string
 }
 
 func (c Config) withDefaults() Config {
@@ -76,6 +81,11 @@ func (c Config) withDefaults() Config {
 	def(&c.ExtProcCluster, "ext_proc")
 	def(&c.DecryptCluster, "dfp")
 	def(&c.PassthroughCluster, "orig_dst")
+	def(&c.ProcessorHealthCluster, "processor_health")
+	def(&c.NodeControllerCluster, "node_controller")
+	if c.HealthPort == 0 {
+		c.HealthPort = 18444
+	}
 	return c
 }
 
@@ -114,10 +124,8 @@ var clusterName = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 // listener, so an unchanged node pushes nothing.
 func (c Config) Egress(in Input) (*listenerv3.Listener, error) {
 	c = c.withDefaults()
-	for _, cl := range []string{c.XDSCluster, c.ExtProcCluster, c.DecryptCluster, c.PassthroughCluster} {
-		if !clusterName.MatchString(cl) {
-			return nil, fmt.Errorf("xds: %q is not a cluster name", cl)
-		}
+	if err := c.checkClusters(); err != nil {
+		return nil, err
 	}
 	names := append([]string(nil), in.Names...)
 	sort.Strings(names)
@@ -180,12 +188,65 @@ func (c Config) Egress(in Input) (*listenerv3.Listener, error) {
 	}, nil
 }
 
+func (c Config) checkClusters() error {
+	for _, cl := range []string{c.XDSCluster, c.ExtProcCluster, c.DecryptCluster, c.PassthroughCluster, c.ProcessorHealthCluster, c.NodeControllerCluster} {
+		if !clusterName.MatchString(cl) {
+			return fmt.Errorf("xds: %q is not a cluster name", cl)
+		}
+	}
+	return nil
+}
+
+// Health builds the health listener. It accepts connections only from the
+// source addresses given, which are the addresses on this node: its pods,
+// the node itself and loopback. Any other source gets no chain and is reset.
+//
+// Like the redirect listener, the sources are in the matcher, so a pod
+// coming or going is applied in place.
+func (c Config) Health(sources []netip.Addr) (*listenerv3.Listener, error) {
+	c = c.withDefaults()
+	if err := c.checkClusters(); err != nil {
+		return nil, err
+	}
+	fc, err := c.chain("health_chain.yaml", "")
+	if err != nil {
+		return nil, err
+	}
+	source, err := input("source-ip", &networkinputsv3.SourceIPInput{})
+	if err != nil {
+		return nil, err
+	}
+	health, err := chainAction(HealthChain)
+	if err != nil {
+		return nil, err
+	}
+	// Loopback is always on the node, and keeps the exact map from being empty.
+	byAddr := map[string]*matcherv3.Matcher_OnMatch{"127.0.0.1": health}
+	for _, a := range sources {
+		byAddr[a.Unmap().String()] = health
+	}
+	return &listenerv3.Listener{
+		Name: HealthListener,
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{SocketAddress: &corev3.SocketAddress{
+			Address: "0.0.0.0", PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: c.HealthPort},
+		}}},
+		FilterChains: []*listenerv3.FilterChain{fc},
+		FilterChainMatcher: &matcherv3.Matcher{
+			MatcherType: &matcherv3.Matcher_MatcherTree_{MatcherTree: &matcherv3.Matcher_MatcherTree{
+				Input:    source,
+				TreeType: &matcherv3.Matcher_MatcherTree_ExactMatchMap{ExactMatchMap: &matcherv3.Matcher_MatcherTree_MatchMap{Map: byAddr}},
+			}},
+		},
+	}, nil
+}
+
 func (c Config) chain(file, name string) (*listenerv3.FilterChain, error) {
 	var buf bytes.Buffer
 	err := chainTemplates.ExecuteTemplate(&buf, file, struct {
 		Name, StatPrefix                                               string
 		XDSCluster, ExtProcCluster, DecryptCluster, PassthroughCluster string
-	}{name, StatPrefix(name), c.XDSCluster, c.ExtProcCluster, c.DecryptCluster, c.PassthroughCluster})
+		ProcessorHealthCluster, NodeControllerCluster                  string
+	}{name, StatPrefix(name), c.XDSCluster, c.ExtProcCluster, c.DecryptCluster, c.PassthroughCluster, c.ProcessorHealthCluster, c.NodeControllerCluster})
 	if err != nil {
 		return nil, fmt.Errorf("xds: %s: %w", file, err)
 	}

@@ -9,7 +9,7 @@ scope: repo
 
 The node controller is the gateway's control process on one node. It decides which hostnames Envoy decrypts there and for which pods, serves Envoy its listeners and certificates, and holds the node's intermediate CA. The program is `cmd/node-controller`; the loop is `internal/controller`.
 
-The plan for what is not built yet (the health listener, overload settings, the node status object) is `docs/superpowers/plans/2026-11-24-node-controller.md`.
+The plan for what is not built yet (overload settings, the node status object) is `docs/superpowers/plans/2026-11-24-node-controller.md`.
 
 ## What runs where
 
@@ -18,7 +18,8 @@ Envoy's bootstrap (`deploy/envoy/envoy.yaml`) holds only the clusters and the ad
 | Socket | Served by | Used by | For |
 |---|---|---|---|
 | `/run/kubescape-sandbox/xds.sock` | node controller (gRPC) | Envoy | listeners (LDS) and leaf certificates (SDS) |
-| `/run/kubescape-sandbox/gateway.sock` | node controller (HTTP) | node-agent | `POST /v1/sightings` |
+| `/run/kubescape-sandbox/gateway.sock` | node controller (HTTP) | node-agent, Envoy | `POST /v1/sightings`; `GET /healthz/certs` for the health listener |
+| `/run/kubescape-sandbox/processor-health.sock` | processor (HTTP) | Envoy | `GET /healthz/processor` for the health listener |
 | `/run/kubescape-sandbox/extproc.sock` | processor | Envoy | `ext_proc` |
 | `/run/sandbox-gateway/envoy-admin.sock` | Envoy | node controller | stats: open connections per hostname |
 
@@ -28,7 +29,7 @@ Envoy waits for its first listeners without a timeout (`initial_fetch_timeout: 0
 
 ## The redirect listener
 
-`internal/xds` builds one listener, `egress_tls`, on port 18443 (`-listener-port`). It has:
+`internal/xds` builds the listener `egress_tls` on port 18443 (`-listener-port`). It has:
 
 - one filter chain per name in the host set, `decrypt/<name>`, rendered from `internal/xds/templates/decrypt_chain.yaml`. There is never a wildcard chain;
 - one `passthrough` chain (`passthrough_chain.yaml`);
@@ -66,6 +67,26 @@ A decrypt chain:
 - has its own stat prefix, `egress_<name with dots as underscores>`.
 
 The listener never parses PROXY protocol: the pod writes the first bytes of the connection, and the pod's identity is keyed on the remote address.
+
+## The health listener
+
+node-agent probes the gateway to decide whether to keep redirecting. `internal/xds` builds a second listener, `health`, on port 18444 (`-health-port`). It has three paths, each answered by a different process, so one of them dying does not hide the others:
+
+| Path | Answered by | Answer |
+|---|---|---|
+| `GET /healthz/envoy` | Envoy itself | `200 ok` |
+| `GET /healthz/processor` | the processor, on `/run/kubescape-sandbox/processor-health.sock` | 503 until its policy informers have synced, then 200 with `evaluator`, `degradedDecisions`, `stuckEvaluatorCalls` |
+| `GET /healthz/certs` | the node controller, on `gateway.sock` | `200 {"canDecrypt": true, "decryptValidUntil": "<RFC 3339>", "rootFingerprint": "<sha256, hex>"}` |
+
+Any other path is a 404. A process that is down gives a 503 on its own path only. The two routed paths time out at 300 ms, under the probe's own 400 ms.
+
+`/healthz/certs` answers 200 whenever the node controller is up. The body says whether the node can decrypt: `canDecrypt` is false with no intermediate, or when the one held has less than one leaf lifetime left. `decryptValidUntil` is left out when there is no intermediate.
+
+The listener takes connections from this node only. Its matcher lists the address of every pod on the node (node-agent is one of them), the node's own interface addresses and `127.0.0.1`; any other source gets no chain and is reset. On EKS pod addresses come from the VPC and a node has no pod range of its own, so the list is built from the pods and kept current by the same in-place matcher updates as the redirect listener.
+
+Both listeners arrive in one LDS response. An Envoy that starts while the node controller is down opens neither: the probe gets a refused connection, not a healthy answer with no redirect listener behind it.
+
+Overload settings are not configured yet. Envoy's global request shedding also answers 503 on this listener, which would make a loaded gateway look dead; the plan's open item 2 has the measurement and the options.
 
 ## Reconcile
 
@@ -116,7 +137,7 @@ The name joins the host set when a valid pattern on the node covers it. `address
 | `-name-cap` | 256 | names with a certificate and a chain |
 | `-leaf-ttl`, `-renew-every` | 1h, 1m | leaves |
 | `-intermediate-ttl` | 24h | the stand-in intermediate |
-| `-listener-port` | 18443 | the redirect listener |
+| `-listener-port`, `-health-port` | 18443, 18444 | the redirect and health listeners |
 | `-decrypt-cluster`, `-passthrough-cluster` | `dfp`, `orig_dst` | bootstrap clusters the chains route to |
 | `-view-file` | | pods and policy objects from a YAML file, for test stacks |
 | `-debug-addr` | off | `/stats` and `/debug/vars`, no authentication |

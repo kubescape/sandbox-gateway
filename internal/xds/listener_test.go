@@ -330,3 +330,39 @@ func TestPassthroughGoesToTheOriginalDestination(t *testing.T) {
 		}
 	}
 }
+
+func TestHealthListener(t *testing.T) {
+	l, err := Config{}.Health(addrs("10.0.0.5", "192.168.1.10", "::ffff:10.0.0.6"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.ValidateAll(); err != nil {
+		t.Fatal(err)
+	}
+	if got := l.GetAddress().GetSocketAddress().GetPortValue(); got != 18444 {
+		t.Fatalf("port %d", got)
+	}
+	// Only on-node sources reach the chain; loopback always does.
+	for _, src := range []string{"10.0.0.5", "192.168.1.10", "10.0.0.6", "127.0.0.1"} {
+		if got := pick(t, l, src, ""); got != "health" {
+			t.Errorf("%s: chain %q, want health", src, got)
+		}
+	}
+	if got := pick(t, l, "203.0.113.9", ""); got != "" {
+		t.Errorf("an address that is not on the node reached chain %q", got)
+	}
+	js := string(stable(t, l))
+	for _, want := range []string{
+		`"path": "/healthz/envoy"`, `"path": "/healthz/processor"`, `"path": "/healthz/certs"`,
+		`"cluster": "processor_health"`, `"cluster": "node_controller"`, `"timeout": "0.300s"`,
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("the health listener lacks %s", want)
+		}
+	}
+	// The same sources in another order give an equal listener.
+	again, _ := Config{}.Health(addrs("192.168.1.10", "10.0.0.6", "10.0.0.5"))
+	if !proto.Equal(l, again) {
+		t.Fatal("order of the sources must not change the listener")
+	}
+}

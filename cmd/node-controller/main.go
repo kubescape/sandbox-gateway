@@ -1,7 +1,7 @@
 // Command node-controller is the gateway's control process on one node. It
 // serves Envoy its listeners (LDS) and leaf certificates (SDS), keeps the
 // node's host set from the policy objects and node-agent's DNS sightings,
-// and holds the node's intermediate CA.
+// answers the certificate health path, and holds the node's intermediate CA.
 package main
 
 import (
@@ -11,7 +11,9 @@ import (
 	"errors"
 	"flag"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -37,7 +39,7 @@ import (
 
 func main() {
 	listen := flag.String("listen", "unix:///run/kubescape-sandbox/xds.sock", "gRPC address Envoy fetches listeners and certificates from: unix:///path or host:port")
-	gatewaySock := flag.String("gateway-socket", "unix:///run/kubescape-sandbox/gateway.sock", "HTTP address node-agent posts DNS sightings to (POST /v1/sightings)")
+	gatewaySock := flag.String("gateway-socket", "unix:///run/kubescape-sandbox/gateway.sock", "HTTP address for node-agent's DNS sightings (POST /v1/sightings) and the health listener's certificate path (GET /healthz/certs)")
 	adminSock := flag.String("envoy-admin", "/run/sandbox-gateway/envoy-admin.sock", "Envoy's admin unix socket; read for open connections per hostname")
 	node := flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this pod runs on (default $NODE_NAME)")
 	viewFile := flag.String("view-file", "", "read pods and policy objects from this YAML file, not from the API server (test stacks)")
@@ -46,6 +48,7 @@ func main() {
 	renew := flag.Duration("renew-every", time.Minute, "how often each Envoy stream is checked for renewed leaves to push")
 	interTTL := flag.Duration("intermediate-ttl", 24*time.Hour, "validity of the stand-in intermediate; replaced at half of it")
 	port := flag.Uint("listener-port", 18443, "port of the redirect listener")
+	healthPort := flag.Uint("health-port", 18444, "port of the health listener node-agent probes")
 	decryptCluster := flag.String("decrypt-cluster", "dfp", "bootstrap cluster decrypted requests are routed to")
 	passthroughCluster := flag.String("passthrough-cluster", "orig_dst", "bootstrap cluster passthrough connections are forwarded through")
 	rootCert := flag.String("ca-cert", "", "root certificate (PEM) the stand-in intermediate is signed by; empty creates one in memory")
@@ -104,13 +107,21 @@ func main() {
 	secrets.RenewEvery = *renew
 	ctrl := &controller.Controller{
 		View: view, Set: set, Authority: authority, Listeners: lds, Activity: activity,
-		KickSecrets: secrets.Kick, Log: log,
-		Config: xds.Config{Port: uint32(*port), DecryptCluster: *decryptCluster, PassthroughCluster: *passthroughCluster},
+		KickSecrets: secrets.Kick, Log: log, NodeAddrs: localAddrs,
+		Config: xds.Config{Port: uint32(*port), HealthPort: uint32(*healthPort), DecryptCluster: *decryptCluster, PassthroughCluster: *passthroughCluster},
 	}
 	go ctrl.Run(ctx)
 
 	// Sightings from node-agent.
-	sock := &gatewaysock.Handler{Observe: set.Observe, Changed: ctrl.Kick, Log: log}
+	sock := &gatewaysock.Handler{Observe: set.Observe, Changed: ctrl.Kick, Log: log, Certs: func() gatewaysock.Certs {
+		state := authority.State()
+		c := gatewaysock.Certs{CanDecrypt: state.CanDecrypt, RootFingerprint: state.RootFingerprint}
+		if !state.ValidUntil.IsZero() {
+			until := state.ValidUntil.UTC()
+			c.DecryptValidUntil = &until
+		}
+		return c
+	}}
 	gl, err := runutil.Listen(*gatewaySock)
 	if err != nil {
 		fatal(log, "listen "+*gatewaySock, err)
@@ -154,6 +165,24 @@ func main() {
 	if err := g.Serve(lis); err != nil {
 		fatal(log, "serve", err)
 	}
+}
+
+// localAddrs returns the addresses of this network namespace's interfaces. The
+// gateway pod is on the host network, so these are the node's own addresses.
+func localAddrs() []netip.Addr {
+	ifaddrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	var out []netip.Addr
+	for _, a := range ifaddrs {
+		if ipn, ok := a.(*net.IPNet); ok {
+			if addr, ok := netip.AddrFromSlice(ipn.IP); ok {
+				out = append(out, addr.Unmap())
+			}
+		}
+	}
+	return out
 }
 
 // standInRoot loads the root the stand-in intermediate is signed by. With no

@@ -90,7 +90,10 @@ Each is stated so a reviewer can reject it.
 ## Open items that need an answer
 
 1. Who loads the `getsockopt` program. It belongs with the redirect loader in node-agent (T4, SUB-9947), attached at the cgroup root and filtered on the listener port, since it reads `conns`. That adds one program to T4's list and one line to C1. Until T4 lands, the integration job loads the spike's program from `test/origdst/`. Needs the contract owner's yes.
-2. Overload and C4. `envoy.overload_actions.stop_accepting_requests` applies to every connection manager, the health listener's included, and the ticket says overload must never make C4 fail. Task 5.4 measures it first. If the health listener is affected, shedding moves to the redirect listener's chains only, or the question comes back.
+2. Overload and C4. Measured on 1.40.2 with an injected resource monitor: while `envoy.overload_actions.stop_accepting_requests` is active, the health listener answers `503 envoy overloaded` on every path (the admin interface still answers 200). The action applies to every connection manager and has no per-listener exemption. So global request shedding would fail C4 and open the gate, which the ticket forbids. No overload config ships until this is decided. The options:
+   - (recommended) No global request shedding. Bound the decrypted path alone: circuit breakers on the decrypt and `ext_proc` clusters (a cap on concurrent decrypted requests), with a fixed JSON body through the decrypt chains' `local_reply_config`. The health listener has its own connection manager and is not touched. `shrink_heap` stays as the only global action.
+   - Keep global shedding and accept that overload opens the gate for `allow` pods. That is fail-open under load, a change to the design's posture.
+   - Serve C4 without a connection manager. Not possible with three routed paths on one port.
 3. "Sheds with the plugin's provider-shaped error". Envoy sheds before `ext_proc` runs, so the evaluator is never asked. Task 5.4 ships a fixed JSON error from Envoy through `local_reply_config`. A provider-shaped body needs the processor to shed, which is a change in the processor packages and is not made here.
 4. Passthrough entries. The CRD does not say whether `decrypt.passthrough` takes patterns. This plan treats an entry with `*` as a pattern in the host set's syntax and anything else as an exact name.
 
@@ -105,7 +108,7 @@ Each PR is a draft with SUB-9949 in the title. They stack in this order; a later
 | 3 | `feat/SUB-9949-node-view` | Informers on pods, namespaces and both policy kinds; the per-node snapshot |
 | 4 | `feat/SUB-9949-xds` | Intermediate holder, listener builder, LDS, SDS rework, sightings socket, new bootstrap, integration stack on LDS |
 | 5 | `feat/SUB-9949-passthrough` | Passthrough to the original destination, with the test's BPF stand-in |
-| 6 | `feat/SUB-9949-health` | Health listener, overload |
+| 6 | `feat/SUB-9949-health` | Health listener. Overload waits for open item 2 |
 | 7 | `feat/SUB-9949-node-status` | `SandboxGatewayNodeStatus` writer |
 | 8 | `test/SUB-9949-integration` | The remaining integration tests and the SigV4 check |
 

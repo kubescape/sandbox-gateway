@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSightings(t *testing.T) {
@@ -58,5 +59,42 @@ func TestSightings(t *testing.T) {
 	}
 	if len(seen) != 2 {
 		t.Fatalf("a refused request must not reach the set: %v", seen)
+	}
+}
+
+func TestCerts(t *testing.T) {
+	until := time.Date(2026, 11, 24, 15, 0, 0, 0, time.UTC)
+	state := Certs{CanDecrypt: true, DecryptValidUntil: &until, RootFingerprint: "ab12"}
+	h := &Handler{Certs: func() Certs { return state }}
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+	get := func() string {
+		resp, err := http.Get(srv.URL + "/healthz/certs")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != 200 {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+		b := make([]byte, 512)
+		n, _ := resp.Body.Read(b)
+		return strings.TrimSpace(string(b[:n]))
+	}
+	if got, want := get(), `{"canDecrypt":true,"decryptValidUntil":"2026-11-24T15:00:00Z","rootFingerprint":"ab12"}`; got != want {
+		t.Fatalf("body = %s\nwant   %s", got, want)
+	}
+	// No intermediate: still 200, and the body says the node cannot decrypt.
+	state = Certs{}
+	if got, want := get(), `{"canDecrypt":false,"rootFingerprint":""}`; got != want {
+		t.Fatalf("body = %s\nwant   %s", got, want)
+	}
+	resp, err := http.Post(srv.URL+"/healthz/certs", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("POST: status %d", resp.StatusCode)
 	}
 }
