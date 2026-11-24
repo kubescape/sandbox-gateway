@@ -151,8 +151,11 @@ type Filter func(streamfmt.Item) (remove bool)
 type Editor struct{ /* ... */ }
 func New(remove Filter) *Editor
 // Feed returns the bytes to forward for this chunk. It holds back an
-// incomplete trailing event.
-func (e *Editor) Feed(chunk []byte) []byte
+// incomplete trailing event. ErrEventTooLarge means an event over the parser
+// limits arrived once the format was known; the caller ends the stream.
+func (e *Editor) Feed(chunk []byte) ([]byte, error)
+// Flush ends the stream: an event completed only by the end (a lone CR) is
+// edited, and an event that never got its blank line is dropped.
 func (e *Editor) Flush() []byte
 ```
 
