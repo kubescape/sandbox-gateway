@@ -7,9 +7,9 @@ scope: repo
 
 # Processor
 
-The processor is the gateway's Envoy external processor (`ext_proc`). Envoy sends it every decrypted request and response in `FULL_DUPLEX_STREAMED` mode, so the processor sees each body chunk and returns the bytes Envoy forwards. It works out which pod sent the request, parses the request and the streamed response, and writes one record per transaction.
+The processor is the gateway's Envoy external processor (`ext_proc`). Envoy sends it every decrypted request and response in `FULL_DUPLEX_STREAMED` mode, so the processor sees each body chunk and returns the bytes Envoy forwards. It works out which pod sent the request, hands the request to the evaluator and enforces its verdict, parses the streamed response, and writes one record per transaction.
 
-The command is `cmd/processor`. The wiring is `internal/app`, the server `internal/extproc`.
+The program is `pkg/processor.Main()`; `cmd/processor` calls it and registers no evaluator. The wiring is `internal/app`, the server `internal/extproc`.
 
 ## Who sent the request
 
@@ -63,6 +63,33 @@ Integers are in host byte order. Addresses are 16 bytes, IPv4 in its IPv6-mapped
 
 The processor opens both maps read-only at start and exits if either is missing or has another key or value size. It needs `CAP_BPF` and the bpffs mount.
 
+## The evaluator
+
+The processor decides nothing itself. An evaluator does, through the interface in `pkg/plugin` (contract C6): `Classify` names the provider and model from the host, the path and the body; `Evaluate` returns a verdict; `DenyResponse` and `StreamError` give the provider-shaped answers for a blocked request and for a stream ended by the watchdog.
+
+A build registers its evaluator with `plugin.Register`, from an `init` function of the evaluator's package, and then calls `processor.Main()`. A build that registers none passes every request: nothing is held, classified or evaluated, and the start-up log and `/stats` on the debug server report `"evaluator":"unavailable"`.
+
+With an evaluator, one request goes like this:
+
+1. At the request headers the processor starts `Classify` with the read end of a pipe. A request with no body, and a WebSocket upgrade, get an empty body and are decided at the headers; WebSocket frames are never fed to the evaluator.
+2. Each body chunk is written to the pipe and forwarded one chunk behind, so the newest chunk waits for the verdict. A blocked request therefore never reaches the provider whole.
+3. At the end of the body, or at the trailers, the pipe is closed, `Classify` returns, and `Evaluate` gets the `Request`: the workload (with the fail posture from the `bindings` table and the policy references from the lookup), host, method, path, headers, model. `Sections` is empty and `Degraded` false until the policy source is wired in.
+4. A verdict of `deny` in `enforce` mode blocks the request with the evaluator's `DenyResponse`. A `deny` in `audit` mode passes and the record has `would_deny`. Anything else passes and the held chunk is released.
+
+Every call into the evaluator is bounded, because Go cannot stop a function that ignores its context:
+
+- Each call runs in its own goroutine and holds one of `-max-evaluator-calls` slots until it returns. A call past its deadline keeps its slot and counts as stuck; `/stats` shows `stuckEvaluatorCalls`.
+- `Classify`, each write of a body chunk to it, and `Evaluate` get `-chunk-budget` each. `DenyResponse` and `StreamError` get 200 ms. The context `Evaluate` gets ends at its budget, so an evaluator that honours it gives the slot back in time. The same deadline decides whether its answer counts: a verdict that comes back after it is refused, and the request gets the timeout denial.
+- A `Classify` still running when a body write times out counts as stuck until it returns.
+- When `Classify` or `Evaluate` stalls, panics, or `Evaluate` finds no slot, the request is refused with `DenyResponse`, rule `framework.evaluator-timeout`.
+- When `DenyResponse` itself finds no slot, stalls or panics, the processor sends its own 403, `{"error":{"type":"gateway_error","message":"request blocked by the gateway"}}`. A deny verdict stands even then, on any pod.
+- When no slot is free to start `Classify`, the request cannot begin evaluation and the pod's fail posture decides: an `allow` pod passes, a `deny` pod gets the processor's 403 with rule `framework.evaluator-saturated`. Both records are `degraded`.
+- On every way a transaction ends (verdict, timeout, client reset, stream error), the pipe is closed, which unblocks `Classify` and any writer.
+
+The watchdog ends a response whose chunk takes longer than `-chunk-budget` with the evaluator's `StreamError` frame and end of stream. With no evaluator, or a `StreamError` that cannot answer in 200 ms, the stream ends with no frame.
+
+The record carries `provider`, `model`, the `verdict` (action, mode, rule, origin, policy uid and revision), `would_deny`, `degraded` and `evaluator_error`, which says which call failed and how. The access log shows `rule_id`, `action`, `mode`, `would_deny`, `degraded` and `model`.
+
 ## Streams
 
 | Package | What it does |
@@ -84,12 +111,13 @@ The record's `stop_reason` comes from `streamfmt`: Anthropic's `stop_reason`, Op
 | `-maps-dir` | `/sys/fs/bpf/kubescape-sandbox/http` | where `conns` and `bindings` are pinned |
 | `-lookup-socket` | `/run/kubescape-sandbox/lookup.sock` | node-agent's workload lookup |
 | `-lookup-refresh` | `5s` | ask node-agent again once a cached answer is this old |
-| `-chunk-budget` | `0` (off) | the stall watchdog |
+| `-chunk-budget` | `3s` | the stall watchdog, and the budget of each evaluator call and body write; `0` turns the watchdog off |
+| `-max-evaluator-calls` | `64` | evaluator calls in flight, stuck ones included |
 | `-otlp-endpoint`, `-records` | empty | where records go besides the log |
 | `-debug-addr` | `127.0.0.1:9102` | debug server, no authentication |
 
 ## Testing
 
-`go test -race ./...` covers the packages. The pinned-map test in `internal/conntable` needs root and runs as root in CI.
+`go test -race ./...` covers the packages. `internal/extproc` tests the evaluator seam against a fake evaluator whose calls can be made to stall or panic. The pinned-map test in `internal/conntable` needs root and runs as root in CI.
 
-`test/integration/run.sh` runs Envoy with `test/processor-it`, which is the same server against an in-memory table that names one fixed pod, because the stack has no eBPF redirect. It checks a streamed call end to end, that the record names the pod, that a client cannot change the address the processor sees, that an empty table refuses the request, and that the shipped processor image will not start without the maps.
+`test/integration/run.sh` runs Envoy with `test/processor-it`, which is the same server against an in-memory table that names one fixed pod, because the stack has no eBPF redirect. The fixture runs with `-evaluator`, a test evaluator that denies the model `denied-model`. It checks a streamed call end to end, that the record names the pod, that a request for the denied model gets the evaluator's 403 and a `denied` record, that a client cannot change the address the processor sees, that an empty table refuses the request, and that the shipped processor image will not start without the maps.

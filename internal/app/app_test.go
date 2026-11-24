@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/kubescape/sandbox-gateway/internal/conntable"
 	"github.com/kubescape/sandbox-gateway/internal/extproc"
+	"github.com/kubescape/sandbox-gateway/pkg/plugin"
 )
 
 type emptyTable struct{}
@@ -116,5 +119,27 @@ func TestRecordAttrsIdentity(t *testing.T) {
 		if a[k] != want {
 			t.Errorf("%s = %v, want %v", k, a[k], want)
 		}
+	}
+}
+
+type noopEval struct{}
+
+func (noopEval) Classify(string, string, io.Reader) (string, string, bool) { return "", "", false }
+func (noopEval) Evaluate(context.Context, plugin.Request) plugin.Verdict   { return plugin.Verdict{} }
+func (noopEval) DenyResponse(string, plugin.Verdict) (int, http.Header, []byte) {
+	return 403, nil, nil
+}
+func (noopEval) StreamError(string, string) []byte { return nil }
+
+func TestEvaluatorUnavailableReported(t *testing.T) {
+	srv := extproc.New(extproc.Config{Conns: emptyTable{}})
+	if got := stats(srv, nil)["evaluator"]; got != "unavailable" {
+		t.Fatalf("no evaluator: %v", got)
+	}
+	if got := stats(srv, noopEval{})["evaluator"]; got != "available" {
+		t.Fatalf("with an evaluator: %v", got)
+	}
+	if _, ok := stats(srv, nil)["stuckEvaluatorCalls"]; !ok {
+		t.Fatal("stats do not report stuck evaluator calls")
 	}
 }

@@ -5,6 +5,8 @@
 //
 // By default every connection belongs to one fixed bound pod. With
 // -reject-all no connection is in the table, so every request is refused.
+// With -evaluator a test evaluator is registered that denies requests for
+// the model "denied-model", in the mode -mode gives.
 package main
 
 import (
@@ -20,6 +22,7 @@ import (
 	"github.com/kubescape/sandbox-gateway/internal/app"
 	"github.com/kubescape/sandbox-gateway/internal/conntable"
 	"github.com/kubescape/sandbox-gateway/internal/lookup"
+	"github.com/kubescape/sandbox-gateway/pkg/plugin"
 )
 
 const cgroup = 4242
@@ -55,13 +58,20 @@ func main() {
 	cfg := app.Flags(flag.CommandLine)
 	posture := flag.String("posture", conntable.PostureAllow, "fail posture of the stub pod: allow or deny")
 	rejectAll := flag.Bool("reject-all", false, "no connection is in the table, so every request is refused")
+	withEvaluator := flag.Bool("evaluator", false, "register a test evaluator that denies the model "+deniedModel)
+	mode := flag.String("mode", plugin.ModeEnforce, "mode of the test evaluator's verdicts: audit or enforce")
 	flag.Parse()
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(log)
 	cfg.Log = log
 	cfg.Conns = stubTable{posture: *posture, rejectAll: *rejectAll}
 	cfg.Lookup = stubLookup
-	log.Warn("integration test build: stub connection table and lookup", "reject_all", *rejectAll, "posture", *posture)
+	if *withEvaluator {
+		plugin.Register(testEvaluator{mode: *mode})
+		cfg.Evaluator = plugin.Registered()
+	}
+	log.Warn("integration test build: stub connection table and lookup",
+		"reject_all", *rejectAll, "posture", *posture, "evaluator", *withEvaluator, "mode", *mode)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
