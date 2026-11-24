@@ -9,7 +9,7 @@ scope: repo
 
 The node controller is the gateway's control process on one node. It decides which hostnames Envoy decrypts there, and for which pods. The program is `cmd/node-controller`.
 
-This page describes what is in the code today. The plan for the rest is `docs/superpowers/plans/2026-11-24-node-controller.md`. Until its later PRs land, `cmd/node-controller` still runs the seeded SDS server with the older `hostset.Set`; the host set described below is built and tested but not wired in yet.
+This page describes what is in the code today. The plan for the rest is `docs/superpowers/plans/2026-11-24-node-controller.md`. Until its later PRs land, `cmd/node-controller` still runs the seeded SDS server with the older `hostset.Set`; the host set and the node view described below are built and tested but not wired in yet.
 
 ## Host set
 
@@ -47,3 +47,26 @@ The set is node-wide. Who is decrypted for a name is decided per pod. `NamesFor`
 - minus its `passthrough` entries. An entry with `*` is a pattern, any other is an exact name.
 
 So a pod is never decrypted for a host that only another pod's policy names, even when both hosts share an address.
+
+## Node view
+
+`internal/nodeview` is where the per-pod lists come from. It watches four resources and needs `list` and `watch` on each:
+
+| Resource | Why |
+|---|---|
+| `pods`, with the field selector `spec.nodeName` | the pods on this node, their labels and addresses |
+| `namespaces` | a `ClusterSandboxPolicy` selects namespaces by label |
+| `sandboxpolicies`, `clustersandboxpolicies` (`kubescape.io`) | selectors and the `http.decrypt` lists |
+
+A policy object applies to a pod when its selector matches the pod, it has an `http` section, and `spec.mode` is not `off`. A `SandboxPolicy` selects pods in its own namespace. A `ClusterSandboxPolicy` also needs its namespace selector to match the pod's namespace; the empty selector matches every namespace, and an object with no namespace selector selects nothing. When several objects apply to one pod, their exact hosts, patterns and passthrough entries are each merged as a union.
+
+The view does not check whether node-agent has bound the pod. An unbound pod is never redirected, so its entry is not used.
+
+Pods the view leaves out:
+
+- a pod on another node, a pod with no address yet, and a pod that has finished (its address may already belong to another pod);
+- a pod on the host network. Its connections carry the node's address, which every host process shares, so it is never matched for decryption.
+
+`Snapshot.OnNode` lists the address of every pod on the node, selected or not. The health listener uses it to accept on-node sources only.
+
+`LoadStatic` builds the same view from a YAML file of `Pod`, `Namespace` and policy objects, for test programs with no API server.
