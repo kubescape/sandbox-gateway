@@ -212,7 +212,7 @@ func (e *Editor) event(ev sse.Event, raw []byte) []byte {
 }
 
 // chatEvent handles an OpenAI chat event. A tool call is judged at its first
-// chunk that carries its id or name. Until every call in flight has had one,
+// chunk that carries its name. Until every call in flight has had one,
 // the events are held, so a call named in a later chunk is still judged with
 // its name. A choice's finish reason settles that choice's calls that never
 // got one; [DONE], or the end of the stream, settles the rest.
@@ -310,7 +310,7 @@ func (e *Editor) chat(ev sse.Event, raw []byte, p streamfmt.Event) []byte {
 	for _, tc := range p.ToolCalls {
 		k := itemKey{tc.Choice, tc.Index}
 		if _, ok := e.seen[k]; !ok {
-			// A tool call whose first chunk carried neither id nor name.
+			// A tool call that never got a name.
 			e.seen[k] = e.remove(streamfmt.Item{Format: streamfmt.OpenAIChat, Choice: tc.Choice, Index: tc.Index, Kind: "function"})
 		}
 		if e.seen[k] || e.shift(k) > 0 {

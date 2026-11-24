@@ -574,3 +574,22 @@ func TestChatFinishSettlesOnlyItsChoice(t *testing.T) {
 		t.Fatalf("asked = %+v", asked)
 	}
 }
+
+// Review: a provider that sends a tool call's id in one chunk and its name in
+// a later one. The filter must see the name, so the id alone does not start
+// the call.
+func TestChatToolCallIDBeforeName(t *testing.T) {
+	s := chatChunk(`{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"arguments":""}}]}`, "null") +
+		chatChunk(`{"tool_calls":[{"index":0,"function":{"name":"bash","arguments":""}}]}`, "null") +
+		chatChunk(`{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}`, "null") +
+		chatCall(1, "call_b", "read") +
+		chatChunk(`{}`, `"tool_calls"`) + ev("", "[DONE]")
+	var asked []streamfmt.Item
+	out := run(func(it streamfmt.Item) bool { asked = append(asked, it); return it.Name == "bash" }, s)
+	if strings.Contains(out, "call_a") || !strings.Contains(out, "call_b") {
+		t.Fatalf("output:\n%s", out)
+	}
+	if len(asked) != 2 || asked[0].Name != "bash" || asked[1].Name != "read" {
+		t.Fatalf("asked = %+v", asked)
+	}
+}
