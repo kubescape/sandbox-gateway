@@ -1,7 +1,8 @@
 // Package app wires the processor together and runs it: the ext_proc gRPC
 // server, the record outputs and the debug server. The parts that differ
-// between builds, the connection table and the workload lookup, come in
-// through Config, so a test program can run the same server against stubs.
+// between builds, the connection table, the workload lookup and the
+// evaluator, come in through Config, so a test program can run the same
+// server against stubs.
 package app
 
 import (
@@ -22,32 +23,36 @@ import (
 	"github.com/kubescape/sandbox-gateway/internal/extproc"
 	"github.com/kubescape/sandbox-gateway/internal/otlpemit"
 	"github.com/kubescape/sandbox-gateway/internal/runutil"
+	"github.com/kubescape/sandbox-gateway/pkg/plugin"
 )
 
 // Config is everything Run needs.
 type Config struct {
-	Listen       string // unix:///path or host:port
-	Conns        conntable.Table
-	Lookup       extproc.LookupFunc
-	Enforce      bool
-	ChunkBudget  time.Duration
-	Faults       extproc.Faults
-	RecordsFile  string // also append records here as JSON lines
-	OTLPEndpoint string
-	DebugAddr    string
-	Log          *slog.Logger
+	Listen string // unix:///path or host:port
+	Conns  conntable.Table
+	Lookup extproc.LookupFunc
+	// Evaluator decides requests; nil passes every request and reports the
+	// evaluator as unavailable.
+	Evaluator         plugin.Evaluator
+	MaxEvaluatorCalls int
+	ChunkBudget       time.Duration
+	Faults            extproc.Faults
+	RecordsFile       string // also append records here as JSON lines
+	OTLPEndpoint      string
+	DebugAddr         string
+	Log               *slog.Logger
 }
 
 // Flags registers the flags every processor build shares and returns the
-// Config they fill. The caller sets Conns and Lookup.
+// Config they fill. The caller sets Conns, Lookup and Evaluator.
 func Flags(fs *flag.FlagSet) *Config {
 	c := &Config{}
 	fs.StringVar(&c.Listen, "listen", "unix:///run/kubescape-sandbox/extproc.sock", "gRPC listen address: unix:///path or host:port")
 	fs.IntVar(&c.Faults.StallAfterChunks, "fault-stall-after-chunks", 0, "TEST ONLY: stop answering after N response chunks")
 	fs.IntVar(&c.Faults.EarlyEOSAfterEvents, "fault-early-eos-after-events", 0, "TEST ONLY: end the response after N SSE events with synthetic terminal events")
-	fs.DurationVar(&c.ChunkBudget, "chunk-budget", 0, "watchdog: end the response fail-closed if one chunk takes longer than this; 0 disables")
+	fs.DurationVar(&c.ChunkBudget, "chunk-budget", extproc.DefaultChunkBudget, "watchdog and evaluator budget: end the response fail-closed if one chunk takes longer than this, and fail a request whose evaluator call does; 0 disables the watchdog")
+	fs.IntVar(&c.MaxEvaluatorCalls, "max-evaluator-calls", extproc.DefaultMaxEvaluatorCalls, "evaluator calls in flight, stuck ones included; past it a request is decided by the pod's fail posture")
 	fs.StringVar(&c.OTLPEndpoint, "otlp-endpoint", "", "OTLP/HTTP endpoint for transaction records (e.g. http://otel-collector:4318)")
-	fs.BoolVar(&c.Enforce, "enforce", false, "block would_deny decisions with a provider-shaped 403; has no effect without a rule evaluator")
 	fs.StringVar(&c.RecordsFile, "records", "", "also append transaction records as JSON lines to this file")
 	fs.StringVar(&c.DebugAddr, "debug-addr", "127.0.0.1:9102", "debug HTTP address; it has no authentication, so keep it on loopback; empty disables")
 	return c
@@ -82,12 +87,13 @@ func Run(ctx context.Context, c Config) error {
 		log.Info("otlp export enabled", "endpoint", c.OTLPEndpoint)
 	}
 	srv := extproc.New(extproc.Config{
-		Enforce:     c.Enforce,
-		Conns:       c.Conns,
-		Lookup:      c.Lookup,
-		Faults:      c.Faults,
-		ChunkBudget: c.ChunkBudget,
-		Log:         log,
+		Evaluator:         c.Evaluator,
+		MaxEvaluatorCalls: c.MaxEvaluatorCalls,
+		Conns:             c.Conns,
+		Lookup:            c.Lookup,
+		Faults:            c.Faults,
+		ChunkBudget:       c.ChunkBudget,
+		Log:               log,
 		Emit: func(r extproc.Record) {
 			log.Info("transaction", "record", r)
 			if otlp != nil {
@@ -100,9 +106,7 @@ func Run(ctx context.Context, c Config) error {
 			}
 		},
 	})
-	runutil.ServeDebug(c.DebugAddr, func() any {
-		return map[string]int64{"active": srv.Active.Load(), "total": srv.Total.Load()}
-	})
+	runutil.ServeDebug(c.DebugAddr, func() any { return stats(srv, c.Evaluator) })
 	if c.Faults.StallAfterChunks > 0 || c.Faults.EarlyEOSAfterEvents > 0 {
 		log.Warn("fault injection enabled", "stall_after_chunks", c.Faults.StallAfterChunks, "early_eos_after_events", c.Faults.EarlyEOSAfterEvents)
 	}
@@ -117,8 +121,25 @@ func Run(ctx context.Context, c Config) error {
 		<-ctx.Done()
 		g.GracefulStop()
 	}()
-	log.Info("processor listening", "addr", c.Listen, "evaluator", "unavailable")
+	log.Info("processor listening", "addr", c.Listen, "evaluator", EvaluatorState(c.Evaluator))
 	return g.Serve(lis)
+}
+
+// EvaluatorState is "available" when the build has an evaluator and
+// "unavailable" when it has none.
+func EvaluatorState(e plugin.Evaluator) string {
+	if e == nil {
+		return "unavailable"
+	}
+	return "available"
+}
+
+// stats is what the debug server's /stats answers.
+func stats(srv *extproc.Server, e plugin.Evaluator) map[string]any {
+	return map[string]any{
+		"active": srv.Active.Load(), "total": srv.Total.Load(),
+		"evaluator": EvaluatorState(e), "stuckEvaluatorCalls": srv.StuckEvaluatorCalls(),
+	}
 }
 
 // RecordAttrs maps a transaction record onto OTLP attributes. Keys follow the
@@ -153,13 +174,18 @@ func RecordAttrs(r extproc.Record) map[string]any {
 		a["gateway.lookup_failing_since"] = id.LookupFailingSince
 		a["gateway.lookup_error"] = id.LookupError
 	}
-	if d := r.Decision; d != nil {
-		a["policy.rule_id"] = d.RuleID
-		a["policy.action"] = string(d.Action)
-		a["policy.reason"] = d.Reason
-		a["policy.class_version"] = d.ClassVersion
-		a["policy.degraded"] = d.Degraded
-		a["gen_ai.request.model"] = d.Model
+	a["gen_ai.system"] = r.Provider
+	a["gen_ai.request.model"] = r.Model
+	a["policy.would_deny"] = r.WouldDeny
+	a["policy.degraded"] = r.Degraded
+	a["gateway.evaluator_error"] = r.EvaluatorError
+	if v := r.Verdict; v != nil {
+		a["policy.rule_id"] = v.Rule
+		a["policy.action"] = v.Action
+		a["policy.mode"] = v.Mode
+		a["policy.uid"] = v.PolicyUID
+		a["policy.revision"] = v.PolicyRevision
+		a["policy.origin"] = v.Origin
 	}
 	return a
 }

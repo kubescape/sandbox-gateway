@@ -28,45 +28,9 @@ var respSSE = []string{
 	"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
 }
 
-// fakeEvaluator is a test evaluator. It returns a canned decision and keeps the
-// body it was fed, so the tests cover the framework's side of the seam and no
-// rule logic.
-type fakeEvaluator struct {
-	mu       sync.Mutex
-	decision plugin.Decision
-	fed      []byte
-}
-
-const fakeRuleID = "test.canned-decision"
-
-func wouldDeny() *fakeEvaluator {
-	return &fakeEvaluator{decision: plugin.Decision{RuleID: fakeRuleID, Action: plugin.WouldDeny,
-		Reason: "canned", Model: "claude-opus-5-5", Stream: true, Tools: []string{"bash"}, Messages: 1}}
-}
-
-func (f *fakeEvaluator) Inspects(path string) bool { return path == "/v1/messages" }
-func (f *fakeEvaluator) NewScan() plugin.Scan      { return f }
-
-func (f *fakeEvaluator) Feed(chunk []byte) {
-	f.mu.Lock()
-	f.fed = append(f.fed, chunk...)
-	f.mu.Unlock()
-}
-
-func (f *fakeEvaluator) Decide() plugin.Decision {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.decision
-}
-
-func (f *fakeEvaluator) body() string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return string(f.fed)
-}
-
 type harness struct {
-	eval    *fakeEvaluator
+	eval    *fakeEval
+	srv     *Server
 	client  extprocv3.ExternalProcessorClient
 	mu      sync.Mutex
 	records []Record
@@ -78,7 +42,7 @@ func newHarness(t *testing.T, faults Faults) *harness {
 
 func newHarnessBudget(t *testing.T, faults Faults, budget time.Duration) *harness {
 	t.Helper()
-	h := &harness{eval: wouldDeny()}
+	h := &harness{eval: auditDeny()}
 	srv := New(Config{
 		Evaluator:   h.eval,
 		Faults:      faults,
@@ -91,6 +55,7 @@ func newHarnessBudget(t *testing.T, faults Faults, budget time.Duration) *harnes
 			h.mu.Unlock()
 		},
 	})
+	h.srv = srv
 	lis := bufconn.Listen(1 << 20)
 	g := grpc.NewServer()
 	extprocv3.RegisterExternalProcessorServer(g, srv)
@@ -146,16 +111,15 @@ func sendRequest(t *testing.T, st extprocv3.ExternalProcessor_ProcessClient) *ex
 		Request: &extprocv3.ProcessingRequest_RequestHeaders{RequestHeaders: &extprocv3.HttpHeaders{
 			Headers: hdrs(":method", "POST", ":path", "/v1/messages", ":authority", "api.anthropic.com", "x-request-id", "rid-1")}}}))
 	recv(t, st)
+	// With an evaluator the body is forwarded one chunk behind, so the first
+	// half gets no answer and the end of stream forwards both.
 	half := len(reqBody) / 2
-	var last *extprocv3.ProcessingResponse
-	var echoed []byte
 	for i, part := range []string{reqBody[:half], reqBody[half:]} {
 		must(t, st.Send(&extprocv3.ProcessingRequest{Request: &extprocv3.ProcessingRequest_RequestBody{
 			RequestBody: &extprocv3.HttpBody{Body: []byte(part), EndOfStream: i == 1}}}))
-		last = recv(t, st)
-		echoed = append(echoed, last.GetRequestBody().GetResponse().GetBodyMutation().GetStreamedResponse().GetBody()...)
 	}
-	if string(echoed) != reqBody {
+	last := recv(t, st)
+	if echoed := forwarded(last); echoed != reqBody {
 		t.Fatalf("request body not forwarded unchanged:\n%s", echoed)
 	}
 	must(t, st.Send(&extprocv3.ProcessingRequest{Request: &extprocv3.ProcessingRequest_ResponseHeaders{
@@ -171,7 +135,8 @@ func TestAuditPassThrough(t *testing.T) {
 	last := sendRequest(t, st)
 
 	audit := last.GetDynamicMetadata().GetFields()[AuditNS].GetStructValue().GetFields()
-	if audit["action"].GetStringValue() != "would_deny" || audit["rule_id"].GetStringValue() != fakeRuleID {
+	if audit["action"].GetStringValue() != "deny" || audit["mode"].GetStringValue() != "audit" ||
+		!audit["would_deny"].GetBoolValue() || audit["rule_id"].GetStringValue() != fakeRuleID {
 		t.Fatalf("audit metadata = %v", audit)
 	}
 	if got := h.eval.body(); got != reqBody {
@@ -197,8 +162,8 @@ func TestAuditPassThrough(t *testing.T) {
 	if r.TransactionID != "rid-1" || r.Identity == nil || r.Identity.Pod != "coder-7d9f" || r.PPv2Ignored == "" {
 		t.Fatalf("identity: %+v", r)
 	}
-	if r.Decision == nil || r.Decision.Action != plugin.WouldDeny || len(r.Decision.Tools) != 1 {
-		t.Fatalf("decision: %+v", r.Decision)
+	if r.Verdict == nil || r.Verdict.Action != plugin.ActionDeny || !r.WouldDeny || r.Model != "claude-opus-5-5" || r.Provider != "anthropic" {
+		t.Fatalf("verdict: %+v %+v", r.Verdict, r)
 	}
 	if r.SSEEvents != 7 || r.StopReason != "end_turn" || r.Status != "200" || r.Ended != "eos" || r.EarlyEOS {
 		t.Fatalf("record: %+v", r)
@@ -305,7 +270,7 @@ func TestWatchdogEndsStalledResponse(t *testing.T) {
 	start := time.Now()
 	sr := recv(t, st).GetResponseBody().GetResponse().GetBodyMutation().GetStreamedResponse()
 	took := time.Since(start)
-	if !sr.GetEndOfStream() || !strings.Contains(string(sr.GetBody()), "event: error") {
+	if !sr.GetEndOfStream() || string(sr.GetBody()) != fakeStreamError("anthropic", "watchdog") {
 		t.Fatalf("watchdog response: eos=%v body=%q", sr.GetEndOfStream(), sr.GetBody())
 	}
 	if took > time.Second {
@@ -373,77 +338,6 @@ func must(t *testing.T, err error) {
 	}
 }
 
-// The evaluator's document version and degraded flag reach the audit metadata.
-func TestDecisionVersionAndDegradedReachAudit(t *testing.T) {
-	eval := &fakeEvaluator{decision: plugin.Decision{RuleID: fakeRuleID, Action: plugin.Allow, ClassVersion: "v7"}}
-	h := &harness{}
-	srv := New(Config{Evaluator: eval, Conns: newTable(), Lookup: fixedLookup(testWorkload(), time.Time{}, nil), Emit: func(r Record) {
-		h.mu.Lock()
-		h.records = append(h.records, r)
-		h.mu.Unlock()
-	}})
-	lis := bufconn.Listen(1 << 20)
-	g := grpc.NewServer()
-	extprocv3.RegisterExternalProcessorServer(g, srv)
-	go g.Serve(lis)
-	defer g.Stop()
-	conn, _ := grpc.NewClient("passthrough:///buf",
-		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),
-		grpc.WithTransportCredentials(insecure.NewCredentials()))
-	defer conn.Close()
-	h.client = extprocv3.NewExternalProcessorClient(conn)
-
-	for i, degraded := range []bool{false, true} {
-		eval.mu.Lock()
-		eval.decision.Degraded = degraded
-		eval.mu.Unlock()
-		st, err := h.client.Process(context.Background())
-		must(t, err)
-		last := sendRequest(t, st)
-		must(t, st.CloseSend())
-		a := last.GetDynamicMetadata().GetFields()[AuditNS].GetStructValue().GetFields()
-		if a["action"].GetStringValue() != "allow" || a["class_version"].GetStringValue() != "v7" || a["degraded"].GetBoolValue() != degraded {
-			t.Fatalf("run %d: %v", i, a)
-		}
-	}
-}
-
-// Enforce: a would_deny request gets a 403 instead of its last chunk being forwarded.
-func TestEnforceBlocksWithProviderShaped403(t *testing.T) {
-	h := &harness{}
-	srv := New(Config{Evaluator: wouldDeny(), Enforce: true, Conns: newTable(), Lookup: fixedLookup(testWorkload(), time.Time{}, nil), Emit: func(r Record) {
-		h.mu.Lock()
-		h.records = append(h.records, r)
-		h.mu.Unlock()
-	}})
-	lis := bufconn.Listen(1 << 20)
-	g := grpc.NewServer()
-	extprocv3.RegisterExternalProcessorServer(g, srv)
-	go g.Serve(lis)
-	defer g.Stop()
-	conn, _ := grpc.NewClient("passthrough:///buf",
-		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),
-		grpc.WithTransportCredentials(insecure.NewCredentials()))
-	defer conn.Close()
-	st, err := extprocv3.NewExternalProcessorClient(conn).Process(context.Background())
-	must(t, err)
-	must(t, st.Send(&extprocv3.ProcessingRequest{Attributes: srcAttrs(testSource), Request: &extprocv3.ProcessingRequest_RequestHeaders{RequestHeaders: &extprocv3.HttpHeaders{
-		Headers: hdrs(":method", "POST", ":path", "/v1/messages", ":authority", "api.anthropic.com")}}}))
-	recv(t, st)
-	half := len(reqBody) / 2
-	// Enforce forwards one chunk behind: the first chunk gets no answer yet.
-	must(t, st.Send(&extprocv3.ProcessingRequest{Request: &extprocv3.ProcessingRequest_RequestBody{RequestBody: &extprocv3.HttpBody{Body: []byte(reqBody[:half])}}}))
-	must(t, st.Send(&extprocv3.ProcessingRequest{Request: &extprocv3.ProcessingRequest_RequestBody{RequestBody: &extprocv3.HttpBody{Body: []byte(reqBody[half:]), EndOfStream: true}}}))
-	ir := recv(t, st).GetImmediateResponse()
-	if ir == nil || ir.GetStatus().GetCode() != 403 || !strings.Contains(string(ir.GetBody()), "permission_error") {
-		t.Fatalf("immediate response = %v", ir)
-	}
-	must(t, st.CloseSend())
-	if r := h.waitRecords(t, 1)[0]; r.Decision.Action != plugin.Deny || r.Ended != "denied" {
-		t.Fatalf("record: %+v", r)
-	}
-}
-
 // start runs a server with cfg and returns a stream plus the harness that collects records.
 func start(t *testing.T, cfg Config) (extprocv3.ExternalProcessor_ProcessClient, *harness) {
 	t.Helper()
@@ -465,9 +359,13 @@ func startRaw(t *testing.T, cfg Config) (extprocv3.ExternalProcessor_ProcessClie
 		h.records = append(h.records, r)
 		h.mu.Unlock()
 	}
+	h.srv = New(cfg)
+	if f, ok := cfg.Evaluator.(*fakeEval); ok {
+		h.eval = f
+	}
 	lis := bufconn.Listen(1 << 20)
 	g := grpc.NewServer()
-	extprocv3.RegisterExternalProcessorServer(g, New(cfg))
+	extprocv3.RegisterExternalProcessorServer(g, h.srv)
 	go g.Serve(lis)
 	t.Cleanup(g.Stop)
 	conn, err := grpc.NewClient("passthrough:///buf",
@@ -475,9 +373,18 @@ func startRaw(t *testing.T, cfg Config) (extprocv3.ExternalProcessor_ProcessClie
 		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	must(t, err)
 	t.Cleanup(func() { conn.Close() })
-	st, err := extprocv3.NewExternalProcessorClient(conn).Process(context.Background())
+	h.client = extprocv3.NewExternalProcessorClient(conn)
+	st, err := h.client.Process(context.Background())
 	must(t, err)
 	return st, h
+}
+
+// stream opens another transaction on the harness's server.
+func (h *harness) stream(t *testing.T) extprocv3.ExternalProcessor_ProcessClient {
+	t.Helper()
+	st, err := h.client.Process(context.Background())
+	must(t, err)
+	return st
 }
 
 func sendHeaders(t *testing.T, st extprocv3.ExternalProcessor_ProcessClient, kv ...string) *extprocv3.ProcessingResponse {
@@ -508,152 +415,4 @@ func forwarded(r *extprocv3.ProcessingResponse) string {
 
 func is403(r *extprocv3.ProcessingResponse) bool {
 	return r.GetImmediateResponse().GetStatus().GetCode() == 403
-}
-
-// The shipped processor has no evaluator: it forwards the body, decides nothing, blocks nothing.
-func TestNoEvaluatorPassesEverything(t *testing.T) {
-	st, h := start(t, Config{Enforce: true})
-	sendHeaders(t, st)
-	sendBody(t, st, reqBody, true)
-	r := recv(t, st)
-	if forwarded(r) != reqBody || r.GetImmediateResponse() != nil {
-		t.Fatalf("response = %v", r)
-	}
-	if r.GetDynamicMetadata() != nil {
-		t.Fatalf("audit metadata without an evaluator: %v", r.GetDynamicMetadata())
-	}
-	must(t, st.CloseSend())
-	if rec := h.waitRecords(t, 1)[0]; rec.Decision != nil {
-		t.Fatalf("decision without an evaluator: %+v", rec.Decision)
-	}
-}
-
-// A degraded would_deny is audit only, even in enforce mode.
-func TestEnforceNeverBlocksDegraded(t *testing.T) {
-	eval := wouldDeny()
-	eval.decision.Degraded = true
-	st, h := start(t, Config{Evaluator: eval, Enforce: true})
-	sendHeaders(t, st)
-	sendBody(t, st, reqBody, true)
-	r := recv(t, st)
-	if r.GetImmediateResponse() != nil || forwarded(r) != reqBody {
-		t.Fatalf("degraded decision blocked or body changed: %v", r)
-	}
-	a := r.GetDynamicMetadata().GetFields()[AuditNS].GetStructValue().GetFields()
-	if a["action"].GetStringValue() != "would_deny" || !a["degraded"].GetBoolValue() {
-		t.Fatalf("audit = %v", a)
-	}
-	must(t, st.CloseSend())
-	if rec := h.waitRecords(t, 1)[0]; rec.Decision.Action != plugin.WouldDeny || rec.Ended == "denied" {
-		t.Fatalf("record: %+v", rec)
-	}
-}
-
-// A request that ends in trailers has no body chunk marked end of stream. It is decided on the trailers.
-func TestTrailersAreDecided(t *testing.T) {
-	st, h := start(t, Config{Evaluator: wouldDeny()})
-	sendHeaders(t, st)
-	sendBody(t, st, reqBody, false)
-	if got := forwarded(recv(t, st)); got != reqBody {
-		t.Fatalf("audit mode held the chunk back: %q", got)
-	}
-	sendTrailers(t, st)
-	r := recv(t, st)
-	a := r.GetDynamicMetadata().GetFields()[AuditNS].GetStructValue().GetFields()
-	if r.GetRequestTrailers() == nil || a["action"].GetStringValue() != "would_deny" {
-		t.Fatalf("trailers response = %v", r)
-	}
-	must(t, st.CloseSend())
-	if rec := h.waitRecords(t, 1)[0]; rec.Decision == nil || rec.Decision.Action != plugin.WouldDeny {
-		t.Fatalf("record: %+v", rec)
-	}
-}
-
-// Enforce with trailers: the request is denied and its last chunk never goes upstream.
-func TestEnforceBlocksOnTrailers(t *testing.T) {
-	st, h := start(t, Config{Evaluator: wouldDeny(), Enforce: true})
-	sendHeaders(t, st)
-	half := len(reqBody) / 2
-	sendBody(t, st, reqBody[:half], false) // held, no answer
-	sendBody(t, st, reqBody[half:], false)
-	if got := forwarded(recv(t, st)); got != reqBody[:half] {
-		t.Fatalf("forwarded %q, want only the first chunk", got)
-	}
-	sendTrailers(t, st)
-	if r := recv(t, st); !is403(r) {
-		t.Fatalf("want 403, got %v", r)
-	}
-	must(t, st.CloseSend())
-	if rec := h.waitRecords(t, 1)[0]; rec.Decision.Action != plugin.Deny || rec.Ended != "denied" {
-		t.Fatalf("record: %+v", rec)
-	}
-}
-
-// Enforce with an empty final chunk: the last chunk that carried data is still held back.
-func TestEnforceHoldsLastDataChunk(t *testing.T) {
-	st, _ := start(t, Config{Evaluator: wouldDeny(), Enforce: true})
-	sendHeaders(t, st)
-	half := len(reqBody) / 2
-	sendBody(t, st, reqBody[:half], false)
-	sendBody(t, st, reqBody[half:], false)
-	if got := forwarded(recv(t, st)); got != reqBody[:half] {
-		t.Fatalf("forwarded %q, want only the first chunk", got)
-	}
-	sendBody(t, st, "", true)
-	if r := recv(t, st); !is403(r) {
-		t.Fatalf("want 403, got %v", r)
-	}
-}
-
-// Enforce and an allowed request: the held chunk is released, in order, on trailers and on end of stream.
-func TestEnforceReleasesHeldChunkWhenAllowed(t *testing.T) {
-	allow := func() *fakeEvaluator {
-		return &fakeEvaluator{decision: plugin.Decision{RuleID: fakeRuleID, Action: plugin.Allow}}
-	}
-	half := len(reqBody) / 2
-
-	st, _ := start(t, Config{Evaluator: allow(), Enforce: true})
-	sendHeaders(t, st)
-	sendBody(t, st, reqBody[:half], false)
-	sendBody(t, st, reqBody[half:], true)
-	r := recv(t, st)
-	if forwarded(r) != reqBody || !r.GetRequestBody().GetResponse().GetBodyMutation().GetStreamedResponse().GetEndOfStream() {
-		t.Fatalf("end of stream: %v", r)
-	}
-
-	st, _ = start(t, Config{Evaluator: allow(), Enforce: true})
-	sendHeaders(t, st)
-	sendBody(t, st, reqBody, false)
-	sendTrailers(t, st)
-	if got := forwarded(recv(t, st)); got != reqBody {
-		t.Fatalf("held chunk before trailers: %q", got)
-	}
-	if r := recv(t, st); r.GetRequestTrailers() == nil {
-		t.Fatalf("want the trailers response, got %v", r)
-	}
-}
-
-// The upgrade header is the client's, so it must not skip the evaluator on an inspected path.
-func TestWebSocketUpgradeOnInspectedPath(t *testing.T) {
-	st, h := start(t, Config{Evaluator: wouldDeny()})
-	r := sendHeaders(t, st, "upgrade", "websocket")
-	a := r.GetDynamicMetadata().GetFields()[AuditNS].GetStructValue().GetFields()
-	if r.GetRequestHeaders() == nil || a["rule_id"].GetStringValue() != RuleUnevaluatedUpgrade || a["action"].GetStringValue() != "would_deny" {
-		t.Fatalf("audit mode: %v", r)
-	}
-	must(t, st.CloseSend())
-	h.waitRecords(t, 1)
-
-	st, _ = start(t, Config{Evaluator: wouldDeny(), Enforce: true})
-	if r := sendHeaders(t, st, "upgrade", "websocket"); !is403(r) {
-		t.Fatalf("enforce mode: want 403, got %v", r)
-	}
-
-	// A path the evaluator does not inspect upgrades as before.
-	st, _ = start(t, Config{Evaluator: wouldDeny(), Enforce: true})
-	must(t, st.Send(&extprocv3.ProcessingRequest{Attributes: srcAttrs(testSource), Request: &extprocv3.ProcessingRequest_RequestHeaders{
-		RequestHeaders: &extprocv3.HttpHeaders{Headers: hdrs(":method", "GET", ":path", "/v1/ws", "upgrade", "websocket")}}}))
-	if r := recv(t, st); r.GetRequestHeaders() == nil || r.GetDynamicMetadata().GetFields()[AuditNS].GetStructValue().GetFields()["rule_id"] != nil {
-		t.Fatalf("uninspected path: %v", r)
-	}
 }

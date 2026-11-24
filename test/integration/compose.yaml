@@ -30,8 +30,9 @@ services:
     environment:
       SANDBOX_GATEWAY_SOCKET_GID: "101"
     # PROCESSOR_MODE=--reject-all empties the stub table; run.sh sets it for one check.
+    # --evaluator: a test evaluator that denies the model "denied-model" (run.sh checks it).
     command: ["processor-it", "--listen", "unix:///run/kubescape-sandbox/extproc.sock",
-              "${PROCESSOR_MODE:---posture=allow}"]
+              "--evaluator", "--mode=enforce", "${PROCESSOR_MODE:---posture=allow}"]
     volumes:
     - run-gateway:/run/kubescape-sandbox
 

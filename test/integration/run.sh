@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # One streamed call through Envoy to the mock provider.
 # Pass: the client, trusting only the gateway CA, reads the whole stream (end_turn), and the
-# processor's transaction record shows it parsed the same stream and named the pod. Refusals
+# processor's transaction record shows it parsed the same stream and named the pod. The
+# processor runs a test evaluator: a request for "denied-model" gets its 403. Refusals
 # checked too: a Host header that is not the decrypted name, a passthrough name that
 # resolves to loopback, and a connection that is not in the connection table. A client
 # must not be able to choose the address the processor looks it up by, with an
@@ -40,6 +41,15 @@ sleep 1
 grep -q '"stop_reason":"end_turn"' generated/record.json
 grep -Eq '"sse_events":[1-9]' generated/record.json
 grep -q '"pod":"it-pod"' generated/record.json
+
+echo "--- the test evaluator blocks a request for the denied model, with its DenyResponse"
+"${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt \
+  --model denied-model --expect-status 403 --wait 0 | tee generated/denied.json
+grep -q 'denied by the integration test evaluator' generated/denied.json
+sleep 1
+"${COMPOSE[@]}" logs --no-color --no-log-prefix processor | grep '"msg":"transaction"' | tail -1 | tee generated/denied-record.json
+grep -q '"rule":"it.denied-model"' generated/denied-record.json
+grep -q '"ended":"denied"' generated/denied-record.json
 
 echo "--- a Host header that differs from the decrypted name is refused"
 "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt \

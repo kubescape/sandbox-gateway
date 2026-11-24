@@ -13,6 +13,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -28,6 +29,8 @@ type result struct {
 	Deltas     int    `json:"content_deltas"`
 	StopReason string `json:"stop_reason"`
 	Complete   bool   `json:"message_stop"`
+	// Body is the start of the response body, kept with -expect-status.
+	Body string `json:"body,omitempty"`
 }
 
 func main() {
@@ -113,6 +116,8 @@ func call(addr, host, hostHeader, caPath, model, xff, proxyLine string, expect i
 		if resp.StatusCode != expect {
 			return res, fmt.Errorf("status %d, want %d", resp.StatusCode, expect)
 		}
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		res.Body = string(b)
 		return res, nil
 	}
 	if resp.StatusCode != http.StatusOK {

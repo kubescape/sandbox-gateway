@@ -1,19 +1,19 @@
-// Package extproc is the PoC's Envoy external processor: the policy core.
+// Package extproc is the gateway's Envoy external processor.
 //
 // Envoy runs it with request and response bodies in FULL_DUPLEX_STREAMED mode.
 // In that mode the processor owns the body: every chunk Envoy sends must be
-// answered with a StreamedBodyResponse carrying the bytes to forward. The PoC
-// forwards every byte unchanged (audit only) while it:
+// answered with a StreamedBodyResponse carrying the bytes to forward.
 //
-//   - buffers the request body (up to a cap), evaluates the one intent at end
-//     of stream and writes the decision into dynamic metadata ("kubescape.sandbox.audit")
-//     for the access log;
-//   - parses the SSE response as it streams and times each chunk;
-//   - emits one Record per transaction (stage 4 turns these into OTLP).
+// For each transaction it identifies the pod from the kernel connection table,
+// streams the request body to the evaluator (pkg/plugin) and enforces the
+// verdict, parses the response stream and times each chunk, and emits one
+// Record. Every call into the evaluator is bounded (evalcall.go): a stalled or
+// panicking evaluator fails the request, and the framework answers on its own
+// when the evaluator cannot. With no evaluator every request passes.
 //
 // Two fault knobs exist for the hostile tests and are off by default:
-// StallAfterChunks (stalled processor, AC6) and EarlyEOSAfterEvents (early
-// EOS with synthetic terminal events, AC7).
+// StallAfterChunks (stalled processor) and EarlyEOSAfterEvents (early EOS with
+// synthetic terminal events).
 package extproc
 
 import (
@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,6 +53,26 @@ const (
 	AuditNS       = "kubescape.sandbox.audit"
 )
 
+// Defaults and framework rule ids.
+const (
+	// DefaultChunkBudget is how long one response chunk, one write of the
+	// request body to the evaluator, or one evaluator call may take.
+	DefaultChunkBudget = 3 * time.Second
+	// DefaultMaxEvaluatorCalls caps the evaluator calls in flight (decision 10).
+	DefaultMaxEvaluatorCalls = 64
+	// callbackBudget bounds DenyResponse and StreamError (decision 12).
+	callbackBudget = 200 * time.Millisecond
+
+	// RuleEvaluatorTimeout is the rule on a request the evaluator could not
+	// decide: a call stalled, panicked or found no free slot after evaluation
+	// began.
+	RuleEvaluatorTimeout = "framework.evaluator-timeout"
+	// RuleEvaluatorSaturated is the rule on a request that could not begin
+	// evaluation because every slot was taken. It is decided by the pod's
+	// fail posture.
+	RuleEvaluatorSaturated = "framework.evaluator-saturated"
+)
+
 // Faults are test-only behaviours for the hostile tests.
 type Faults struct {
 	StallAfterChunks    int // stop answering after this many response body chunks; 0 = off
@@ -60,20 +81,19 @@ type Faults struct {
 
 // Config configures the processor.
 type Config struct {
-	// Evaluator decides inspected requests. nil means this build has no rule
-	// evaluator: nothing is scanned, no decision is recorded and nothing is blocked.
+	// Evaluator decides requests. nil means this build has none: nothing is
+	// classified or evaluated and every request passes.
 	Evaluator plugin.Evaluator
-	// Enforce turns would_deny into a block: the request body is forwarded one
-	// chunk behind, so the last chunk with data is never sent (the upstream only
-	// ever saw an incomplete body, then a reset) and the client gets a
-	// provider-shaped 403. A degraded decision never blocks.
-	Enforce bool
-	Faults  Faults
-	// ChunkBudget is the AC6 watchdog: if answering one response chunk takes
-	// longer than this, a separate goroutine ends the response with an
-	// Anthropic error event (fail closed). 0 disables it. It covers a slow or
-	// hung policy step while the gRPC stream still works; a wedged process
-	// needs Envoy's idle timeout or a restart (see README).
+	// MaxEvaluatorCalls caps the evaluator calls in flight, stuck ones
+	// included. 0 means DefaultMaxEvaluatorCalls.
+	MaxEvaluatorCalls int
+	Faults            Faults
+	// ChunkBudget is the watchdog: if answering one response chunk takes
+	// longer than this, a separate goroutine ends the response with the
+	// evaluator's StreamError frame (fail closed), or with end of stream and
+	// no frame. 0 disables the watchdog. It also bounds each write of the
+	// request body to the evaluator and each evaluator call; there 0 means
+	// DefaultChunkBudget.
 	ChunkBudget time.Duration
 	// Conns is the kernel's record of who opened each connection, keyed on the
 	// pod socket's address and port, which Envoy reports as the source.address
@@ -118,23 +138,32 @@ type Identity struct {
 
 // Record is the per-transaction audit record.
 type Record struct {
-	TransactionID     string           `json:"transaction_id"` // Envoy x-request-id; joined to the tap's id in stage 4
-	Identity          *Identity        `json:"identity,omitempty"`
-	Downstream        string           `json:"downstream,omitempty"`   // source.address from Envoy
-	PPv2Ignored       string           `json:"ppv2_ignored,omitempty"` // an identity the client claimed over PROXY protocol; never used
-	RejectReason      string           `json:"reject_reason,omitempty"`
-	TestOracle        string           `json:"test_oracle,omitempty"` // x-sandbox-test-oracle, set by the stage 1 test client
-	Authority         string           `json:"authority,omitempty"`
-	Method            string           `json:"method,omitempty"`
-	Path              string           `json:"path,omitempty"`
-	Decision          *plugin.Decision `json:"decision,omitempty"`
-	RequestBytes      int              `json:"request_bytes"`
-	Status            string           `json:"status,omitempty"`
-	ContentEncoding   string           `json:"content_encoding,omitempty"` // non-empty = compressed body the processor can't read
-	ResponseChunks    int              `json:"response_chunks"`
-	ResponseBytes     int              `json:"response_bytes"`
-	SSEEvents         int              `json:"sse_events"`
-	EventStreamFrames int              `json:"eventstream_frames,omitempty"` // Bedrock application/vnd.amazon.eventstream frames
+	TransactionID string    `json:"transaction_id"` // Envoy x-request-id; joined to the tap's id in stage 4
+	Identity      *Identity `json:"identity,omitempty"`
+	Downstream    string    `json:"downstream,omitempty"`   // source.address from Envoy
+	PPv2Ignored   string    `json:"ppv2_ignored,omitempty"` // an identity the client claimed over PROXY protocol; never used
+	RejectReason  string    `json:"reject_reason,omitempty"`
+	TestOracle    string    `json:"test_oracle,omitempty"` // x-sandbox-test-oracle, set by the stage 1 test client
+	Authority     string    `json:"authority,omitempty"`
+	Method        string    `json:"method,omitempty"`
+	Path          string    `json:"path,omitempty"`
+	// Provider and Model are what the evaluator's Classify returned.
+	Provider string   `json:"provider,omitempty"`
+	Model    string   `json:"model,omitempty"`
+	Verdict  *Verdict `json:"verdict,omitempty"`
+	// WouldDeny is a deny verdict in audit mode: the request passed.
+	WouldDeny bool `json:"would_deny,omitempty"`
+	// Degraded marks a request decided without a full evaluation.
+	Degraded bool `json:"degraded,omitempty"`
+	// EvaluatorError says which evaluator call failed and how.
+	EvaluatorError    string `json:"evaluator_error,omitempty"`
+	RequestBytes      int    `json:"request_bytes"`
+	Status            string `json:"status,omitempty"`
+	ContentEncoding   string `json:"content_encoding,omitempty"` // non-empty = compressed body the processor can't read
+	ResponseChunks    int    `json:"response_chunks"`
+	ResponseBytes     int    `json:"response_bytes"`
+	SSEEvents         int    `json:"sse_events"`
+	EventStreamFrames int    `json:"eventstream_frames,omitempty"` // Bedrock application/vnd.amazon.eventstream frames
 	// StopReason is how the provider said the response ended, in its own
 	// terms: the Anthropic stop_reason, the OpenAI chat finish_reason, or the
 	// OpenAI Responses status ("completed", "incomplete", "failed").
@@ -147,6 +176,21 @@ type Record struct {
 	WebSocket         *WSStats `json:"websocket,omitempty"`
 	ObservabilityMode bool     `json:"observability_mode,omitempty"`
 	Ended             string   `json:"ended"` // eos | trailers | stream_closed | stream_error | watchdog | denied | rejected
+}
+
+// Verdict is the evaluator's verdict as the record carries it.
+type Verdict struct {
+	Action         string `json:"action"` // allow | deny
+	Mode           string `json:"mode"`   // audit | enforce
+	Rule           string `json:"rule,omitempty"`
+	Origin         string `json:"origin,omitempty"`
+	PolicyUID      string `json:"policy_uid,omitempty"`
+	PolicyRevision int64  `json:"policy_revision,omitempty"`
+}
+
+func recordVerdict(v plugin.Verdict) *Verdict {
+	return &Verdict{Action: v.Action, Mode: v.Mode, Rule: v.Rule, Origin: v.Origin,
+		PolicyUID: v.PolicyUID, PolicyRevision: v.PolicyRevision}
 }
 
 // WSStats summarises an upgraded WebSocket connection (S5): messages decoded
@@ -163,10 +207,16 @@ type WSStats struct {
 // Server implements ExternalProcessorServer.
 type Server struct {
 	extprocv3.UnimplementedExternalProcessorServer
-	cfg    Config
-	Active atomic.Int64
-	Total  atomic.Int64
+	cfg     Config
+	calls   *calls
+	feeders atomic.Int64 // goroutines writing a request chunk to the evaluator
+	Active  atomic.Int64
+	Total   atomic.Int64
 }
+
+// StuckEvaluatorCalls is the number of evaluator calls still running past
+// their deadline.
+func (s *Server) StuckEvaluatorCalls() int64 { return s.calls.stuck.Load() }
 
 // New returns a processor.
 func New(cfg Config) *Server {
@@ -180,14 +230,25 @@ func New(cfg Config) *Server {
 			log.Info("transaction", "record", json.RawMessage(b))
 		}
 	}
-	return &Server{cfg: cfg}
+	return &Server{cfg: cfg, calls: newCalls(cfg.MaxEvaluatorCalls)}
+}
+
+// budget bounds one evaluator call or one write of the body to it.
+func (s *Server) budget() time.Duration {
+	if s.cfg.ChunkBudget > 0 {
+		return s.cfg.ChunkBudget
+	}
+	return DefaultChunkBudget
 }
 
 // txn is the per-stream state. One ext_proc stream is one HTTP transaction.
 type txn struct {
 	rec       Record
-	scan      plugin.Scan // request body, scanned as it streams (no buffering); nil when not inspected
-	held      []byte      // enforce: the newest request chunk, not yet forwarded
+	ctx       context.Context // ends when the transaction does
+	policies  []plugin.PolicyRef
+	headers   http.Header
+	eval      *evaluation // nil when the request is not being evaluated
+	held      []byte      // the newest request chunk, not forwarded until the verdict
 	holding   bool
 	wsIn      wsframe.Decoder
 	wsOut     wsframe.Decoder
@@ -200,6 +261,7 @@ type txn struct {
 	emitted   bool
 
 	// Shared with the watchdog goroutine.
+	provider      atomic.Value // string: the provider Classify named
 	inflightSince atomic.Int64 // unix nanos a response chunk started; 0 when none
 	fired         atomic.Bool
 	sendMu        sync.Mutex
@@ -234,10 +296,11 @@ func (s *Server) watch(stream extprocv3.ExternalProcessor_ProcessServer, t *txn,
 				continue
 			}
 			s.cfg.Log.Warn("watchdog: chunk over budget, ending response fail-closed", "budget", budget)
+			frame := s.streamError(t, "watchdog")
 			t.sendMu.Lock()
 			if !t.closed { // Process may have returned while this goroutine waited
 				_ = stream.Send(&extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ResponseBody{
-					ResponseBody: streamed(watchdogErrorEvent, true)}})
+					ResponseBody: streamed(frame, true)}})
 				t.closed = true
 			}
 			t.sendMu.Unlock()
@@ -246,16 +309,39 @@ func (s *Server) watch(stream extprocv3.ExternalProcessor_ProcessServer, t *txn,
 	}
 }
 
-// watchdogErrorEvent is how the Anthropic API itself ends a stream that fails
-// mid-flight, so SDKs raise a normal API error instead of a protocol error.
-var watchdogErrorEvent = []byte("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"egress gateway: policy processing timed out, response ended (fail closed)\"}}\n\n")
+// streamError is the frame that ends a stalled stream: the evaluator's
+// StreamError for the request's provider. With no evaluator, or one that
+// cannot answer within callbackBudget, it is nil and the stream just ends.
+func (s *Server) streamError(t *txn, reason string) []byte {
+	if s.cfg.Evaluator == nil {
+		return nil
+	}
+	provider, _ := t.provider.Load().(string)
+	frame, err := run(s.calls, context.Background(), callbackBudget, func(context.Context) []byte {
+		return s.cfg.Evaluator.StreamError(provider, reason)
+	})
+	if err != nil {
+		s.cfg.Log.Warn("StreamError gave no frame; ending the stream without one", "error", err)
+		return nil
+	}
+	return frame
+}
 
 // Process handles one HTTP transaction.
 func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error {
 	s.Active.Add(1)
 	s.Total.Add(1)
 	defer s.Active.Add(-1)
-	t := &txn{}
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
+	t := &txn{ctx: ctx}
+	// Whatever way the transaction ends, an evaluation still running is
+	// stopped: its pipe is closed, which unblocks Classify and any writer.
+	defer func() {
+		if t.eval != nil {
+			t.eval.abort()
+		}
+	}()
 	// gRPC forbids Send once the handler has returned. Taking sendMu here waits
 	// for a watchdog Send in flight and stops any later one.
 	defer func() {
@@ -320,50 +406,6 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 	}
 }
 
-// inspects reports whether the evaluator looks at this request, and starts its
-// scan on first use.
-func (s *Server) inspects(t *txn) bool {
-	if s.cfg.Evaluator == nil || !s.cfg.Evaluator.Inspects(t.rec.Path) {
-		return false
-	}
-	if t.scan == nil {
-		t.scan = s.cfg.Evaluator.NewScan()
-	}
-	return true
-}
-
-// RuleUnevaluatedUpgrade is the rule id on a request the framework refuses to
-// pass unexamined: a WebSocket upgrade on a path the evaluator inspects. The
-// body of such a request is frames, which the evaluator cannot read.
-const RuleUnevaluatedUpgrade = "framework.websocket-on-inspected-path"
-
-// verdict records a decision on the transaction and returns the audit metadata
-// for the access log. denied is true when enforce mode blocks the request: a
-// would_deny that is not degraded.
-func (s *Server) verdict(t *txn, d plugin.Decision) (meta *structpb.Struct, denied bool) {
-	if s.cfg.Enforce && d.Action == plugin.WouldDeny && !d.Degraded {
-		d.Action = plugin.Deny
-		denied = true
-		t.rec.Ended = "denied"
-	}
-	t.rec.Decision = &d
-	fields := map[string]any{
-		"rule_id": d.RuleID, "action": string(d.Action), "model": d.Model, "reason": d.Reason,
-		"class_version": d.ClassVersion, "degraded": d.Degraded,
-	}
-	for k, v := range identityFields(t.rec.Identity) {
-		fields[k] = v
-	}
-	return auditMetadata(fields), denied
-}
-
-func deny(d *plugin.Decision, meta *structpb.Struct) *extprocv3.ProcessingResponse {
-	return &extprocv3.ProcessingResponse{
-		Response:        &extprocv3.ProcessingResponse_ImmediateResponse{ImmediateResponse: denyResponse(d.Reason)},
-		DynamicMetadata: meta,
-	}
-}
-
 // identify finds who sent the request, from the kernel table and node-agent's
 // lookup, and puts it on the record. It returns a non-empty reason when the
 // request must be rejected.
@@ -424,6 +466,9 @@ func (s *Server) identify(ctx context.Context, t *txn) (rejectReason string) {
 		default:
 			id.Namespace, id.Pod, id.Container = w.Namespace, w.Pod, w.Container
 			id.ControllerKind, id.ControllerName = w.Controller.Kind, w.Controller.Name
+			for _, p := range w.Policies {
+				t.policies = append(t.policies, plugin.PolicyRef{UID: p.UID, Generation: p.Generation})
+			}
 		}
 		if !failingSince.IsZero() {
 			id.LookupFailingSince = failingSince.UTC().Format(time.RFC3339)
@@ -482,6 +527,7 @@ func (s *Server) handle(stream extprocv3.ExternalProcessor_ProcessServer, t *txn
 			t.rec.Ended, t.rec.RejectReason = "rejected", reason
 			return reject(reason), nil
 		}
+		t.headers = httpHeaders(v.RequestHeaders.GetHeaders())
 		if v.RequestHeaders.GetEndOfStream() {
 			t.reqEOSAt = time.Now()
 		}
@@ -491,15 +537,24 @@ func (s *Server) handle(stream extprocv3.ExternalProcessor_ProcessServer, t *txn
 			Response: &extprocv3.ProcessingResponse_RequestHeaders{
 				RequestHeaders: &extprocv3.HeadersResponse{}},
 			DynamicMetadata: auditMetadata(identityFields(t.rec.Identity))}
-		// The client sets the upgrade header, so it must not be a way around the
-		// evaluator: the request is decided here, without its body.
-		if t.rec.WebSocket != nil && s.cfg.Evaluator != nil && s.cfg.Evaluator.Inspects(t.rec.Path) {
-			meta, denied := s.verdict(t, plugin.Decision{RuleID: RuleUnevaluatedUpgrade, Action: plugin.WouldDeny,
-				Reason: "websocket upgrade on an inspected path cannot be evaluated"})
-			if denied {
-				return deny(t.rec.Decision, meta), nil
+		if s.cfg.Evaluator == nil {
+			return resp, nil
+		}
+		// A request with no body, and a WebSocket upgrade, are decided here.
+		// The client sets the upgrade header, so it must not be a way around
+		// the evaluator: Classify gets an empty body and frames are never fed.
+		noBody := v.RequestHeaders.GetEndOfStream() || t.rec.WebSocket != nil
+		if blocked := s.startEvaluation(t, noBody); blocked != nil {
+			return blocked, nil
+		}
+		if noBody && t.eval != nil {
+			blocked, meta := s.decide(t)
+			if blocked != nil {
+				return blocked, nil
 			}
 			resp.DynamicMetadata = meta
+		} else if t.eval == nil {
+			resp.DynamicMetadata = s.auditMeta(t) // passed unevaluated: no slot, allow pod
 		}
 		return resp, nil
 
@@ -507,19 +562,24 @@ func (s *Server) handle(stream extprocv3.ExternalProcessor_ProcessServer, t *txn
 		chunk := v.RequestBody.GetBody()
 		eos := v.RequestBody.GetEndOfStream()
 		t.rec.RequestBytes += len(chunk)
-		inspected := t.rec.WebSocket == nil && s.inspects(t)
 		if t.rec.WebSocket != nil {
 			t.wsChunk(&t.wsIn, chunk, true)
-		} else if inspected {
-			t.scan.Feed(chunk)
+			return bodyResponse(chunk, eos), nil
+		}
+		if eos {
+			t.reqEOSAt = time.Now()
+		}
+		if t.eval == nil || t.eval.decided {
+			return bodyResponse(chunk, eos), nil
+		}
+		if err := s.feed(t, chunk); err != nil {
+			return s.evaluationFailed(t, "classify", err), nil
 		}
 		if !eos {
-			if !inspected || !s.cfg.Enforce {
-				return bodyResponse(chunk, false), nil
-			}
-			// Enforce: forward one chunk behind. The newest chunk stays here until
-			// the decision, so a denied request never reaches the upstream whole,
-			// even when the client ends it with an empty chunk or with trailers.
+			// Forward one chunk behind. The newest chunk stays here until the
+			// verdict, so a blocked request never reaches the upstream whole,
+			// even when the client ends it with an empty chunk or with
+			// trailers.
 			prev, had := t.held, t.holding
 			t.held, t.holding = chunk, true
 			if !had {
@@ -527,19 +587,16 @@ func (s *Server) handle(stream extprocv3.ExternalProcessor_ProcessServer, t *txn
 			}
 			return bodyResponse(prev, false), nil
 		}
-		t.reqEOSAt = time.Now()
 		if t.holding {
 			chunk = append(t.held, chunk...)
 			t.held, t.holding = nil, false
 		}
-		resp := bodyResponse(chunk, true)
-		if inspected {
-			meta, denied := s.verdict(t, t.scan.Decide())
-			if denied {
-				return deny(t.rec.Decision, meta), nil
-			}
-			resp.DynamicMetadata = meta
+		blocked, meta := s.decide(t)
+		if blocked != nil {
+			return blocked, nil
 		}
+		resp := bodyResponse(chunk, true)
+		resp.DynamicMetadata = meta
 		return resp, nil
 
 	case *extprocv3.ProcessingRequest_RequestTrailers:
@@ -547,11 +604,11 @@ func (s *Server) handle(stream extprocv3.ExternalProcessor_ProcessServer, t *txn
 			RequestTrailers: &extprocv3.TrailersResponse{}}}
 		// A request that ends in trailers never has a body chunk marked end of
 		// stream, so this is where it is decided.
-		if t.rec.WebSocket == nil && t.rec.Decision == nil && s.inspects(t) {
+		if t.eval != nil && !t.eval.decided {
 			t.reqEOSAt = time.Now()
-			meta, denied := s.verdict(t, t.scan.Decide())
-			if denied {
-				return deny(t.rec.Decision, meta), nil
+			blocked, meta := s.decide(t)
+			if blocked != nil {
+				return blocked, nil
 			}
 			resp.DynamicMetadata = meta
 			if t.holding {
@@ -737,20 +794,6 @@ func (t *txn) wsChunk(d *wsframe.Decoder, chunk []byte, in bool) {
 	}
 }
 
-// denyResponse is a 403 shaped like the Anthropic API's own permission_error, so
-// SDKs raise their normal PermissionDenied error and don't retry.
-func denyResponse(reason string) *extprocv3.ImmediateResponse {
-	body, _ := json.Marshal(map[string]any{"type": "error", "error": map[string]string{
-		"type": "permission_error", "message": "blocked by egress policy: " + reason}})
-	return &extprocv3.ImmediateResponse{
-		Status: &typev3.HttpStatus{Code: typev3.StatusCode_Forbidden},
-		Headers: &extprocv3.HeaderMutation{SetHeaders: []*corev3.HeaderValueOption{
-			{Header: &corev3.HeaderValue{Key: "content-type", RawValue: []byte("application/json")}}}},
-		Body:    body,
-		Details: "egress_policy_deny",
-	}
-}
-
 // trackEvent follows the items and the stop reason of the response stream, in
 // whichever of the known formats it arrives.
 func (t *txn) trackEvent(ev sse.Event) {
@@ -821,6 +864,23 @@ func headerMap(hm *corev3.HeaderMap) map[string]string {
 			v = string(h.GetRawValue())
 		}
 		out[strings.ToLower(h.GetKey())] = v
+	}
+	return out
+}
+
+// httpHeaders converts the request headers for the evaluator. Pseudo-headers
+// (":method", ":path", ...) are left out; they reach it as fields of Request.
+func httpHeaders(hm *corev3.HeaderMap) http.Header {
+	out := http.Header{}
+	for _, h := range hm.GetHeaders() {
+		if strings.HasPrefix(h.GetKey(), ":") {
+			continue
+		}
+		v := h.GetValue()
+		if len(h.GetRawValue()) > 0 {
+			v = string(h.GetRawValue())
+		}
+		out.Add(h.GetKey(), v)
 	}
 	return out
 }
