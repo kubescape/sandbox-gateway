@@ -26,7 +26,10 @@ import (
 	"github.com/kubescape/sandbox-gateway/internal/app"
 	"github.com/kubescape/sandbox-gateway/internal/conntable"
 	"github.com/kubescape/sandbox-gateway/internal/lookup"
+	"github.com/kubescape/sandbox-gateway/internal/policysource"
 	"github.com/kubescape/sandbox-gateway/pkg/plugin"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
 )
 
 // Main parses the flags, opens the kernel tables, and serves until SIGTERM
@@ -53,6 +56,20 @@ func Main() {
 	cfg.Conns = conns
 	cfg.Lookup = lookup.New(*lookupSocket, *lookupRefresh, time.Now).Workload
 	cfg.Evaluator = plugin.Registered()
+
+	// The policy informers run with the pod's service account. The processor
+	// runs as a pod and takes no kubeconfig.
+	restCfg, err := rest.InClusterConfig()
+	if err != nil {
+		log.Error("load the in-cluster config", "error", err)
+		os.Exit(1)
+	}
+	client, err := dynamic.NewForConfig(restCfg)
+	if err != nil {
+		log.Error("build the API client", "error", err)
+		os.Exit(1)
+	}
+	cfg.Policies = policysource.New(client, time.Now)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()

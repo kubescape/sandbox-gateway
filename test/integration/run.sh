@@ -2,7 +2,8 @@
 # One streamed call through Envoy to the mock provider.
 # Pass: the client, trusting only the gateway CA, reads the whole stream (end_turn), and the
 # processor's transaction record shows it parsed the same stream and named the pod. The
-# processor runs a test evaluator: a request for "denied-model" gets its 403. Refusals
+# processor runs a test evaluator: a request for "denied-model" gets its 403. Its policy
+# objects come from policies.yaml; a request to a decrypted host they do not list is refused. Refusals
 # checked too: a Host header that is not the decrypted name, a passthrough name that
 # resolves to loopback, and a connection that is not in the connection table. A client
 # must not be able to choose the address the processor looks it up by, with an
@@ -50,6 +51,14 @@ sleep 1
 "${COMPOSE[@]}" logs --no-color --no-log-prefix processor | grep '"msg":"transaction"' | tail -1 | tee generated/denied-record.json
 grep -q '"rule":"it.denied-model"' generated/denied-record.json
 grep -q '"ended":"denied"' generated/denied-record.json
+
+echo "--- a decrypted host that no policy decrypts is refused by the decrypt-list guard"
+"${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt \
+  --host api.openai.com --expect-status 403 --wait 0 | tee generated/not-decrypted.json
+grep -q 'request blocked by the gateway' generated/not-decrypted.json
+sleep 1
+"${COMPOSE[@]}" logs --no-color --no-log-prefix processor | grep '"msg":"transaction"' | tail -1 | tee generated/not-decrypted-record.json
+grep -q '"rule":"framework.host-not-decrypted"' generated/not-decrypted-record.json
 
 echo "--- a Host header that differs from the decrypted name is refused"
 "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt \
