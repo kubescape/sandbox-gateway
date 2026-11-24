@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -250,6 +251,23 @@ func TestLookupServedFromCacheIsMarked(t *testing.T) {
 	must(t, st.CloseSend())
 	id := h.waitRecords(t, 1)[0].Identity
 	if id.Pod != "coder-7d9f" || id.LookupFailingSince != "2026-11-22T10:00:00Z" {
+		t.Fatalf("identity = %+v", id)
+	}
+}
+
+// Review: the kernel tables decide the binding. A lookup answer about another
+// binding does not describe this connection, so none of it is used.
+func TestLookupForAnotherBindingNotUsed(t *testing.T) {
+	w := testWorkload()
+	w.BindingID = 11 // the kernel tables say 12
+	st, h := start(t, Config{Lookup: fixedLookup(w, time.Time{}, nil)})
+	if headersFrom(t, st, testSource).GetRequestHeaders() == nil {
+		t.Fatal("request did not continue")
+	}
+	must(t, st.CloseSend())
+	id := h.waitRecords(t, 1)[0].Identity
+	if id == nil || id.BindingID != 12 || id.Posture != "deny" || id.Pod != "" || id.Namespace != "" ||
+		!strings.HasPrefix(id.LookupError, "binding_mismatch") {
 		t.Fatalf("identity = %+v", id)
 	}
 }

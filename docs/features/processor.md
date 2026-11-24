@@ -20,6 +20,8 @@ Identity comes from two tables node-agent pins under `/sys/fs/bpf/kubescape-sand
 3. `bindings`, keyed on the cgroup, gives the pod's fail posture (`allow` or `deny`) and its health-gate state. Its binding id must equal the one in the `conns` entry.
 4. `GET /v1/workload?cgroup=<id>` on `/run/kubescape-sandbox/lookup.sock` names the namespace, pod, container, controller and the policy objects that cover the pod.
 
+The kernel tables decide the binding. The binding id on the record is the one in `conns`, and it must equal the one in `bindings` (otherwise `binding_mismatch`, below); the posture and the gate come from that same `bindings` entry. The lookup only names the workload, and its answer is used only when its `bindingId` is that same binding. When it names another binding, because node-agent's view or the cache lags a rebinding, the request is not refused, but none of the lookup's fields go on the record: it carries the kernel half of the identity and a `lookup_error` that starts with `binding_mismatch`.
+
 A request is refused with a 403 from the processor, before anything reaches the provider, when:
 
 | `reject_reason` | Cause |
@@ -35,7 +37,7 @@ A PROXY protocol identity that arrives in the `kubescape.sandbox.attribution` me
 
 When node-agent's socket does not answer, the last answer for that cgroup is served from a cache, and the record carries `lookup_failing_since`. With no cached answer the record carries `lookup_error` and only the kernel half of the identity. Neither case is refused.
 
-The lookup runs while the request headers wait, so it is kept short. One request per cgroup is in flight at a time; while it is, other requests for that cgroup get the cached answer at once. After a failed request the cgroup is not asked about again for one second. A request the client abandoned does not count as a failure.
+The lookup runs while the request headers wait, so it is kept short. One request per cgroup is in flight at a time; while it is, other requests for that cgroup get the cached answer at once. After a failed request the cgroup is not asked about again for one second, counted from when the failure came back (a request can take up to the two-second client timeout to fail). A request the client abandoned does not count as a failure.
 
 The pod's namespace, pod name, container, binding id, fail posture and original destination are also written to the `kubescape.sandbox.audit` metadata, so Envoy's access log shows them.
 

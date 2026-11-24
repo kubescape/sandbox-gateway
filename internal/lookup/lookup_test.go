@@ -97,10 +97,22 @@ func (a *fakeAgent) start(t *testing.T) {
 
 func (a *fakeAgent) stop() { _ = a.srv.Close(); _ = os.Remove(a.sock) }
 
-type clock struct{ t time.Time }
+type clock struct {
+	mu sync.Mutex
+	t  time.Time
+}
 
-func (c *clock) now() time.Time          { return c.t }
-func (c *clock) advance(d time.Duration) { c.t = c.t.Add(d) }
+func (c *clock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *clock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
 
 func newClock() *clock { return &clock{t: time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)} }
 
@@ -369,5 +381,48 @@ func TestCancelledCallerIsNotASocketFailure(t *testing.T) {
 	// No retry interval was started: the next call asks again and succeeds.
 	if _, failing, err := c.Workload(context.Background(), 1); err != nil || !failing.IsZero() || a.hits.Load() != 3 {
 		t.Fatalf("failing=%v err=%v hits=%d", failing, err, a.hits.Load())
+	}
+}
+
+// Review: the retry interval must start when the failed fetch returns. A fetch
+// that fails only at the client timeout (2s) used to start a 1s interval at the
+// time it was sent, already over, so the next request fetched again and could
+// wait on the socket again, even with a workload cached.
+func TestRetryIntervalStartsWhenFetchReturns(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		a := newAgent(t)
+		clk := newClock()
+		c := New(a.sock, 5*time.Second, clk.now)
+		hits := int64(0)
+		if cached {
+			if _, _, err := c.Workload(context.Background(), 1); err != nil {
+				t.Fatal(err)
+			}
+			hits = 1
+			clk.advance(6 * time.Second) // past refresh: the next call fetches
+		}
+		a.fail.Store(true)
+		release := a.block()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_, _, _ = c.Workload(context.Background(), 1)
+		}()
+		a.waitHits(t, hits+1)
+		clk.advance(2 * time.Second) // the fetch is slow: longer than retryAfter
+		release()
+		<-done
+		w, failing, err := c.Workload(context.Background(), 1)
+		if n := a.hits.Load(); n != hits+1 {
+			t.Fatalf("cached=%v: %d requests, want %d: the follow-up must wait out the interval", cached, n, hits+1)
+		}
+		if failing.IsZero() || (cached && (err != nil || w.Pod != "coder-7d9f")) || (!cached && err == nil) {
+			t.Fatalf("cached=%v: %+v failing=%v err=%v", cached, w, failing, err)
+		}
+		clk.advance(retryAfter)
+		_, _, _ = c.Workload(context.Background(), 1)
+		if n := a.hits.Load(); n != hits+2 {
+			t.Fatalf("cached=%v: %d requests after the interval, want %d", cached, n, hits+2)
+		}
 	}
 }

@@ -410,6 +410,14 @@ func (s *Server) identify(ctx context.Context, t *txn) (rejectReason string) {
 			return "not_bound"
 		case err != nil:
 			id.LookupError = err.Error()
+		case w.BindingID != conn.BindingID:
+			// The kernel tables decide the binding; the lookup only names
+			// the workload. An answer about another binding (node-agent's
+			// view or its cache lags a rebinding) does not describe this
+			// connection, so none of it goes on the record.
+			s.cfg.Log.Warn("lookup names another binding than the kernel tables",
+				"lookup_binding", w.BindingID, "kernel_binding", conn.BindingID, "cgroup", conn.CgroupID)
+			id.LookupError = fmt.Sprintf("binding_mismatch: the lookup names binding %d, the kernel tables %d", w.BindingID, conn.BindingID)
 		default:
 			id.Namespace, id.Pod, id.Container = w.Namespace, w.Pod, w.Container
 			id.ControllerKind, id.ControllerName = w.Controller.Kind, w.Controller.Name

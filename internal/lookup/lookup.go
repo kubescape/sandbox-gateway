@@ -155,6 +155,10 @@ func (c *Client) Workload(ctx context.Context, cgroupID uint64) (w Workload, fai
 	c.mu.Unlock()
 
 	fresh, ferr := c.fetch(ctx, cgroupID)
+	// The fetch can take as long as the client timeout. What follows is
+	// stamped with the time it returned, so the retry interval starts when
+	// the failure is known, not when the request went out.
+	now = c.now()
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
