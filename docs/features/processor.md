@@ -17,7 +17,7 @@ Identity comes from two tables node-agent pins under `/sys/fs/bpf/kubescape-sand
 
 1. Envoy passes the downstream remote address as the `source.address` request attribute. That is the pod socket's own address and port. An IPv4 address in its IPv6-mapped form is the same key.
 2. `conns`, keyed on that address and port, gives the cgroup, the pid, the binding and the original destination. It is read on every request and never cached by address, because the kernel reuses an address and port for another pod's connection once the first one closes.
-3. `bindings`, keyed on the cgroup, gives the pod's fail posture (`allow` or `deny`) and its health-gate state.
+3. `bindings`, keyed on the cgroup, gives the pod's fail posture (`allow` or `deny`) and its health-gate state. Its binding id must equal the one in the `conns` entry.
 4. `GET /v1/workload?cgroup=<id>` on `/run/kubescape-sandbox/lookup.sock` names the namespace, pod, container, controller and the policy objects that cover the pod.
 
 A request is refused with a 403 from the processor, before anything reaches the provider, when:
@@ -27,6 +27,7 @@ A request is refused with a 403 from the processor, before anything reaches the 
 | `no_source_address` | Envoy sent no usable `source.address` |
 | `no_connection_entry` | the connection is not in `conns` |
 | `not_bound` | the cgroup has no `bindings` entry, or node-agent answers that it is not bound |
+| `binding_mismatch` | the binding id in the `conns` entry differs from the one in the cgroup's `bindings` entry, so the connection was made under another binding |
 | `connection_table_error` | reading a map failed |
 | `no_connection_table` | the processor has no tables (a build or wiring error) |
 

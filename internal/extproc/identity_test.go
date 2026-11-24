@@ -128,6 +128,15 @@ func TestConnWithoutBindingRejected(t *testing.T) {
 	wantRejected(t, headersFrom(t, st, testSource), h, "not_bound")
 }
 
+// The connection was made under one binding and the pod's cgroup now has
+// another: the two tables do not describe the same pod.
+func TestBindingMismatchRejected(t *testing.T) {
+	tbl := newTable()
+	tbl.bindings[testCgroup] = conntable.Binding{BindingID: 13, Posture: conntable.PostureAllow}
+	st, h := start(t, Config{Conns: tbl})
+	wantRejected(t, headersFrom(t, st, testSource), h, "binding_mismatch")
+}
+
 // Review focus: the connection is in the table but node-agent says the pod was
 // unbound in between.
 func TestUnboundCgroupRejected(t *testing.T) {

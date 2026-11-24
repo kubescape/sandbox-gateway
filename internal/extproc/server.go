@@ -390,6 +390,14 @@ func (s *Server) identify(ctx context.Context, t *txn) (rejectReason string) {
 	if !ok {
 		return "not_bound"
 	}
+	// The connection carries the binding it was made under. If the cgroup's
+	// binding is another one now, the two tables do not describe the same pod,
+	// and the posture read here would not be this connection's.
+	if conn.BindingID != binding.BindingID {
+		s.cfg.Log.Warn("connection and cgroup name different bindings",
+			"conn_binding", conn.BindingID, "cgroup_binding", binding.BindingID, "cgroup", conn.CgroupID)
+		return "binding_mismatch"
+	}
 	id := &Identity{
 		BindingID: conn.BindingID, Posture: binding.Posture, Gate: binding.Gate,
 		CgroupID: conn.CgroupID, PID: conn.PID,
