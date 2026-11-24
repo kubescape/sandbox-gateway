@@ -94,15 +94,18 @@ type Record struct {
 	ResponseBytes     int               `json:"response_bytes"`
 	SSEEvents         int               `json:"sse_events"`
 	EventStreamFrames int               `json:"eventstream_frames,omitempty"` // Bedrock application/vnd.amazon.eventstream frames
-	StopReason        string            `json:"stop_reason,omitempty"`
-	FirstChunkAfterMs float64           `json:"first_chunk_after_ms,omitempty"` // request EOS to first response chunk, as seen here
-	ChunkProcMaxUs    int64             `json:"chunk_proc_max_us"`
-	ChunkProcAvgUs    int64             `json:"chunk_proc_avg_us"`
-	EarlyEOS          bool              `json:"early_eos,omitempty"`
-	WatchdogFired     bool              `json:"watchdog_fired,omitempty"`
-	WebSocket         *WSStats          `json:"websocket,omitempty"`
-	ObservabilityMode bool              `json:"observability_mode,omitempty"`
-	Ended             string            `json:"ended"` // eos | trailers | stream_closed | stream_error | watchdog
+	// StopReason is how the provider said the response ended, in its own
+	// terms: the Anthropic stop_reason, the OpenAI chat finish_reason, or the
+	// OpenAI Responses status ("completed", "incomplete", "failed").
+	StopReason        string   `json:"stop_reason,omitempty"`
+	FirstChunkAfterMs float64  `json:"first_chunk_after_ms,omitempty"` // request EOS to first response chunk, as seen here
+	ChunkProcMaxUs    int64    `json:"chunk_proc_max_us"`
+	ChunkProcAvgUs    int64    `json:"chunk_proc_avg_us"`
+	EarlyEOS          bool     `json:"early_eos,omitempty"`
+	WatchdogFired     bool     `json:"watchdog_fired,omitempty"`
+	WebSocket         *WSStats `json:"websocket,omitempty"`
+	ObservabilityMode bool     `json:"observability_mode,omitempty"`
+	Ended             string   `json:"ended"` // eos | trailers | stream_closed | stream_error | watchdog
 }
 
 // WSStats summarises an upgraded WebSocket connection (S5): messages decoded
@@ -457,6 +460,15 @@ func (s *Server) handle(stream extprocv3.ExternalProcessor_ProcessServer, t *txn
 		if t.rec.Ended == "" {
 			t.rec.Ended = "trailers"
 		}
+		// A body that ends in trailers has no chunk marked end of stream, so
+		// the SSE parser is closed here: an event ended by a lone CR
+		// completes only at the end.
+		if t.rec.WebSocket == nil && t.es == nil && !t.eosSent {
+			for _, ev := range t.parser.Close() {
+				t.rec.SSEEvents++
+				t.trackEvent(ev)
+			}
+		}
 		return &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ResponseTrailers{
 			ResponseTrailers: &extprocv3.TrailersResponse{}}}, nil
 	}
@@ -538,10 +550,11 @@ func (t *txn) sseChunk(s *Server, chunk []byte, forward *[]byte, eos *bool) {
 			// turn with synthetic terminal events.
 			// Forward exactly up to the end of the triggering event; later
 			// events in the same chunk are dropped.
-			*forward = append(append([]byte(nil), chunk[:ev.End]...), t.terminalEvents()...)
+			term, stop := t.terminalEvents()
+			*forward = append(append([]byte(nil), chunk[:ev.End]...), term...)
 			t.eosSent = true
 			t.rec.EarlyEOS = true
-			t.rec.StopReason = "end_turn"
+			t.rec.StopReason = stop
 			*eos = true
 			break
 		}
@@ -631,10 +644,21 @@ func (t *txn) anthropicOpen() []int {
 	return t.track.Open()
 }
 
-// terminalEvents closes open content blocks and ends the message the way the
-// Anthropic API does, so SDKs finish the turn instead of raising.
-func (t *txn) terminalEvents() []byte {
+// terminalEvents ends the stream the way the provider would, in the stream's
+// format, so SDKs finish the turn instead of raising. It returns the events
+// and the stop reason they give. A stream whose format is not known yet is
+// ended as an Anthropic one.
+func (t *txn) terminalEvents() ([]byte, string) {
 	var b strings.Builder
+	switch t.track.Format {
+	case streamfmt.OpenAIChat:
+		b.WriteString("data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		b.WriteString("data: [DONE]\n\n")
+		return []byte(b.String()), "stop"
+	case streamfmt.OpenAIResponses:
+		b.WriteString("event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n")
+		return []byte(b.String()), "incomplete"
+	}
 	// The tracker also holds open items of other formats; only Anthropic
 	// content blocks are closed with content_block_stop.
 	for _, idx := range t.anthropicOpen() {
@@ -642,7 +666,7 @@ func (t *txn) terminalEvents() []byte {
 	}
 	b.WriteString("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n")
 	b.WriteString("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
-	return []byte(b.String())
+	return []byte(b.String()), "end_turn"
 }
 
 func bodyResponse(body []byte, eos bool) *extprocv3.ProcessingResponse {

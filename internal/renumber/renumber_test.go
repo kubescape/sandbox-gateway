@@ -373,7 +373,7 @@ func TestPendingIsBounded(t *testing.T) {
 		"no blank line": "data: " + strings.Repeat("y", 64<<10) + "\n",
 	} {
 		e := New(named("bash"))
-		var err error
+		_, err := e.Feed([]byte(aStart))         // a known format: the editor must fail closed
 		for i := 0; i < 512 && err == nil; i++ { // up to 32 MiB
 			_, err = e.Feed([]byte(line))
 			if len(e.pending) > maxPending {
@@ -407,5 +407,118 @@ func TestOpenAIChatToolCallsArePerChoice(t *testing.T) {
 	c1 := ch[1].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
 	if c1["index"].(float64) != 0 {
 		t.Fatalf("choice 1's call moved to index %v", c1["index"])
+	}
+}
+
+// Review: before any event of a known format there is nothing to edit, so an
+// oversized event (an MCP stream with a large tool result) passes through.
+func TestOversizedEventInUnknownStreamPassesThrough(t *testing.T) {
+	big := ev("message", `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"`+strings.Repeat("A", 5<<20)+`"}]}}`)
+	s := ev("", `{"jsonrpc":"2.0","method":"ping"}`) + big + ev("", `{"jsonrpc":"2.0","id":2,"result":{}}`)
+	for _, chunks := range [][]string{{s}, {s[:100], s[100 : 3<<20], s[3<<20:]}} {
+		out, err := feedAll(New(named("bash")), chunks...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != s {
+			t.Fatalf("stream changed: %d bytes in, %d out", len(s), len(out))
+		}
+	}
+	// Bytes that never end an event are not held without bound either.
+	e := New(named("bash"))
+	var out []byte
+	for i := 0; i < 512; i++ {
+		b, err := e.Feed([]byte(strings.Repeat("y", 64<<10)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, b...)
+		if len(e.pending) > maxPending {
+			t.Fatalf("holding %d bytes", len(e.pending))
+		}
+	}
+	if out = append(out, e.Flush()...); len(out) != 512*64<<10 {
+		t.Fatalf("forwarded %d bytes, want all %d", len(out), 512*64<<10)
+	}
+}
+
+// Review: an event of many short data lines is far larger as received than
+// its data. One under the data limit must not fail the stream.
+func TestManyShortLinesUnderLimit(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("event: content_block_delta\n")
+	b.WriteString(`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"a"}` + "\n")
+	for i := 0; i < 700_000; i++ { // JSON whitespace: 2.1 MB of data, 6.3 MB as received
+		b.WriteString("data:   \n")
+	}
+	b.WriteString("data: }\n\n")
+	chunks := []string{aStart + aBlock(0, "tool_use", "bash")}
+	for rest := b.String(); len(rest) > 0; { // in 64 KiB chunks, so the event is held while it arrives
+		n := min(len(rest), 64<<10)
+		chunks, rest = append(chunks, rest[:n]), rest[n:]
+	}
+	out, err := feedAll(New(named("bash")), chunks...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The event was read and renumbered, not passed through.
+	if !strings.HasSuffix(out, `"index":0,"type":"content_block_delta"}`+"\n\n") {
+		t.Fatalf("event not renumbered: ...%q", out[max(0, len(out)-120):])
+	}
+}
+
+// Review: a tool call whose first chunk carries neither id nor name is judged
+// once its name arrives, not before.
+func TestChatToolCallNamedLate(t *testing.T) {
+	s := chatChunk(`{"role":"assistant","content":""}`, "null") +
+		chatChunk(`{"tool_calls":[{"index":0,"function":{"arguments":""}}]}`, "null") +
+		chatChunk(`{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"bash","arguments":""}}]}`, "null") +
+		chatChunk(`{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}`, "null") +
+		chatCall(1, "call_b", "read") +
+		chatChunk(`{}`, `"tool_calls"`) + ev("", "[DONE]")
+	for i := 0; i <= len(s); i += 7 {
+		out := run(named("bash"), s[:i], s[i:])
+		if strings.Contains(out, "call_a") || !strings.Contains(out, "call_b") {
+			t.Fatalf("split at %d:\n%s", i, out)
+		}
+		for _, m := range decode(t, out) {
+			delta := m["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)
+			for _, tc := range asList(delta["tool_calls"]) {
+				if idx := tc.(map[string]any)["index"].(float64); idx != 0 {
+					t.Fatalf("split at %d: call index %v, want 0", i, idx)
+				}
+			}
+		}
+	}
+	// A call that never gets a name is judged at the end, by what it has.
+	never := chatChunk(`{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}`, "null")
+	var asked []streamfmt.Item
+	out := run(func(it streamfmt.Item) bool { asked = append(asked, it); return false }, never)
+	if out != never || len(asked) != 1 || asked[0].Name != "" {
+		t.Fatalf("out=%q asked=%v", out, asked)
+	}
+}
+
+// Review: dropping a chunk that held only a removed call must not drop the
+// logprobs or usage the chunk also carried.
+func TestChatChunkKeepsLogprobsAndUsage(t *testing.T) {
+	s := chatCall(0, "call_a", "bash") +
+		ev("", `{"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"x"}}]},"logprobs":{"content":[]},"finish_reason":null}]}`) +
+		ev("", `{"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"y"}}]},"finish_reason":null}],"usage":{"total_tokens":3}}`)
+	out := run(named("bash"), s)
+	if strings.Contains(out, "call_a") || !strings.Contains(out, `"logprobs":{"content":[]}`) || !strings.Contains(out, `"total_tokens":3`) {
+		t.Fatalf("output:\n%s", out)
+	}
+}
+
+// Review: a rewritten event keeps its id, retry and comment lines.
+func TestRewriteKeepsOtherLines(t *testing.T) {
+	s := aStart + aBlock(0, "tool_use", "bash") +
+		": keep-alive\nid: 42\nretry: 1000\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\n" +
+		"data: \"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
+	out := run(named("bash"), s)
+	want := ": keep-alive\nid: 42\nretry: 1000\nevent: content_block_start\ndata: {\"content_block\":{\"text\":\"\",\"type\":\"text\"},\"index\":0,\"type\":\"content_block_start\"}\n\n"
+	if !strings.HasSuffix(out, want) {
+		t.Fatalf("output:\n%q\nwant suffix\n%q", out, want)
 	}
 }

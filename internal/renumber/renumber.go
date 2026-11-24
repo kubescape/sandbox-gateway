@@ -11,10 +11,12 @@
 // The stop reason is left as the provider sent it, also when the removed item
 // was the reason the provider stopped.
 //
-// An event too large to parse cannot be edited, and forwarding it as it came
-// could leak a removed item or a stale index. So the editor fails closed: Feed
-// returns ErrEventTooLarge, forwards nothing more, and the caller ends the
-// stream.
+// An event too large to parse cannot be edited. Before the stream has shown
+// one of the known formats there is nothing to edit, so the editor stops
+// parsing and passes the rest of the stream through. Once the format is known,
+// forwarding such an event as it came could leak a removed item or a stale
+// index, so the editor fails closed: Feed returns ErrEventTooLarge, forwards
+// nothing more, and the caller ends the stream.
 package renumber
 
 import (
@@ -28,12 +30,14 @@ import (
 )
 
 // Parser limits. An event is at most maxEvent bytes of data and no line is
-// longer than maxLine; the editor holds at most maxPending bytes of an event
-// that has not ended.
+// longer than maxLine. The editor holds at most maxPending bytes as received:
+// the event that has not ended plus the OpenAI chat events waiting on a tool
+// call's name. Bytes as received include each line's field name and line end,
+// so the limit leaves room above maxEvent for an event of many short lines.
 const (
 	maxLine    = 1 << 20
 	maxEvent   = 4 << 20
-	maxPending = maxEvent + maxLine
+	maxPending = 2*maxEvent + maxLine
 )
 
 // ErrEventTooLarge means the stream had an event over the parser's limits. The
@@ -58,11 +62,26 @@ type Editor struct {
 	seen    map[itemKey]bool // item -> removed
 	dropped int              // events dropped so far (Responses sequence numbers)
 	err     error            // set once the editor has failed closed
+	through bool             // passing the stream through unread (see the package doc)
+
+	// OpenAI chat: tool calls seen without a name yet, and the events held
+	// until they get one.
+	undecided map[itemKey]bool
+	queue     []queued
+	queued    int // bytes in queue
+}
+
+// queued is an OpenAI chat event held until every tool call in flight has a
+// name the filter can judge.
+type queued struct {
+	ev  sse.Event
+	raw []byte
+	p   streamfmt.Event
 }
 
 // New returns an editor that removes the items remove picks.
 func New(remove Filter) *Editor {
-	e := &Editor{remove: remove, seen: map[itemKey]bool{}}
+	e := &Editor{remove: remove, seen: map[itemKey]bool{}, undecided: map[itemKey]bool{}}
 	e.parser.MaxLine, e.parser.MaxEvent = maxLine, maxEvent
 	return e
 }
@@ -71,16 +90,22 @@ func New(remove Filter) *Editor {
 // forward for it. It holds back an incomplete trailing event, so the result
 // can be shorter than the chunk, or empty.
 //
-// When the stream has an event too large to parse, Feed returns
-// ErrEventTooLarge, and returns it again on every later call with nothing to
-// forward.
+// When the stream has an event too large to parse after its format is known,
+// Feed returns ErrEventTooLarge, and returns it again on every later call with
+// nothing to forward.
 func (e *Editor) Feed(chunk []byte) ([]byte, error) {
 	if e.err != nil {
 		return nil, e.err
 	}
+	if e.through {
+		return chunk, nil
+	}
 	droppedBefore := e.parser.Dropped
 	events := e.parser.Feed(chunk)
 	if e.parser.Dropped != droppedBefore {
+		if e.format == streamfmt.Unknown {
+			return e.passThrough(chunk), nil
+		}
 		return nil, e.fail()
 	}
 	carried := len(e.pending)
@@ -93,15 +118,27 @@ func (e *Editor) Feed(chunk []byte) ([]byte, error) {
 		start = end
 	}
 	e.pending = append(e.pending[:0], e.pending[start:]...)
-	if len(e.pending) > maxPending {
+	if len(e.pending)+e.queued > maxPending {
+		if e.format == streamfmt.Unknown {
+			return append(out, e.passThrough(nil)...), nil
+		}
 		return nil, e.fail()
 	}
 	return out, nil
 }
 
+// passThrough stops editing a stream whose format is not one the editor knows:
+// it returns what it holds and chunk, and Feed returns later chunks as they
+// come.
+func (e *Editor) passThrough(chunk []byte) []byte {
+	out := append(e.pending, chunk...)
+	e.through, e.pending = true, nil
+	return out
+}
+
 // fail stops the editor: what it holds is dropped and nothing more is forwarded.
 func (e *Editor) fail() error {
-	e.err, e.pending = ErrEventTooLarge, nil
+	e.err, e.pending, e.queue, e.queued = ErrEventTooLarge, nil, nil, 0
 	return e.err
 }
 
@@ -116,7 +153,7 @@ func (e *Editor) fail() error {
 // the editor does not edit gets its tail back unchanged. After a failure Flush
 // returns nothing.
 func (e *Editor) Flush() []byte {
-	if e.err != nil {
+	if e.err != nil || e.through {
 		return nil
 	}
 	var out []byte
@@ -125,6 +162,9 @@ func (e *Editor) Flush() []byte {
 		out = append(out, e.event(ev, e.pending[start:])...)
 		start = len(e.pending)
 	}
+	// Chat events still waiting on a tool call's name: the stream ended
+	// without one, so the filter judges the call without its name.
+	out = append(out, e.settle()...)
 	if tail := e.pending[start:]; len(tail) > 0 && e.format == streamfmt.Unknown {
 		out = append(out, tail...)
 	}
@@ -155,11 +195,53 @@ func (e *Editor) event(ev sse.Event, raw []byte) []byte {
 	case streamfmt.Anthropic:
 		return e.indexed(ev, raw, p, "index")
 	case streamfmt.OpenAIChat:
-		return e.chat(ev, raw, p)
+		return e.chatEvent(ev, raw, p)
 	case streamfmt.OpenAIResponses:
 		return e.responses(ev, raw, p)
 	}
 	return raw
+}
+
+// chatEvent handles an OpenAI chat event. A tool call is judged at its first
+// chunk that carries its id or name. Until every call in flight has had one,
+// the events are held, so a call named in a later chunk is still judged with
+// its name. The end of the choices (a finish reason, or [DONE]) settles the
+// calls that never got one.
+func (e *Editor) chatEvent(ev sse.Event, raw []byte, p streamfmt.Event) []byte {
+	for _, it := range p.Starts {
+		delete(e.undecided, itemKey{it.Choice, it.Index})
+	}
+	for _, tc := range p.ToolCalls {
+		if k := (itemKey{tc.Choice, tc.Index}); !hasKey(e.seen, k) {
+			e.undecided[k] = true
+		}
+	}
+	if len(e.undecided) > 0 && !p.Done && p.StopReason == "" {
+		e.queue = append(e.queue, queued{ev, bytes.Clone(raw), p})
+		e.queued += len(raw)
+		return nil
+	}
+	return append(e.settle(), e.chat(ev, raw, p)...)
+}
+
+// settle judges the tool calls that never got a name and returns the held
+// chat events, edited.
+func (e *Editor) settle() []byte {
+	for k := range e.undecided {
+		e.seen[k] = e.remove(streamfmt.Item{Format: streamfmt.OpenAIChat, Choice: k.choice, Index: k.index, Kind: "function"})
+		delete(e.undecided, k)
+	}
+	var out []byte
+	for _, q := range e.queue {
+		out = append(out, e.chat(q.ev, q.raw, q.p)...)
+	}
+	e.queue, e.queued = nil, 0
+	return out
+}
+
+func hasKey(m map[itemKey]bool, k itemKey) bool {
+	_, ok := m[k]
+	return ok
 }
 
 // shift is how far an item moves down: the number of removed items before it
@@ -243,11 +325,12 @@ func (e *Editor) chat(ev sse.Event, raw []byte, p streamfmt.Event) []byte {
 			} else {
 				delete(delta, "tool_calls")
 			}
-			if len(delta) > 0 || choice["finish_reason"] != nil {
+			if len(delta) > 0 || choice["finish_reason"] != nil || choice["logprobs"] != nil {
 				keep = true
 			}
 		}
-		return keep
+		// Usage and the like ride on the chunk, not on a choice.
+		return keep || m["usage"] != nil
 	})
 }
 
@@ -307,16 +390,49 @@ func rewrite(ev sse.Event, raw []byte, edit func(map[string]any) (keep bool)) []
 	if !edit(m) {
 		return nil
 	}
-	var b bytes.Buffer
-	if ev.Name != "" {
-		b.WriteString("event: " + ev.Name + "\n")
-	}
-	b.WriteString("data: ")
-	enc := json.NewEncoder(&b)
+	var payload bytes.Buffer
+	enc := json.NewEncoder(&payload)
 	enc.SetEscapeHTML(false)
-	if enc.Encode(m) != nil { // Encode ends the payload with one newline
+	if enc.Encode(m) != nil {
 		return raw
 	}
-	b.WriteByte('\n')
+	return replaceData(raw, bytes.TrimSuffix(payload.Bytes(), []byte("\n")))
+}
+
+// replaceData returns raw with its data lines replaced by one line carrying
+// payload, at the place of the first. Every other line (event, id, retry,
+// comments, the blank line that ends the event) is kept as it came. Line
+// ends become LF.
+func replaceData(raw, payload []byte) []byte {
+	var b bytes.Buffer
+	written := false
+	for len(raw) > 0 {
+		line := raw
+		raw = nil
+		if i := bytes.IndexAny(line, "\r\n"); i >= 0 {
+			adv := i + 1
+			if line[i] == '\r' && i+1 < len(line) && line[i+1] == '\n' {
+				adv = i + 2
+			}
+			line, raw = line[:i], line[adv:]
+		}
+		if isData(line) {
+			if !written {
+				b.WriteString("data: ")
+				b.Write(payload)
+				b.WriteByte('\n')
+				written = true
+			}
+			continue
+		}
+		b.Write(line)
+		b.WriteByte('\n')
+	}
 	return b.Bytes()
+}
+
+// isData reports whether an SSE line is a data field.
+func isData(line []byte) bool {
+	rest, ok := bytes.CutPrefix(line, []byte("data"))
+	return ok && (len(rest) == 0 || rest[0] == ':')
 }
