@@ -52,6 +52,17 @@ The identity is only as good as `source.address`, so the listener must report th
 
 The explicit-proxy listener (`explicit_proxy`, port 3128) cannot serve decrypted hosts with this processor. A connection that arrives through it has no socket address to look up and no `conns` entry, so every request on its decrypting chain is refused with `no_source_address`.
 
+### Request position
+
+The verdict record's join key ends in `request_position`. The C7 contract defines it as the HTTP/2 stream id, or the request's ordinal on an HTTP/1.1 connection. Envoy 1.40 cannot give the processor the stream id.
+
+We checked this against Envoy v1.40.2, with an ext_proc server that printed every attribute it received. The client opened three HTTP/2 streams on one connection, then sent three HTTP/1.1 requests on another. Envoy has no stream id attribute and drops unknown attribute names without a word. The `%STREAM_ID%` access-log field is Envoy's own id for the stream, not the HTTP/2 one. `connection.id` does arrive, and it is the same for every request on a connection. The three HTTP/2 streams reached the processor in the order a, c, b, so counting them per connection gives the order they reached the processor, not the order the client opened them.
+
+The processor therefore does this:
+
+- On HTTP/1.1, `request_position` is the request's ordinal on its connection, counted from 1 per `connection.id`. Requests on an HTTP/1.1 connection run one after another, so the count matches the order the pod sent them.
+- On HTTP/2, `request_position` is left out. The contract's own fallback then applies, the same one it gives for a capture tap that cannot produce the position: the backend joins on the connection plus method, path and a time window. The record keeps the method and path (as `gateway.method` and `gateway.path`) and its timestamp for that join. An arrival-order count would be wrong for concurrent streams and still look like a valid key, so the processor does not send one.
+
 ### Map layout
 
 Integers are in host byte order. Addresses are 16 bytes, IPv4 in its IPv6-mapped form. The structs use natural C alignment:
@@ -126,6 +137,26 @@ Both blocks above happen at the request headers, so none of the request reaches 
 | `internal/wsframe` | WebSocket frames after an upgrade |
 
 The record's `stop_reason` comes from `streamfmt`: Anthropic's `stop_reason`, OpenAI's `finish_reason`, or the status of a Responses stream's closing event.
+
+## The record
+
+Every transaction ends in one record, whatever ended it: an allowed request, a blocked one, a rejected connection, or the stall watchdog. The JSON log line (and `-records`) carries the full transaction. OTLP gets the verdict record of contract C7: one log record per transaction, family `R-L7-GW` (the instrumentation scope name), with no request or response bytes (`internal/record`).
+
+Its attributes use the C7 names as they are:
+
+| Attribute | Value |
+|---|---|
+| `crd_uid`, `crd_revision`, `rule`, `origin`, `verdict`, `mode` | from the verdict. A connection refused before any policy applied is `deny` in `enforce` mode, with rule `framework.` plus the reject reason (`framework.no-connection-entry`, for one) |
+| `would_deny`, `degraded` | as on the log line |
+| `tier` | always `gateway` |
+| `fail_posture`, `namespace`, `pod`, `container`, `controller_kind`, `controller_name` | the identity |
+| `provider`, `model` | what `Classify` returned |
+| `destination_state` | `blocked` for a denied or rejected request, otherwise `inspected`. The processor never sees passthrough traffic |
+| `fail_open_window` | the pod's health gate was failing open or recovering when the request arrived |
+| `upstream_content_encoding` | only when the upstream answered with an encoding other than `identity` |
+| `conn_local_addr`, `conn_local_port`, `orig_dst`, `request_position` | the join key; `request_position` only on HTTP/1.x (above) |
+
+Everything else the processor measured goes under `gateway.`: the transaction id, authority, method, path and protocol, status, how the transaction ended, byte and event counts, timings, the reject reason, and the kernel half of the identity.
 
 ## Flags
 

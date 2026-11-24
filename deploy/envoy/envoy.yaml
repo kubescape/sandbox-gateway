@@ -138,8 +138,9 @@ static_resources:
                 request_trailer_mode: SEND
                 response_trailer_mode: SEND
               # ext_proc looks the downstream remote address up in the pinned conns map to
-              # find the pod.
-              request_attributes: [source.address]
+              # find the pod. connection.id and request.protocol give the record's
+              # request_position on HTTP/1.x (docs/features/processor.md).
+              request_attributes: [source.address, connection.id, request.protocol]
               # kubescape.sandbox.attribution is empty with this config. It stays forwarded so
               # that, if a proxy_protocol filter is ever added back, the processor flags the
               # identity a client claims (ppv2_ignored) and does not use it.
