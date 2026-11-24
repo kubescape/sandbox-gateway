@@ -173,13 +173,17 @@ func TestDegradedStillBlocksDenyPod(t *testing.T) {
 func TestDenyPodNothingCachedBlocked(t *testing.T) {
 	f := allowAll()
 	_, h := start(t, Config{Evaluator: f, Policies: policies()}) // the lookup names uid-a; nothing cached
-	if body, blocked := oneRequest(t, h, "api.anthropic.com"); !blocked || body != fakeDenyBody(RuleNoCachedPolicy) {
-		t.Fatalf("blocked=%v body=%s", blocked, body)
+	// Review: refused at the headers, before any of the body is forwarded.
+	st := h.stream(t)
+	r := sendHeaders(t, st)
+	if !is403(r) || immediateBody(r) != frameworkBody {
+		t.Fatalf("headers answer = %v", r)
 	}
-	if _, e, _, _ := f.counts(); e != 0 {
-		t.Fatalf("Evaluate called %d times with nothing to evaluate", e)
+	if c, e, d, _ := f.counts(); c+e+d != 0 {
+		t.Fatalf("the evaluator was called: classify %d, evaluate %d, deny %d", c, e, d)
 	}
-	if rec := h.waitRecords(t, 1)[0]; !rec.Degraded || rec.Verdict.Rule != RuleNoCachedPolicy || rec.Provider != "anthropic" {
+	must(t, st.CloseSend())
+	if rec := h.waitRecords(t, 1)[0]; !rec.Degraded || rec.Verdict.Rule != RuleNoCachedPolicy || rec.RequestBytes != 0 {
 		t.Fatalf("record: %+v", rec)
 	}
 }

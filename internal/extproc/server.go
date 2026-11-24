@@ -281,7 +281,6 @@ type txn struct {
 	lookupFailingSince time.Time
 	sections           []plugin.PolicySection
 	in                 input // the decision table's input, set by the policy stage
-	noPolicy           bool  // nothing cached on a deny pod: blocked once Classify names the provider
 	headers            http.Header
 	eval               *evaluation // nil when the request is not being evaluated
 	held               []byte      // the newest request chunk, not forwarded until the verdict
@@ -472,6 +471,7 @@ func (s *Server) identify(ctx context.Context, t *txn) (rejectReason string) {
 		return "connection_table_error"
 	}
 	if !ok {
+		s.cfg.Stale.Forget(conn.CgroupID) // the workload is gone
 		return "not_bound"
 	}
 	// The connection carries the binding it was made under. If the cgroup's
@@ -491,6 +491,7 @@ func (s *Server) identify(ctx context.Context, t *txn) (rejectReason string) {
 		w, failingSince, err := s.cfg.Lookup(ctx, conn.CgroupID)
 		switch {
 		case errors.Is(err, lookup.ErrNotBound):
+			s.cfg.Stale.Forget(conn.CgroupID) // the workload is gone
 			return "not_bound"
 		case err != nil:
 			id.LookupError = err.Error()
@@ -579,15 +580,14 @@ func (s *Server) handle(stream extprocv3.ExternalProcessor_ProcessServer, t *txn
 			DynamicMetadata: auditMetadata(identityFields(t.rec.Identity))}
 		pre := s.policyStage(t)
 		switch {
-		case pre.Block && pre.Rule == RuleHostNotDecrypted:
-			// Decision 5: a plain 403 from the framework, whatever the modes say.
+		case pre.Block:
+			// Known before any body: a host no policy decrypts (decision 5),
+			// or a deny pod with nothing cached. Refused at the headers, so
+			// none of the request reaches the provider. The provider is not
+			// known yet, so the answer is the framework's own 403.
 			t.rec.Verdict = &Verdict{Action: plugin.ActionDeny, Mode: plugin.ModeEnforce, Rule: pre.Rule}
 			t.rec.Ended = "denied"
 			return immediate(frameworkDeny(), s.auditMeta(t)), nil
-		case pre.Block:
-			// Nothing cached on a deny pod: blocked with the evaluator's
-			// DenyResponse once Classify has named the provider.
-			t.noPolicy = true
 		case !pre.CallEvaluate:
 			resp.DynamicMetadata = s.auditMeta(t)
 			return resp, nil

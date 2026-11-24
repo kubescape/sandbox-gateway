@@ -14,7 +14,10 @@ import (
 )
 
 // Tracker keeps, per cgroup, when a referenced policy first failed to
-// resolve. It is safe for concurrent use.
+// resolve. An entry stays while its workload does, however long it is idle,
+// so a workload that comes back after a quiet spell is still degraded if its
+// policy never resolved. It leaves when its policy resolves or when the
+// workload is gone (Forget). It is safe for concurrent use.
 type Tracker struct {
 	limit time.Duration
 	now   func() time.Time
@@ -23,6 +26,10 @@ type Tracker struct {
 }
 
 type entry struct{ since, seen time.Time }
+
+// maxEntries bounds the map against cgroups nobody forgets: past it, the
+// entry seen least recently goes.
+const maxEntries = 1 << 16
 
 // New returns a tracker that degrades a workload stale for limit or more.
 func New(limit time.Duration, now func() time.Time) *Tracker {
@@ -37,10 +44,10 @@ func (t *Tracker) Observe(cgroupID uint64, lookupFailingSince, informerLostSince
 	now := t.now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.prune(now)
 	e, had := t.since[cgroupID]
 	switch {
 	case unresolved && !had:
+		t.evictIfFull()
 		t.since[cgroupID] = entry{since: now, seen: now}
 		e = t.since[cgroupID]
 	case unresolved:
@@ -54,14 +61,27 @@ func (t *Tracker) Observe(cgroupID uint64, lookupFailingSince, informerLostSince
 	return !since.IsZero() && now.Sub(since) >= t.limit
 }
 
-// prune forgets cgroups no request has come from in a long while, so a pod
-// that went away does not stay in the map. Called with mu held.
-func (t *Tracker) prune(now time.Time) {
+// Forget drops a cgroup whose workload is gone: unbound, or no longer in the
+// kernel tables.
+func (t *Tracker) Forget(cgroupID uint64) {
+	t.mu.Lock()
+	delete(t.since, cgroupID)
+	t.mu.Unlock()
+}
+
+// evictIfFull makes room for one entry. Called with mu held.
+func (t *Tracker) evictIfFull() {
+	if len(t.since) < maxEntries {
+		return
+	}
+	var oldest uint64
+	var at time.Time
 	for id, e := range t.since {
-		if now.Sub(e.seen) > 10*t.limit {
-			delete(t.since, id)
+		if at.IsZero() || e.seen.Before(at) {
+			oldest, at = id, e.seen
 		}
 	}
+	delete(t.since, oldest)
 }
 
 func earliest(ts ...time.Time) time.Time {

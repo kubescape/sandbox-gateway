@@ -96,13 +96,15 @@ The processor runs its own informers on `SandboxPolicy` and `ClusterSandboxPolic
 
 The pod's fail posture never comes from those sections, because the section that is missing can be the one that says `deny`. It comes from the `bindings` table.
 
-A workload's policy is stale from the earliest of: node-agent's lookup serving from its cache, either informer losing the API server (each informer keeps its own outage clock), or a referenced policy not resolving. After `-stale-after` (5m) its decisions are degraded (`internal/stale`).
+A workload's policy is stale from the earliest of: node-agent's lookup serving from its cache, either informer losing the API server (each informer keeps its own outage clock), or a referenced policy not resolving. After `-stale-after` (5m) its decisions are degraded (`internal/stale`). A workload keeps its clock while it is idle; it leaves the tracker when its policy resolves or when it is no longer bound.
+
+The informers index the objects by UID themselves, so an object deleted and created again under the same name no longer resolves under its old UID. Every list and watch call is counted where it is made: a failure starts that informer's outage clock, a success or any event ends it. Each request gets its own copy of the sections.
 
 Before any body is read, a decision table (`internal/extproc/decide.go`) settles what does not need the evaluator. The first matching row wins:
 
 | Condition | Result |
 |---|---|
-| No covering policy cached, evaluator present, posture `deny` | blocked with the evaluator's `DenyResponse`, rule `framework.no-cached-policy`, degraded; `Evaluate` is not called |
+| No covering policy cached, evaluator present, posture `deny` | the processor's own 403 at the headers, rule `framework.no-cached-policy`, degraded; the evaluator is not called |
 | No covering policy cached, otherwise | passes, degraded, nothing evaluated |
 | Host not in the decrypt list, decision fresh or posture `deny` | the processor's own 403 at the headers, rule `framework.host-not-decrypted` |
 | Host not in the decrypt list, degraded, posture `allow` | passes, degraded |
@@ -110,7 +112,7 @@ Before any body is read, a decision table (`internal/extproc/decide.go`) settles
 
 Otherwise `Evaluate` runs, and an enforce-mode deny blocks unless the decision is degraded on an `allow` pod, which passes and is recorded as `would_deny`. The decrypt list is the union over the cached sections of `decrypt.exactHosts` and the names matching `decrypt.hostPatterns`, minus `decrypt.passthrough`. The decrypt-list guard runs without an evaluator too.
 
-`GET /healthz/processor` on `-health-socket` answers 503 until both informers have synced once, then 200 with `{"evaluator":"available|unavailable","degradedDecisions":N,"stuckEvaluatorCalls":N}`.
+Both blocks above happen at the request headers, so none of the request reaches the provider; the provider is not known yet, so the answer is the processor's own 403. `GET /healthz/processor` on `-health-socket` answers 503 until both informers have synced once and delivered that list to their handlers, then 200 with `{"evaluator":"available|unavailable","degradedDecisions":N,"stuckEvaluatorCalls":N}`.
 
 ## Streams
 

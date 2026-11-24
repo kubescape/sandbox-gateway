@@ -37,54 +37,31 @@ type cached struct {
 	http v1alpha1.HTTPSection
 }
 
-// index holds the cached objects by UID. It is safe for concurrent use.
-type index struct {
-	mu    sync.RWMutex
-	byUID map[string]cached
-}
-
-func newIndex() *index { return &index{byUID: map[string]cached{}} }
-
-// put converts and stores one object. An object that does not convert is
-// dropped from the index, so a stale copy does not linger under its UID.
-func (ix *index) put(u *unstructured.Unstructured) {
+// convert reads the parts of a policy object the processor uses.
+func convert(u *unstructured.Unstructured) (cached, bool) {
 	var obj struct {
 		Spec struct {
 			Mode string                `json:"mode"`
 			HTTP *v1alpha1.HTTPSection `json:"http,omitempty"`
 		} `json:"spec"`
 	}
-	uid := string(u.GetUID())
-	if uid == "" {
-		return
+	if u.GetUID() == "" || runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &obj) != nil {
+		return cached{}, false
 	}
-	ix.mu.Lock()
-	defer ix.mu.Unlock()
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &obj); err != nil {
-		delete(ix.byUID, uid)
-		return
-	}
-	c := cached{ref: plugin.PolicyRef{UID: uid, Generation: u.GetGeneration()}, mode: obj.Spec.Mode}
+	c := cached{ref: plugin.PolicyRef{UID: string(u.GetUID()), Generation: u.GetGeneration()}, mode: obj.Spec.Mode}
 	if obj.Spec.HTTP != nil {
 		c.http = *obj.Spec.HTTP
 	}
-	ix.byUID[uid] = c
+	return c, true
 }
 
-func (ix *index) remove(uid string) {
-	ix.mu.Lock()
-	delete(ix.byUID, uid)
-	ix.mu.Unlock()
-}
-
-// resolve returns the cached section of each reference. A UID cached at
-// another generation yields the cached copy, under its own generation, and
-// counts as outdated; a UID that is absent counts as missing.
-func (ix *index) resolve(refs []plugin.PolicyRef) (sections []plugin.PolicySection, outdated, missing int) {
-	ix.mu.RLock()
-	defer ix.mu.RUnlock()
+// resolveWith resolves refs against get. A UID cached at another generation
+// yields the cached copy, under its own generation, and counts as outdated; a
+// UID get does not find counts as missing. Each section is a deep copy, so
+// one evaluation cannot change what another sees.
+func resolveWith(get func(uid string) (cached, bool), refs []plugin.PolicyRef) (sections []plugin.PolicySection, outdated, missing int) {
 	for _, r := range refs {
-		c, ok := ix.byUID[r.UID]
+		c, ok := get(r.UID)
 		if !ok {
 			missing++
 			continue
@@ -92,23 +69,48 @@ func (ix *index) resolve(refs []plugin.PolicyRef) (sections []plugin.PolicySecti
 		if c.ref.Generation != r.Generation {
 			outdated++
 		}
-		sections = append(sections, plugin.PolicySection{Ref: c.ref, Mode: c.mode, HTTP: c.http})
+		sections = append(sections, plugin.PolicySection{Ref: c.ref, Mode: c.mode, HTTP: *c.http.DeepCopy()})
 	}
 	return sections, outdated, missing
+}
+
+// byUID is the informers' index of objects by UID. The informer keeps it in
+// step with its store, so an object replaced under the same name leaves no
+// entry for its old UID.
+const byUID = "uid"
+
+func uidIndex(obj any) ([]string, error) {
+	if u, ok := obj.(*unstructured.Unstructured); ok && u.GetUID() != "" {
+		return []string{string(u.GetUID())}, nil
+	}
+	return nil, nil
 }
 
 // Source watches both kinds through an API server.
 type Source struct {
 	client dynamic.Interface
 	now    func() time.Time
-	ix     *index
 	kinds  []*kind
+
+	// memo keeps the converted form of each object by UID, valid while the
+	// object's resourceVersion is the same.
+	memoMu sync.Mutex
+	memo   map[string]memoEntry
 }
+
+type memoEntry struct {
+	resourceVersion string
+	c               cached
+}
+
+// memoMax bounds memo; past it, it starts over.
+const memoMax = 4096
 
 // kind is one informer and its outage clock.
 type kind struct {
 	gvr       schema.GroupVersionResource
 	informer  cache.SharedIndexInformer
+	handler   cache.ResourceEventHandlerRegistration
 	mu        sync.Mutex
 	lostSince time.Time
 }
@@ -116,7 +118,7 @@ type kind struct {
 // New returns a source that watches both kinds through client. Call Run to
 // start it.
 func New(client dynamic.Interface, now func() time.Time) *Source {
-	s := &Source{client: client, now: now, ix: newIndex()}
+	s := &Source{client: client, now: now, memo: map[string]memoEntry{}}
 	for _, gvr := range []schema.GroupVersionResource{SandboxPolicies, ClusterSandboxPolicies} {
 		s.kinds = append(s.kinds, s.newKind(gvr))
 	}
@@ -126,22 +128,18 @@ func New(client dynamic.Interface, now func() time.Time) *Source {
 func (s *Source) newKind(gvr schema.GroupVersionResource) *kind {
 	k := &kind{gvr: gvr}
 	res := s.client.Resource(gvr)
-	// A successful list or watch call means the API server answers again, so
-	// each clears this kind's outage clock. So does any event (see the
-	// handlers below).
+	// Every list and watch call is counted where it happens: a failure starts
+	// this kind's outage clock, a success ends it. client-go retries failed
+	// calls on its own, and not every failure reaches the watch error handler.
 	lw := &cache.ListWatch{
 		ListWithContextFunc: func(ctx context.Context, o metav1.ListOptions) (runtime.Object, error) {
 			list, err := res.Namespace(metav1.NamespaceAll).List(ctx, o)
-			if err == nil {
-				s.recovered(k)
-			}
+			s.observe(k, err)
 			return list, err
 		},
 		WatchFuncWithContext: func(ctx context.Context, o metav1.ListOptions) (watch.Interface, error) {
 			w, err := res.Namespace(metav1.NamespaceAll).Watch(ctx, o)
-			if err == nil {
-				s.recovered(k)
-			}
+			s.observe(k, err)
 			return w, err
 		},
 	}
@@ -149,14 +147,16 @@ func (s *Source) newKind(gvr schema.GroupVersionResource) *kind {
 	// that does not support it, such as the fake in tests; against an API
 	// server it stays on.
 	k.informer = cache.NewSharedIndexInformer(cache.ToListWatcherWithWatchListSemantics(lw, s.client),
-		&unstructured.Unstructured{}, 0, cache.Indexers{})
+		&unstructured.Unstructured{}, 0, cache.Indexers{byUID: uidIndex})
+	// A watch that breaks after it was established fails here, not in a call.
 	_ = k.informer.SetWatchErrorHandlerWithContext(func(_ context.Context, _ *cache.Reflector, _ error) {
 		s.lost(k)
 	})
-	_, _ = k.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj any) { s.upsert(k, obj) },
-		UpdateFunc: func(_, obj any) { s.upsert(k, obj) },
-		DeleteFunc: func(obj any) { s.delete(k, obj) },
+	// Any event means the watch delivers.
+	k.handler, _ = k.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(any) { s.recovered(k) },
+		UpdateFunc: func(_, _ any) { s.recovered(k) },
+		DeleteFunc: func(any) { s.recovered(k) },
 	})
 	return k
 }
@@ -174,10 +174,11 @@ func (s *Source) Run(ctx context.Context) {
 	wg.Wait()
 }
 
-// Synced reports whether both informers have listed their kind once.
+// Synced reports whether both informers have listed their kind once and
+// delivered that list to their handlers.
 func (s *Source) Synced() bool {
 	for _, k := range s.kinds {
-		if !k.informer.HasSynced() {
+		if !k.informer.HasSynced() || k.handler == nil || !k.handler.HasSynced() {
 			return false
 		}
 	}
@@ -203,7 +204,49 @@ func (s *Source) LostSince() time.Time {
 // A reference whose UID is cached at another generation yields the cached copy
 // and counts as outdated. A UID that is absent counts as missing.
 func (s *Source) Resolve(refs []plugin.PolicyRef) (sections []plugin.PolicySection, outdated, missing int) {
-	return s.ix.resolve(refs)
+	return resolveWith(s.get, refs)
+}
+
+// get finds the object with uid in either informer's store.
+func (s *Source) get(uid string) (cached, bool) {
+	for _, k := range s.kinds {
+		objs, err := k.informer.GetIndexer().ByIndex(byUID, uid)
+		if err != nil || len(objs) == 0 {
+			continue
+		}
+		u, ok := objs[0].(*unstructured.Unstructured)
+		if !ok {
+			continue
+		}
+		rv := u.GetResourceVersion()
+		s.memoMu.Lock()
+		m, hit := s.memo[uid]
+		s.memoMu.Unlock()
+		if hit && m.resourceVersion == rv {
+			return m.c, true
+		}
+		c, ok := convert(u)
+		if !ok {
+			return cached{}, false
+		}
+		s.memoMu.Lock()
+		if len(s.memo) >= memoMax {
+			s.memo = map[string]memoEntry{}
+		}
+		s.memo[uid] = memoEntry{resourceVersion: rv, c: c}
+		s.memoMu.Unlock()
+		return c, true
+	}
+	return cached{}, false
+}
+
+// observe counts one list or watch call of kind.
+func (s *Source) observe(k *kind, err error) {
+	if err != nil {
+		s.lost(k)
+		return
+	}
+	s.recovered(k)
 }
 
 // lost starts kind's outage clock, unless it is already running.
@@ -221,21 +264,4 @@ func (s *Source) recovered(k *kind) {
 	k.mu.Lock()
 	k.lostSince = time.Time{}
 	k.mu.Unlock()
-}
-
-func (s *Source) upsert(k *kind, obj any) {
-	s.recovered(k)
-	if u, ok := obj.(*unstructured.Unstructured); ok {
-		s.ix.put(u)
-	}
-}
-
-func (s *Source) delete(k *kind, obj any) {
-	s.recovered(k)
-	if d, ok := obj.(cache.DeletedFinalStateUnknown); ok {
-		obj = d.Obj
-	}
-	if u, ok := obj.(*unstructured.Unstructured); ok {
-		s.ix.remove(string(u.GetUID()))
-	}
 }

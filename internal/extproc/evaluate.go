@@ -134,10 +134,6 @@ func (s *Server) decide(t *txn) (blocked *extprocv3.ProcessingResponse, meta *st
 	}
 	t.rec.Provider, t.rec.Model = cls.provider, cls.model
 	t.provider.Store(cls.provider)
-	if t.noPolicy {
-		return s.block(t, plugin.Verdict{Action: plugin.ActionDeny, Mode: plugin.ModeEnforce,
-			Rule: RuleNoCachedPolicy, Provider: cls.provider, Model: cls.model}), nil
-	}
 	req := plugin.Request{
 		Workload: t.workload(), Sections: t.sections, Degraded: t.rec.Degraded,
 		Host: t.rec.Authority, Method: t.rec.Method, Path: t.rec.Path,

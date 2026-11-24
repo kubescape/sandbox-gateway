@@ -95,3 +95,26 @@ func TestEarliestCauseWins(t *testing.T) {
 		t.Fatal("the informer outage, the earliest cause, did not decide")
 	}
 }
+
+// Review: an idle workload keeps its unresolved clock; it does not restart
+// fresh after a quiet spell.
+func TestIdleWorkloadKeepsItsClock(t *testing.T) {
+	clk := newClock()
+	tr := New(5*time.Minute, clk.now)
+	tr.Observe(1, time.Time{}, time.Time{}, true)
+	clk.t = clk.t.Add(24 * time.Hour) // no request for a day
+	if !tr.Observe(1, time.Time{}, time.Time{}, true) {
+		t.Fatal("the idle workload came back fresh")
+	}
+}
+
+func TestForgetDropsTheWorkload(t *testing.T) {
+	clk := newClock()
+	tr := New(5*time.Minute, clk.now)
+	tr.Observe(1, time.Time{}, time.Time{}, true)
+	clk.t = clk.t.Add(time.Hour)
+	tr.Forget(1)
+	if tr.Observe(1, time.Time{}, time.Time{}, true) {
+		t.Fatal("a forgotten workload kept its clock")
+	}
+}

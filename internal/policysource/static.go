@@ -18,8 +18,8 @@ import (
 // is for test programs that run without an API server; it is synced from the
 // start and never loses its source.
 type Static struct {
-	ix   *index
-	refs []plugin.PolicyRef
+	byUID map[string]cached
+	refs  []plugin.PolicyRef
 }
 
 // LoadStatic reads policy objects, as YAML or JSON documents separated by
@@ -30,7 +30,7 @@ func LoadStatic(path string) (*Static, error) {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
-	s := &Static{ix: newIndex()}
+	s := &Static{byUID: map[string]cached{}}
 	dec := yaml.NewYAMLOrJSONDecoder(f, 4096)
 	for {
 		var u unstructured.Unstructured
@@ -46,7 +46,11 @@ func LoadStatic(path string) (*Static, error) {
 		if u.GetUID() == "" {
 			return nil, fmt.Errorf("policysource: %s: %s/%s has no metadata.uid", path, u.GetKind(), u.GetName())
 		}
-		s.ix.put(&u)
+		c, ok := convert(&u)
+		if !ok {
+			return nil, fmt.Errorf("policysource: %s: %s/%s is not a policy object", path, u.GetKind(), u.GetName())
+		}
+		s.byUID[c.ref.UID] = c
 		s.refs = append(s.refs, plugin.PolicyRef{UID: string(u.GetUID()), Generation: u.GetGeneration()})
 	}
 	return s, nil
@@ -58,7 +62,7 @@ func (s *Static) Refs() []plugin.PolicyRef { return s.refs }
 
 // Resolve is Source.Resolve over the file's objects.
 func (s *Static) Resolve(refs []plugin.PolicyRef) ([]plugin.PolicySection, int, int) {
-	return s.ix.resolve(refs)
+	return resolveWith(func(uid string) (cached, bool) { c, ok := s.byUID[uid]; return c, ok }, refs)
 }
 
 // LostSince is always zero.

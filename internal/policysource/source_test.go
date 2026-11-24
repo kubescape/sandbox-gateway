@@ -9,10 +9,12 @@ import (
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -206,7 +208,7 @@ func TestOneInformerRecoveringLeavesOtherLost(t *testing.T) {
 	s.lost(cl)
 	// Events arrive on the cluster informer only.
 	clk.set(first.Add(2 * time.Minute))
-	s.upsert(cl, policy(true, "cl", "uid-cl", 1, "enforce", "cl.example.com"))
+	s.recovered(cl)
 	if got := s.LostSince(); !got.Equal(first) {
 		t.Fatalf("LostSince = %v, want the namespaced outage's start %v", got, first)
 	}
@@ -250,5 +252,61 @@ spec: {mode: audit}
 	}
 	if !s.Synced() || !s.LostSince().IsZero() {
 		t.Fatal("a static source is synced and never lost")
+	}
+}
+
+// Review: an object replaced under the same name (deleted and created again,
+// so with a new UID) must not stay resolvable under its old UID.
+func TestReplacedObjectRetiresOldUID(t *testing.T) {
+	client := newClient(policy(false, "a", "uid-old", 1, "enforce", "a.example.com"))
+	s := start(t, client, newClock())
+	res := client.Resource(SandboxPolicies).Namespace("agents")
+	ctx := context.Background()
+	if err := res.Delete(ctx, "a", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := res.Create(ctx, policy(false, "a", "uid-new", 1, "enforce", "a.example.com"), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		_, _, missing := s.Resolve([]plugin.PolicyRef{{UID: "uid-new", Generation: 1}})
+		return missing == 0
+	}, "the new object")
+	if _, _, missing := s.Resolve([]plugin.PolicyRef{{UID: "uid-old", Generation: 1}}); missing != 1 {
+		t.Fatal("the replaced object still resolves under its old UID")
+	}
+}
+
+// Review: a failed watch call starts the outage clock where it happens, even
+// when client-go retries it without reporting it.
+func TestFailedWatchCallCountsAsLost(t *testing.T) {
+	client := newClient()
+	var down atomic.Bool
+	client.PrependWatchReactor("clustersandboxpolicies", func(k8stesting.Action) (bool, watch.Interface, error) {
+		if down.Load() {
+			return true, nil, errors.New("api server unreachable")
+		}
+		return false, nil, nil
+	})
+	clk := newClock()
+	down.Store(true) // the list works, every watch call fails
+	s := New(client, clk.now)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Run(ctx)
+	waitFor(t, func() bool { return !s.LostSince().IsZero() }, "a failed watch call to start the outage clock")
+	down.Store(false)
+	waitFor(t, func() bool { return s.LostSince().IsZero() }, "a successful watch call to end it")
+}
+
+// Review: each evaluation gets its own copy of the sections.
+func TestSectionsAreCopies(t *testing.T) {
+	s := start(t, newClient(policy(false, "a", "uid-a", 1, "enforce", "a.example.com")), newClock())
+	refs := []plugin.PolicyRef{{UID: "uid-a", Generation: 1}}
+	first, _, _ := s.Resolve(refs)
+	first[0].HTTP.Decrypt.ExactHosts[0] = "changed.example.com"
+	second, _, _ := s.Resolve(refs)
+	if second[0].HTTP.Decrypt.ExactHosts[0] != "a.example.com" {
+		t.Fatal("a change to one resolve's sections showed up in the next")
 	}
 }
