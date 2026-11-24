@@ -96,7 +96,7 @@ The processor runs its own informers on `SandboxPolicy` and `ClusterSandboxPolic
 
 The pod's fail posture never comes from those sections, because the section that is missing can be the one that says `deny`. It comes from the `bindings` table.
 
-A workload's policy is stale from the earliest of: node-agent's lookup serving from its cache, either informer losing the API server (each informer keeps its own outage clock), or a referenced policy not resolving. After `-stale-after` (5m) its decisions are degraded (`internal/stale`). A workload keeps its clock while it is idle; it leaves the tracker when its policy resolves or when it is no longer bound.
+A workload's policy is stale from the earliest of: node-agent's lookup serving from its cache, either informer losing the API server (each informer keeps its own outage clock), or a referenced policy not resolving. After `-stale-after` (5m) its decisions are degraded (`internal/stale`). A workload keeps its clock while it is idle. It leaves the tracker only when its policy resolves or when its removal is confirmed: a request finds its cgroup unbound, or the once-a-minute sweep of the kernel bindings table does not find it. The tracker holds at most 65,536 workloads and never drops a live one to make room. A newly unresolved workload that arrives while it is full is degraded at once, because its age is unknown.
 
 The informers index the objects by UID themselves, so an object deleted and created again under the same name no longer resolves under its old UID. Every list and watch call is counted where it is made: a failure starts that informer's outage clock, a success or any event ends it. Each request gets its own copy of the sections.
 

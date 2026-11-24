@@ -109,6 +109,13 @@ func Run(ctx context.Context, c Config) error {
 	if c.StaleAfter <= 0 {
 		c.StaleAfter = extproc.DefaultStaleAfter
 	}
+	tracker := stale.New(c.StaleAfter, time.Now)
+	if c.Conns != nil {
+		go tracker.Run(ctx, time.Minute, func(cgroupID uint64) (bool, error) {
+			_, ok, err := c.Conns.Binding(cgroupID)
+			return ok, err
+		})
+	}
 	var policies extproc.PolicySource
 	if c.Policies != nil {
 		policies = c.Policies
@@ -116,7 +123,7 @@ func Run(ctx context.Context, c Config) error {
 	}
 	srv := extproc.New(extproc.Config{
 		Policies:          policies,
-		Stale:             stale.New(c.StaleAfter, time.Now),
+		Stale:             tracker,
 		Evaluator:         c.Evaluator,
 		MaxEvaluatorCalls: c.MaxEvaluatorCalls,
 		Conns:             c.Conns,

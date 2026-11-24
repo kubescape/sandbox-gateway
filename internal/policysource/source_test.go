@@ -3,12 +3,15 @@ package policysource
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -274,6 +277,52 @@ func TestReplacedObjectRetiresOldUID(t *testing.T) {
 	}, "the new object")
 	if _, _, missing := s.Resolve([]plugin.PolicyRef{{UID: "uid-old", Generation: 1}}); missing != 1 {
 		t.Fatal("the replaced object still resolves under its old UID")
+	}
+}
+
+// Review: the same replacement delivered as one update event, the way a
+// watch that missed the delete reports it.
+func TestReplacedObjectInOneUpdateRetiresOldUID(t *testing.T) {
+	client := newClient(policy(false, "a", "uid-old", 1, "enforce", "a.example.com"))
+	s := start(t, client, newClock())
+	res := client.Resource(SandboxPolicies).Namespace("agents")
+	if _, err := res.Update(context.Background(), policy(false, "a", "uid-new", 1, "enforce", "a.example.com"), metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		_, _, missing := s.Resolve([]plugin.PolicyRef{{UID: "uid-new", Generation: 1}})
+		return missing == 0
+	}, "the new object")
+	if _, _, missing := s.Resolve([]plugin.PolicyRef{{UID: "uid-old", Generation: 1}}); missing != 1 {
+		t.Fatal("the replaced object still resolves under its old UID")
+	}
+}
+
+// Review: errors client-go retries inside the reflector, without calling the
+// watch error handler, still start the outage clock.
+func TestRetryableWatchErrorCountsAsLost(t *testing.T) {
+	for name, werr := range map[string]error{
+		"too many requests":  apierrors.NewTooManyRequests("slow down", 1),
+		"connection refused": &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := newClient()
+			var down atomic.Bool
+			down.Store(true)
+			client.PrependWatchReactor("clustersandboxpolicies", func(k8stesting.Action) (bool, watch.Interface, error) {
+				if down.Load() {
+					return true, nil, werr
+				}
+				return false, nil, nil
+			})
+			s := New(client, newClock().now)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go s.Run(ctx)
+			waitFor(t, func() bool { return !s.LostSince().IsZero() }, "a retried watch error to start the outage clock")
+			down.Store(false)
+			waitFor(t, func() bool { return s.LostSince().IsZero() }, "a successful watch call to end it")
+		})
 	}
 }
 

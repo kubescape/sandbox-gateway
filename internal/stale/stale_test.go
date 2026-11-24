@@ -1,6 +1,7 @@
 package stale
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -116,5 +117,54 @@ func TestForgetDropsTheWorkload(t *testing.T) {
 	tr.Forget(1)
 	if tr.Observe(1, time.Time{}, time.Time{}, true) {
 		t.Fatal("a forgotten workload kept its clock")
+	}
+}
+
+// Review: at capacity, a live workload whose policy stays unresolved keeps
+// its clock, and one that cannot be tracked is degraded rather than given a
+// fresh grace period.
+func TestLiveUnresolvedWorkloadKeepsItsClockAtCapacity(t *testing.T) {
+	clk := newClock()
+	tr := New(5*time.Minute, clk.now)
+	tr.Observe(1, time.Time{}, time.Time{}, true) // the live workload, first miss now
+	clk.t = clk.t.Add(time.Minute)
+	for id := uint64(2); id <= maxEntries; id++ { // fill the tracker
+		tr.Observe(id, time.Time{}, time.Time{}, true)
+	}
+	if !tr.Observe(maxEntries+1, time.Time{}, time.Time{}, true) {
+		t.Fatal("a workload the full tracker cannot hold was not degraded")
+	}
+	clk.t = clk.t.Add(4 * time.Minute) // five minutes after workload 1's first miss
+	if !tr.Observe(1, time.Time{}, time.Time{}, true) {
+		t.Fatal("eviction pressure restarted a live workload's clock")
+	}
+}
+
+func TestSweepDropsOnlyConfirmedGoneWorkloads(t *testing.T) {
+	clk := newClock()
+	tr := New(5*time.Minute, clk.now)
+	for id := uint64(1); id <= maxEntries; id++ {
+		tr.Observe(id, time.Time{}, time.Time{}, true)
+	}
+	gone := map[uint64]bool{7: true, 8: true}
+	removed := tr.Sweep(func(id uint64) (bool, error) {
+		if id == 9 {
+			return false, errors.New("read failed") // unknown: kept
+		}
+		return !gone[id], nil
+	})
+	if removed != 2 {
+		t.Fatalf("removed = %d", removed)
+	}
+	clk.t = clk.t.Add(time.Minute)
+	if tr.Observe(maxEntries+1, time.Time{}, time.Time{}, true) {
+		t.Fatal("a new workload was degraded after a sweep made room")
+	}
+	clk.t = clk.t.Add(4 * time.Minute)
+	if !tr.Observe(9, time.Time{}, time.Time{}, true) {
+		t.Fatal("a workload whose bindings read failed lost its clock")
+	}
+	if tr.Observe(7, time.Time{}, time.Time{}, true) {
+		t.Fatal("a swept workload kept its old clock")
 	}
 }
