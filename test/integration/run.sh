@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # One streamed call through Envoy to the mock provider.
 # Pass: the client, trusting only the gateway CA, reads the whole stream (end_turn), and the
-# processor's transaction record shows it parsed the same stream. Two refusals are checked
-# too: a Host header that is not the decrypted name, and a passthrough name that resolves
-# to loopback.
+# processor's transaction record shows it parsed the same stream and named the pod. Refusals
+# checked too: a Host header that is not the decrypted name, a passthrough name that
+# resolves to loopback, and a connection that is not in the connection table. A client
+# must not be able to choose the address the processor looks it up by, with an
+# X-Forwarded-For header or a PROXY protocol header. The shipped processor image must
+# refuse to start without the kernel tables.
 set -euo pipefail
 cd "$(dirname "$0")"
 export ENVOY_VERSION="${ENVOY_VERSION:-v1.40.2}"
@@ -21,6 +24,7 @@ trap cleanup EXIT
 
 ./make-envoy-config.sh
 "${COMPOSE[@]}" build
+"${COMPOSE[@]}" --profile tools build processor-image
 "${COMPOSE[@]}" up -d
 echo "--- envoy version"
 "${COMPOSE[@]}" exec -T envoy envoy --version | grep -F "/${ENVOY_VERSION#v}/"
@@ -35,6 +39,7 @@ sleep 1
 "${COMPOSE[@]}" logs --no-color --no-log-prefix processor | grep '"msg":"transaction"' | tail -1 | tee generated/record.json
 grep -q '"stop_reason":"end_turn"' generated/record.json
 grep -Eq '"sse_events":[1-9]' generated/record.json
+grep -q '"pod":"it-pod"' generated/record.json
 
 echo "--- a Host header that differs from the decrypted name is refused"
 "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt \
@@ -49,6 +54,35 @@ sleep 3
 hops=$("${COMPOSE[@]}" logs --no-color --no-log-prefix envoy | grep -c '"kind":"passthrough"' || true)
 echo "passthrough connections logged: $hops"
 [ "$hops" -le 5 ]
+
+echo "--- the address the processor sees is the socket's, whatever the client claims"
+forged=198.51.100.77
+"${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt --x-forwarded-for "$forged" >/dev/null
+# With a PROXY line in front, the bytes are not a TLS ClientHello, so the call must fail.
+if "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt --wait 0 \
+    --proxy-header "PROXY TCP4 $forged 192.0.2.1 4242 443" >/dev/null 2>&1; then
+  echo "FAIL: a connection that starts with a PROXY protocol header was served"; exit 1
+fi
+sleep 1
+"${COMPOSE[@]}" logs --no-color --no-log-prefix processor | grep '"msg":"transaction"' > generated/records.jsonl
+if grep -F "$forged" generated/records.jsonl; then
+  echo "FAIL: the processor saw the address the client claimed"; exit 1
+fi
+
+echo "--- a connection that is not in the connection table is refused"
+PROCESSOR_MODE=--reject-all "${COMPOSE[@]}" up -d --force-recreate processor
+# --no-deps: otherwise compose sees the processor's changed command and recreates it.
+"${COMPOSE[@]}" run --rm -T --no-deps client streamcheck --addr envoy:443 --ca /certs/ca.crt --expect-status 403 --wait 30s
+"${COMPOSE[@]}" logs --no-color --no-log-prefix processor | grep '"msg":"transaction"' | tail -1 | tee generated/rejected.json
+grep -q '"reject_reason":"no_connection_entry"' generated/rejected.json
+"${COMPOSE[@]}" up -d --force-recreate processor
+
+echo "--- the shipped processor image does not start without the kernel tables"
+if out=$(docker run --rm sandbox-gateway/processor:it 2>&1); then
+  echo "FAIL: the processor started with no connection tables"; exit 1
+fi
+echo "$out" | tail -1
+echo "$out" | grep -q 'open the connection tables'
 
 echo "--- envoy access log"
 "${COMPOSE[@]}" logs --no-color --no-log-prefix envoy | grep '"kind":"access"' | tail -1

@@ -83,6 +83,8 @@ func newHarnessBudget(t *testing.T, faults Faults, budget time.Duration) *harnes
 		Evaluator:   h.eval,
 		Faults:      faults,
 		ChunkBudget: budget,
+		Conns:       newTable(),
+		Lookup:      fixedLookup(testWorkload(), time.Time{}, nil),
 		Emit: func(r Record) {
 			h.mu.Lock()
 			h.records = append(h.records, r)
@@ -140,6 +142,7 @@ func sendRequest(t *testing.T, st extprocv3.ExternalProcessor_ProcessClient) *ex
 	t.Helper()
 	must(t, st.Send(&extprocv3.ProcessingRequest{
 		MetadataContext: attrMeta(),
+		Attributes:      srcAttrs(testSource),
 		Request: &extprocv3.ProcessingRequest_RequestHeaders{RequestHeaders: &extprocv3.HttpHeaders{
 			Headers: hdrs(":method", "POST", ":path", "/v1/messages", ":authority", "api.anthropic.com", "x-request-id", "rid-1")}}}))
 	recv(t, st)
@@ -191,7 +194,7 @@ func TestAuditPassThrough(t *testing.T) {
 	must(t, st.CloseSend())
 
 	r := h.waitRecords(t, 1)[0]
-	if r.TransactionID != "rid-1" || r.Attribution["pod_uid"] != "uid-1" || r.Attribution["pid"] != "4242" {
+	if r.TransactionID != "rid-1" || r.Identity == nil || r.Identity.Pod != "coder-7d9f" || r.PPv2Ignored == "" {
 		t.Fatalf("identity: %+v", r)
 	}
 	if r.Decision == nil || r.Decision.Action != plugin.WouldDeny || len(r.Decision.Tools) != 1 {
@@ -272,14 +275,15 @@ func TestEarlyEOSCutsMidChunk(t *testing.T) {
 	must(t, st.CloseSend())
 }
 
-// Identity from the PPv2 TLVs is copied into kubescape.sandbox.audit so the access log can show it.
-func TestAttributionEchoedToAuditMetadata(t *testing.T) {
+// The identity from the kernel table is copied into kubescape.sandbox.audit so the
+// access log can show it. The identity the client claimed is not.
+func TestIdentityEchoedToAuditMetadata(t *testing.T) {
 	h := newHarness(t, Faults{})
 	st, err := h.client.Process(context.Background())
 	must(t, err)
 	last := sendRequest(t, st)
 	audit := last.GetDynamicMetadata().GetFields()[AuditNS].GetStructValue().GetFields()
-	if audit["pod_uid"].GetStringValue() != "uid-1" || audit["pid"].GetStringValue() != "4242" {
+	if _, claimed := audit["pod_uid"]; claimed || audit["pod"].GetStringValue() != "coder-7d9f" || audit["namespace"].GetStringValue() != "agents" {
 		t.Fatalf("audit metadata = %v", audit)
 	}
 	must(t, st.CloseSend())
@@ -373,7 +377,7 @@ func must(t *testing.T, err error) {
 func TestDecisionVersionAndDegradedReachAudit(t *testing.T) {
 	eval := &fakeEvaluator{decision: plugin.Decision{RuleID: fakeRuleID, Action: plugin.Allow, ClassVersion: "v7"}}
 	h := &harness{}
-	srv := New(Config{Evaluator: eval, Emit: func(r Record) {
+	srv := New(Config{Evaluator: eval, Conns: newTable(), Lookup: fixedLookup(testWorkload(), time.Time{}, nil), Emit: func(r Record) {
 		h.mu.Lock()
 		h.records = append(h.records, r)
 		h.mu.Unlock()
@@ -407,7 +411,7 @@ func TestDecisionVersionAndDegradedReachAudit(t *testing.T) {
 // Enforce: a would_deny request gets a 403 instead of its last chunk being forwarded.
 func TestEnforceBlocksWithProviderShaped403(t *testing.T) {
 	h := &harness{}
-	srv := New(Config{Evaluator: wouldDeny(), Enforce: true, Emit: func(r Record) {
+	srv := New(Config{Evaluator: wouldDeny(), Enforce: true, Conns: newTable(), Lookup: fixedLookup(testWorkload(), time.Time{}, nil), Emit: func(r Record) {
 		h.mu.Lock()
 		h.records = append(h.records, r)
 		h.mu.Unlock()
@@ -423,7 +427,7 @@ func TestEnforceBlocksWithProviderShaped403(t *testing.T) {
 	defer conn.Close()
 	st, err := extprocv3.NewExternalProcessorClient(conn).Process(context.Background())
 	must(t, err)
-	must(t, st.Send(&extprocv3.ProcessingRequest{Request: &extprocv3.ProcessingRequest_RequestHeaders{RequestHeaders: &extprocv3.HttpHeaders{
+	must(t, st.Send(&extprocv3.ProcessingRequest{Attributes: srcAttrs(testSource), Request: &extprocv3.ProcessingRequest_RequestHeaders{RequestHeaders: &extprocv3.HttpHeaders{
 		Headers: hdrs(":method", "POST", ":path", "/v1/messages", ":authority", "api.anthropic.com")}}}))
 	recv(t, st)
 	half := len(reqBody) / 2
@@ -442,6 +446,18 @@ func TestEnforceBlocksWithProviderShaped403(t *testing.T) {
 
 // start runs a server with cfg and returns a stream plus the harness that collects records.
 func start(t *testing.T, cfg Config) (extprocv3.ExternalProcessor_ProcessClient, *harness) {
+	t.Helper()
+	if cfg.Conns == nil {
+		cfg.Conns = newTable()
+	}
+	if cfg.Lookup == nil {
+		cfg.Lookup = fixedLookup(testWorkload(), time.Time{}, nil)
+	}
+	return startRaw(t, cfg)
+}
+
+// startRaw is start without the default connection table and lookup.
+func startRaw(t *testing.T, cfg Config) (extprocv3.ExternalProcessor_ProcessClient, *harness) {
 	t.Helper()
 	h := &harness{}
 	cfg.Emit = func(r Record) {
@@ -467,8 +483,10 @@ func start(t *testing.T, cfg Config) (extprocv3.ExternalProcessor_ProcessClient,
 func sendHeaders(t *testing.T, st extprocv3.ExternalProcessor_ProcessClient, kv ...string) *extprocv3.ProcessingResponse {
 	t.Helper()
 	base := []string{":method", "POST", ":path", "/v1/messages", ":authority", "api.anthropic.com"}
-	must(t, st.Send(&extprocv3.ProcessingRequest{Request: &extprocv3.ProcessingRequest_RequestHeaders{
-		RequestHeaders: &extprocv3.HttpHeaders{Headers: hdrs(append(base, kv...)...)}}}))
+	must(t, st.Send(&extprocv3.ProcessingRequest{
+		Attributes: srcAttrs(testSource),
+		Request: &extprocv3.ProcessingRequest_RequestHeaders{
+			RequestHeaders: &extprocv3.HttpHeaders{Headers: hdrs(append(base, kv...)...)}}}))
 	return recv(t, st)
 }
 
@@ -633,9 +651,9 @@ func TestWebSocketUpgradeOnInspectedPath(t *testing.T) {
 
 	// A path the evaluator does not inspect upgrades as before.
 	st, _ = start(t, Config{Evaluator: wouldDeny(), Enforce: true})
-	must(t, st.Send(&extprocv3.ProcessingRequest{Request: &extprocv3.ProcessingRequest_RequestHeaders{
+	must(t, st.Send(&extprocv3.ProcessingRequest{Attributes: srcAttrs(testSource), Request: &extprocv3.ProcessingRequest_RequestHeaders{
 		RequestHeaders: &extprocv3.HttpHeaders{Headers: hdrs(":method", "GET", ":path", "/v1/ws", "upgrade", "websocket")}}}))
-	if r := recv(t, st); r.GetRequestHeaders() == nil || r.GetDynamicMetadata() != nil {
+	if r := recv(t, st); r.GetRequestHeaders() == nil || r.GetDynamicMetadata().GetFields()[AuditNS].GetStructValue().GetFields()["rule_id"] != nil {
 		t.Fatalf("uninspected path: %v", r)
 	}
 }

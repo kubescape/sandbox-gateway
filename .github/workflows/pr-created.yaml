@@ -50,6 +50,14 @@ jobs:
         run: go build ./...
       - name: Vet
         run: go vet ./...
+      # Creating and pinning BPF maps needs root, so the unprivileged test run skips these.
+      # The grep fails the step if the test was skipped here too. pipefail: without it the
+      # step's status is tee's, and a failing test would pass.
+      - name: Pinned map reader (as root)
+        run: |
+          set -o pipefail
+          sudo -E env "PATH=$PATH" go test -count=1 -v -run 'TestOpen' ./internal/conntable/ | tee conntable.out
+          grep -q -- '--- PASS: TestOpenReadsPinnedMaps' conntable.out
       - name: Lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:

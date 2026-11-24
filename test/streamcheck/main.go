@@ -38,11 +38,13 @@ func main() {
 	wait := flag.Duration("wait", 60*time.Second, "keep retrying this long while the gateway starts; 0 tries once")
 	hostHeader := flag.String("host-header", "", "send this Host header instead of -host, to check that the gateway refuses a mismatch")
 	expect := flag.Int("expect-status", 0, "pass when the response has this status, without reading a stream")
+	xff := flag.String("x-forwarded-for", "", "send this X-Forwarded-For header, to check that the gateway does not take the client's address from it")
+	proxyLine := flag.String("proxy-header", "", "write this PROXY protocol v1 line before the TLS handshake, to check that the gateway does not accept one")
 	flag.Parse()
 
 	deadline := time.Now().Add(*wait)
 	for {
-		res, err := call(*addr, *host, *hostHeader, *caPath, *model, *expect)
+		res, err := call(*addr, *host, *hostHeader, *caPath, *model, *xff, *proxyLine, *expect)
 		if err == nil {
 			_ = json.NewEncoder(os.Stdout).Encode(res)
 			return
@@ -56,7 +58,7 @@ func main() {
 	}
 }
 
-func call(addr, host, hostHeader, caPath, model string, expect int) (result, error) {
+func call(addr, host, hostHeader, caPath, model, xff, proxyLine string, expect int) (result, error) {
 	var res result
 	pem, err := os.ReadFile(caPath)
 	if err != nil {
@@ -71,7 +73,15 @@ func call(addr, host, hostHeader, caPath, model string, expect int) (result, err
 		// Every connection goes to the gateway, whatever the URL says. This
 		// stands in for the redirect.
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return dialer.DialContext(ctx, network, addr)
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil || proxyLine == "" {
+				return conn, err
+			}
+			if _, err := conn.Write([]byte(proxyLine + "\r\n")); err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+			return conn, nil
 		},
 		TLSClientConfig:   &tls.Config{RootCAs: pool, ServerName: host, MinVersion: tls.VersionTLS12},
 		ForceAttemptHTTP2: true,
@@ -86,6 +96,9 @@ func call(addr, host, hostHeader, caPath, model string, expect int) (result, err
 	req.Header.Set("content-type", "application/json")
 	if hostHeader != "" {
 		req.Host = hostHeader
+	}
+	if xff != "" {
+		req.Header.Set("x-forwarded-for", xff)
 	}
 	resp, err := client.Do(req)
 	if err != nil {

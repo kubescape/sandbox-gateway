@@ -17,6 +17,7 @@
 package extproc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,7 +33,9 @@ import (
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/types/known/structpb"
 
+	"github.com/kubescape/sandbox-gateway/internal/conntable"
 	"github.com/kubescape/sandbox-gateway/internal/eventstream"
+	"github.com/kubescape/sandbox-gateway/internal/lookup"
 	"github.com/kubescape/sandbox-gateway/internal/sse"
 	"github.com/kubescape/sandbox-gateway/internal/streamfmt"
 	"github.com/kubescape/sandbox-gateway/internal/wsframe"
@@ -42,7 +45,10 @@ import (
 // Namespaces of dynamic metadata. Envoy's ext_proc filter must list
 // AttributionNS in forwarding_namespaces and AuditNS in receiving_namespaces.
 const (
-	AttributionNS = "kubescape.sandbox.attribution" // written by the proxy_protocol listener filter from PPv2 TLVs
+	// AttributionNS is where a proxy_protocol listener filter would put the
+	// identity a client claims in PROXY protocol TLVs. The processor never uses
+	// it; it only flags that one arrived.
+	AttributionNS = "kubescape.sandbox.attribution"
 	AuditNS       = "kubescape.sandbox.audit"
 )
 
@@ -69,31 +75,66 @@ type Config struct {
 	// hung policy step while the gRPC stream still works; a wedged process
 	// needs Envoy's idle timeout or a restart (see README).
 	ChunkBudget time.Duration
-	// AttrLookup is the stage 1 5-tuple path: given Envoy's downstream address
-	// ("ip:port", from the source.address request attribute) it returns the
-	// attribution the redirector recorded. Used when no PPv2 identity arrived.
-	AttrLookup func(addr string) (map[string]string, error)
-	Emit       func(Record) // called once per transaction; default logs JSON
-	Log        *slog.Logger
+	// Conns is the kernel's record of who opened each connection, keyed on the
+	// pod socket's address and port, which Envoy reports as the source.address
+	// request attribute. It is the only identity source. A request whose
+	// connection is not in it is rejected; with no table every request is.
+	Conns conntable.Table
+	// Lookup names the workload that owns a cgroup. nil leaves the record with
+	// the kernel half of the identity only.
+	Lookup LookupFunc
+	Emit   func(Record) // called once per transaction; default logs JSON
+	Log    *slog.Logger
+}
+
+// LookupFunc returns the workload that owns a cgroup. failingSince is zero
+// while the lookup source answers; otherwise the workload comes from a cache
+// and failingSince says since when. lookup.ErrNotBound means the pod is not
+// bound. (*lookup.Client).Workload has this shape.
+type LookupFunc func(ctx context.Context, cgroupID uint64) (w lookup.Workload, failingSince time.Time, err error)
+
+// Identity is who sent a request: the connection's entry in the kernel table,
+// the pod's binding, and the workload node-agent names for its cgroup.
+type Identity struct {
+	Namespace      string `json:"namespace,omitempty"`
+	Pod            string `json:"pod,omitempty"`
+	Container      string `json:"container,omitempty"`
+	ControllerKind string `json:"controller_kind,omitempty"`
+	ControllerName string `json:"controller_name,omitempty"`
+	BindingID      uint32 `json:"binding_id"`
+	Posture        string `json:"fail_posture"` // allow | deny, from the bindings table
+	Gate           uint8  `json:"gate,omitempty"`
+	CgroupID       uint64 `json:"cgroup_id"`
+	PID            uint32 `json:"pid"`
+	ConnLocalAddr  string `json:"conn_local_addr"` // the pod socket's address and port,
+	ConnLocalPort  uint16 `json:"conn_local_port"` // as in the conns key
+	OrigDst        string `json:"orig_dst"`        // where the pod was connecting to
+	// LookupFailingSince is set when the workload came from the lookup cache
+	// because node-agent's socket was not answering.
+	LookupFailingSince string `json:"lookup_failing_since,omitempty"`
+	// LookupError is set when the workload could not be named at all.
+	LookupError string `json:"lookup_error,omitempty"`
 }
 
 // Record is the per-transaction audit record.
 type Record struct {
-	TransactionID     string            `json:"transaction_id"` // Envoy x-request-id; joined to the tap's id in stage 4
-	Attribution       map[string]string `json:"attribution,omitempty"`
-	Downstream        string            `json:"downstream,omitempty"`  // source.address from Envoy
-	TestOracle        string            `json:"test_oracle,omitempty"` // x-sandbox-test-oracle, set by the stage 1 test client
-	Authority         string            `json:"authority,omitempty"`
-	Method            string            `json:"method,omitempty"`
-	Path              string            `json:"path,omitempty"`
-	Decision          *plugin.Decision  `json:"decision,omitempty"`
-	RequestBytes      int               `json:"request_bytes"`
-	Status            string            `json:"status,omitempty"`
-	ContentEncoding   string            `json:"content_encoding,omitempty"` // non-empty = compressed body the processor can't read
-	ResponseChunks    int               `json:"response_chunks"`
-	ResponseBytes     int               `json:"response_bytes"`
-	SSEEvents         int               `json:"sse_events"`
-	EventStreamFrames int               `json:"eventstream_frames,omitempty"` // Bedrock application/vnd.amazon.eventstream frames
+	TransactionID     string           `json:"transaction_id"` // Envoy x-request-id; joined to the tap's id in stage 4
+	Identity          *Identity        `json:"identity,omitempty"`
+	Downstream        string           `json:"downstream,omitempty"`   // source.address from Envoy
+	PPv2Ignored       string           `json:"ppv2_ignored,omitempty"` // an identity the client claimed over PROXY protocol; never used
+	RejectReason      string           `json:"reject_reason,omitempty"`
+	TestOracle        string           `json:"test_oracle,omitempty"` // x-sandbox-test-oracle, set by the stage 1 test client
+	Authority         string           `json:"authority,omitempty"`
+	Method            string           `json:"method,omitempty"`
+	Path              string           `json:"path,omitempty"`
+	Decision          *plugin.Decision `json:"decision,omitempty"`
+	RequestBytes      int              `json:"request_bytes"`
+	Status            string           `json:"status,omitempty"`
+	ContentEncoding   string           `json:"content_encoding,omitempty"` // non-empty = compressed body the processor can't read
+	ResponseChunks    int              `json:"response_chunks"`
+	ResponseBytes     int              `json:"response_bytes"`
+	SSEEvents         int              `json:"sse_events"`
+	EventStreamFrames int              `json:"eventstream_frames,omitempty"` // Bedrock application/vnd.amazon.eventstream frames
 	// StopReason is how the provider said the response ended, in its own
 	// terms: the Anthropic stop_reason, the OpenAI chat finish_reason, or the
 	// OpenAI Responses status ("completed", "incomplete", "failed").
@@ -105,7 +146,7 @@ type Record struct {
 	WatchdogFired     bool     `json:"watchdog_fired,omitempty"`
 	WebSocket         *WSStats `json:"websocket,omitempty"`
 	ObservabilityMode bool     `json:"observability_mode,omitempty"`
-	Ended             string   `json:"ended"` // eos | trailers | stream_closed | stream_error | watchdog
+	Ended             string   `json:"ended"` // eos | trailers | stream_closed | stream_error | watchdog | denied | rejected
 }
 
 // WSStats summarises an upgraded WebSocket connection (S5): messages decoded
@@ -310,9 +351,7 @@ func (s *Server) verdict(t *txn, d plugin.Decision) (meta *structpb.Struct, deni
 		"rule_id": d.RuleID, "action": string(d.Action), "model": d.Model, "reason": d.Reason,
 		"class_version": d.ClassVersion, "degraded": d.Degraded,
 	}
-	// The access log can't read the connection-level PPv2 metadata,
-	// so the identity rides along in the request's kubescape.sandbox.audit.
-	for k, v := range t.rec.Attribution {
+	for k, v := range identityFields(t.rec.Identity) {
 		fields[k] = v
 	}
 	return auditMetadata(fields), denied
@@ -325,6 +364,99 @@ func deny(d *plugin.Decision, meta *structpb.Struct) *extprocv3.ProcessingRespon
 	}
 }
 
+// identify finds who sent the request, from the kernel table and node-agent's
+// lookup, and puts it on the record. It returns a non-empty reason when the
+// request must be rejected.
+func (s *Server) identify(ctx context.Context, t *txn) (rejectReason string) {
+	if s.cfg.Conns == nil {
+		return "no_connection_table"
+	}
+	key, err := conntable.ParseKey(t.rec.Downstream)
+	if err != nil {
+		return "no_source_address"
+	}
+	// Read on every request and never cached here: the kernel reuses an
+	// address and port for another pod's connection once the first one closes.
+	conn, ok, err := s.cfg.Conns.Conn(key)
+	if err != nil {
+		s.cfg.Log.Error("connection table read failed", "error", err)
+		return "connection_table_error"
+	}
+	if !ok {
+		return "no_connection_entry"
+	}
+	binding, ok, err := s.cfg.Conns.Binding(conn.CgroupID)
+	if err != nil {
+		s.cfg.Log.Error("bindings table read failed", "error", err)
+		return "connection_table_error"
+	}
+	if !ok {
+		return "not_bound"
+	}
+	// The connection carries the binding it was made under. If the cgroup's
+	// binding is another one now, the two tables do not describe the same pod,
+	// and the posture read here would not be this connection's.
+	if conn.BindingID != binding.BindingID {
+		s.cfg.Log.Warn("connection and cgroup name different bindings",
+			"conn_binding", conn.BindingID, "cgroup_binding", binding.BindingID, "cgroup", conn.CgroupID)
+		return "binding_mismatch"
+	}
+	id := &Identity{
+		BindingID: conn.BindingID, Posture: binding.Posture, Gate: binding.Gate,
+		CgroupID: conn.CgroupID, PID: conn.PID,
+		ConnLocalAddr: key.Addr.String(), ConnLocalPort: key.Port, OrigDst: conn.OrigDst.String(),
+	}
+	if s.cfg.Lookup != nil {
+		w, failingSince, err := s.cfg.Lookup(ctx, conn.CgroupID)
+		switch {
+		case errors.Is(err, lookup.ErrNotBound):
+			return "not_bound"
+		case err != nil:
+			id.LookupError = err.Error()
+		case w.BindingID != conn.BindingID:
+			// The kernel tables decide the binding; the lookup only names
+			// the workload. An answer about another binding (node-agent's
+			// view or its cache lags a rebinding) does not describe this
+			// connection, so none of it goes on the record.
+			s.cfg.Log.Warn("lookup names another binding than the kernel tables",
+				"lookup_binding", w.BindingID, "kernel_binding", conn.BindingID, "cgroup", conn.CgroupID)
+			id.LookupError = fmt.Sprintf("binding_mismatch: the lookup names binding %d, the kernel tables %d", w.BindingID, conn.BindingID)
+		default:
+			id.Namespace, id.Pod, id.Container = w.Namespace, w.Pod, w.Container
+			id.ControllerKind, id.ControllerName = w.Controller.Kind, w.Controller.Name
+		}
+		if !failingSince.IsZero() {
+			id.LookupFailingSince = failingSince.UTC().Format(time.RFC3339)
+		}
+	}
+	t.rec.Identity = id
+	return ""
+}
+
+// reject refuses a request the processor cannot attribute to a bound pod.
+func reject(reason string) *extprocv3.ProcessingResponse {
+	return &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ImmediateResponse{
+		ImmediateResponse: &extprocv3.ImmediateResponse{
+			Status: &typev3.HttpStatus{Code: typev3.StatusCode_Forbidden},
+			Headers: &extprocv3.HeaderMutation{SetHeaders: []*corev3.HeaderValueOption{
+				{Header: &corev3.HeaderValue{Key: "content-type", RawValue: []byte("text/plain")}}}},
+			Body:    []byte("sandbox gateway: this connection is not attributed to a bound pod (" + reason + ")\n"),
+			Details: reason,
+		}}}
+}
+
+// identityFields is the part of the identity the access log shows.
+func identityFields(id *Identity) map[string]any {
+	if id == nil {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"namespace": id.Namespace, "pod": id.Pod, "container": id.Container,
+		"binding_id": float64(id.BindingID), "fail_posture": id.Posture,
+		"orig_dst": id.OrigDst,
+	}
+}
+
 func (s *Server) handle(stream extprocv3.ExternalProcessor_ProcessServer, t *txn, req *extprocv3.ProcessingRequest) (*extprocv3.ProcessingResponse, error) {
 	switch v := req.Request.(type) {
 	case *extprocv3.ProcessingRequest_RequestHeaders:
@@ -333,14 +465,12 @@ func (s *Server) handle(stream extprocv3.ExternalProcessor_ProcessServer, t *txn
 		t.rec.Authority = h[":authority"]
 		t.rec.Method = h[":method"]
 		t.rec.Path = h[":path"]
-		t.rec.Attribution = attribution(req.GetMetadataContext())
 		t.rec.TestOracle = h["x-sandbox-test-oracle"]
-		// With the 5-tuple table in use, the kernel-observed identity wins. A PPv2
-		// header on the same connection is self-declared by the client, so it is
-		// ignored and flagged (gap 2: a pod could claim another pod's identity).
-		var claimed map[string]string
-		if s.cfg.AttrLookup != nil && t.rec.Attribution != nil {
-			claimed, t.rec.Attribution = t.rec.Attribution, nil
+		// A PROXY protocol identity on the connection is declared by the client,
+		// so a pod could claim to be another pod with it. It is never used, only
+		// flagged.
+		if claimed := attribution(req.GetMetadataContext()); claimed != nil {
+			t.rec.PPv2Ignored = "pod_uid=" + claimed["pod_uid"] + " pid=" + claimed["pid"]
 		}
 		if strings.EqualFold(h["upgrade"], "websocket") {
 			t.rec.WebSocket = &WSStats{}
@@ -348,24 +478,19 @@ func (s *Server) handle(stream extprocv3.ExternalProcessor_ProcessServer, t *txn
 		if a := req.GetAttributes()["envoy.filters.http.ext_proc"]; a != nil {
 			t.rec.Downstream = a.GetFields()["source.address"].GetStringValue()
 		}
-		if t.rec.Attribution == nil && s.cfg.AttrLookup != nil && t.rec.Downstream != "" {
-			if attr, err := s.cfg.AttrLookup(t.rec.Downstream); err == nil {
-				t.rec.Attribution = attr
-			} else {
-				t.rec.Attribution = map[string]string{"source": "5tuple-miss", "error": err.Error()}
-			}
-		}
-		if claimed != nil {
-			if t.rec.Attribution == nil {
-				t.rec.Attribution = map[string]string{}
-			}
-			t.rec.Attribution["ppv2_ignored"] = "pod_uid=" + claimed["pod_uid"] + " pid=" + claimed["pid"]
+		if reason := s.identify(stream.Context(), t); reason != "" {
+			t.rec.Ended, t.rec.RejectReason = "rejected", reason
+			return reject(reason), nil
 		}
 		if v.RequestHeaders.GetEndOfStream() {
 			t.reqEOSAt = time.Now()
 		}
-		resp := &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_RequestHeaders{
-			RequestHeaders: &extprocv3.HeadersResponse{}}}
+		// The identity goes into the audit metadata so the access log shows who
+		// sent the request.
+		resp := &extprocv3.ProcessingResponse{
+			Response: &extprocv3.ProcessingResponse_RequestHeaders{
+				RequestHeaders: &extprocv3.HeadersResponse{}},
+			DynamicMetadata: auditMetadata(identityFields(t.rec.Identity))}
 		// The client sets the upgrade header, so it must not be a way around the
 		// evaluator: the request is decided here, without its body.
 		if t.rec.WebSocket != nil && s.cfg.Evaluator != nil && s.cfg.Evaluator.Inspects(t.rec.Path) {
