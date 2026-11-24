@@ -9,6 +9,11 @@
 # must not be able to choose the address the processor looks it up by, with an
 # X-Forwarded-For header or a PROXY protocol header. The shipped processor image must
 # refuse to start without the kernel tables.
+#
+# The node controller's rules are watched too: a pod is decrypted only for its own names, a
+# passthrough connection goes to its original destination, the health listener's three
+# paths, an SNI flood, chains added and removed under live connections with a cap of
+# three names, leaf renewal, an SDS outage, and a change of root.
 set -euo pipefail
 cd "$(dirname "$0")"
 export ENVOY_VERSION="${ENVOY_VERSION:-v1.40.2}"
@@ -36,6 +41,21 @@ for _ in $(seq 1 60); do
 done
 "${COMPOSE[@]}" logs --no-color --no-log-prefix origdst | tail -3
 "${COMPOSE[@]}" logs --no-color origdst | grep -q 'attached: SO_ORIGINAL_DST'
+started=$(date +%s)
+
+# Helpers for the checks below. Each prints httpget's result line: "<status> <body>".
+result() { grep -E '^[0-9]{3} ' | tail -1 || true; }
+# The node controller's debug stats: host set, names, counters.
+# Asked from sock-probe, which has no fixed address: the client containers do, and only
+# one container can hold an address at a time, so nothing else may run as "client" while
+# a held connection is open from it.
+ncstats() { "${COMPOSE[@]}" run --rm -T --no-deps sock-probe httpget http://node-controller:9101/stats 2>&1 | result; }
+# Envoy stats by filter, over its admin socket.
+envoystat() { "${COMPOSE[@]}" run --rm -T --no-deps sock-probe httpget -unix /run/sandbox-gateway/envoy-admin.sock "http://admin/stats?filter=$1" 2>&1 | grep -v Container || true; }
+# A DNS sighting, posted the way node-agent will.
+sight() { "${COMPOSE[@]}" run --rm -T --no-deps sock-probe httpget -unix /run/kubescape-sandbox/gateway.sock -post "{\"name\":\"$1\",\"addresses\":[\"172.30.0.30\"],\"bindingIds\":[1]}" http://gateway/v1/sightings 2>&1 | result; }
+# Waits until the node controller's stats match a pattern, up to 60 seconds.
+until_stats() { for _ in $(seq 1 60); do ncstats | grep -Eq "$1" && return 0; sleep 1; done; echo "timed out waiting for: $1"; ncstats; return 1; }
 echo "--- envoy version"
 "${COMPOSE[@]}" exec -T envoy envoy --version | grep -F "/${ENVOY_VERSION#v}/"
 
@@ -172,6 +192,89 @@ fi
 echo "$out" | tail -1
 echo "$out" | grep -q 'open the connection tables'
 
+echo "--- a 1,500-name SNI flood mints nothing"
+before=$(ncstats)
+mem_before=$(envoystat '^server.memory_allocated$' | grep -Eo '[0-9]+$' | tail -1)
+"${COMPOSE[@]}" run --rm -T --no-deps client sniflood --target envoy:18443 --n 1500 --c 16 --domain flood.anthropic.com \
+  --envoy-admin http://unused.invalid --sds-debug http://node-controller:9101 > generated/flood.json 2>generated/flood.log
+tail -1 generated/flood.log
+after=$(ncstats)
+mem_after=$(envoystat '^server.memory_allocated$' | grep -Eo '[0-9]+$' | tail -1)
+field() { echo "$1" | grep -Eo "$2" | head -1; }
+# No leaf, no chain and no name came from an SNI.
+[ "$(field "$before" '"leaves":[0-9]+')" = "$(field "$after" '"leaves":[0-9]+')" ]
+[ "$(field "$before" '"names":\[[^]]*\]')" = "$(field "$after" '"names":\[[^]]*\]')" ]
+[ "$(field "$before" '"pushes":[0-9]+')" = "$(field "$after" '"pushes":[0-9]+')" ]
+echo "envoy memory_allocated: $mem_before -> $mem_after bytes"
+[ $((mem_after - mem_before)) -lt $((32 * 1024 * 1024)) ]
+
+echo "--- adding a chain does not drain a live connection"
+"${COMPOSE[@]}" run --rm -T --no-deps client tlshold --addr envoy:18443 --ca /certs/ca.crt --host api.anthropic.com --hold 12s > generated/hold-add.txt 2>/dev/null &
+hold=$!
+sleep 3
+sight a.learned.example.com | tee generated/sight-a.txt
+grep -q '^200 {"changed":true}' generated/sight-a.txt
+until_stats '"names":\[[^]]*"a\.learned\.example\.com"'
+wait "$hold" || true
+cat generated/hold-add.txt
+grep -q '^alive ' generated/hold-add.txt
+# The new chain is live: it-pod is decrypted for the learned name (the 403 is the
+# processor's guard, whose own policy file does not list it).
+"${COMPOSE[@]}" run --rm -T --no-deps client streamcheck --addr envoy:18443 --ca /certs/ca.crt \
+  --host a.learned.example.com --expect-status 403 --wait 20s | tee generated/learned-a.json
+grep -q '"leaf_issuer":"Kubescape Sandbox Gateway' generated/learned-a.json
+# other-pod's policy has no such pattern: for it the name is passed through.
+if out=$("${COMPOSE[@]}" run --rm -T --no-deps client-other streamcheck --addr envoy:18443 --ca /certs/ca.crt --host a.learned.example.com --wait 0 2>&1); then
+  echo "FAIL: a learned name was decrypted for a pod whose policy has no pattern for it"; exit 1
+fi
+echo "$out" | grep -q 'certificate is valid for mock-internal'
+envoystat 'listener_manager.(listener_in_place_updated|total_filter_chains_draining|total_listeners_draining)$' | tee generated/listener-stats.txt
+grep -Eq 'listener_in_place_updated: [1-9]' generated/listener-stats.txt
+grep -q 'total_listeners_draining: 0' generated/listener-stats.txt
+
+echo "--- a busy chain is kept: the cap is full and the only learned name has a connection"
+"${COMPOSE[@]}" run --rm -T --no-deps client tlshold --addr envoy:18443 --ca /certs/ca.crt --host a.learned.example.com --hold 16s > generated/hold-busy.txt 2>/dev/null &
+hold=$!
+sleep 3
+sight b.learned.example.com | tee generated/sight-b.txt
+grep -q '^200 {"changed":false}' generated/sight-b.txt
+sleep 8 # more than one reconcile
+ncstats | tee generated/busy-stats.txt
+grep -Eq '"names":\[[^]]*"a\.learned\.example\.com"' generated/busy-stats.txt
+if grep -q '"b\.learned\.example\.com"' generated/busy-stats.txt; then echo "FAIL: the cap of three was exceeded"; exit 1; fi
+grep -q '"OverCap":1' generated/busy-stats.txt
+grep -q '"Evictions":0' generated/busy-stats.txt
+wait "$hold" || true
+cat generated/hold-busy.txt
+grep -q '^alive ' generated/hold-busy.txt
+
+echo "--- an idle chain is removed, and the waiting name takes its place"
+until_stats '"names":\[[^]]*"b\.learned\.example\.com"'
+ncstats | tee generated/evicted-stats.txt
+if grep -q '"a\.learned\.example\.com"' generated/evicted-stats.txt; then echo "FAIL: the evicted name is still in the set"; exit 1; fi
+grep -q '"Evictions":1' generated/evicted-stats.txt
+grep -q '"OverCap":0' generated/evicted-stats.txt
+"${COMPOSE[@]}" run --rm -T --no-deps client streamcheck --addr envoy:18443 --ca /certs/ca.crt \
+  --host b.learned.example.com --expect-status 403 --wait 20s | grep -q '"leaf_issuer":"Kubescape Sandbox Gateway'
+# The evicted name's chain is gone: it is passed through again.
+if out=$("${COMPOSE[@]}" run --rm -T --no-deps client streamcheck --addr envoy:18443 --ca /certs/ca.crt --host a.learned.example.com --wait 0 2>&1); then
+  echo "FAIL: an evicted name is still decrypted"; exit 1
+fi
+echo "$out" | grep -q 'certificate is valid for mock-internal'
+
+echo "--- a renewed leaf is served without a restart, and decryptValidUntil moves with it"
+# Leaves live 40 seconds here. Past that, the first leaf of every name has expired.
+elapsed=$(( $(date +%s) - started ))
+[ "$elapsed" -ge 45 ] || sleep $((45 - elapsed))
+health client /healthz/certs | tee generated/health-certs-later.txt
+first=$(grep -Eo '"decryptValidUntil":"[^"]+"' generated/health-certs.txt)
+later=$(grep -Eo '"decryptValidUntil":"[^"]+"' generated/health-certs-later.txt)
+echo "$first -> $later"
+[ -n "$later" ] && [ "$first" != "$later" ]
+"${COMPOSE[@]}" run --rm -T --no-deps client streamcheck --addr envoy:18443 --ca /certs/ca.crt --wait 0 | tail -1 | grep -q '"stop_reason":"end_turn"'
+ncstats | grep -Eo '"renewed":[0-9]+' | tee generated/renewed.txt
+grep -Eq '"renewed":[1-9]' generated/renewed.txt
+
 echo "--- one process down fails its own health path and not the other two"
 "${COMPOSE[@]}" stop processor >/dev/null 2>&1
 health client /healthz/processor | tee generated/health-processor-down.txt
@@ -185,6 +288,8 @@ grep -q '^503' generated/health-certs-down.txt
 health client /healthz/envoy | grep -q '^200 ok'
 for _ in $(seq 1 20); do health client /healthz/processor | grep -q '^200 ' && break; sleep 1; done
 health client /healthz/processor | grep -q '^200 '
+# With the SDS server down a call still works: Envoy holds the leaf, no handshake waits on SDS.
+"${COMPOSE[@]}" run --rm -T --no-deps client streamcheck --addr envoy:18443 --ca /certs/ca.crt --wait 0 | tail -1 | grep -q '"stop_reason":"end_turn"'
 
 echo "--- an Envoy that starts while the node controller is down opens no listener"
 "${COMPOSE[@]}" stop envoy >/dev/null 2>&1
@@ -202,6 +307,18 @@ echo "$out" | grep -q '^000 ' # no HTTP answer: nothing listens on the health po
 for _ in $(seq 1 30); do health client /healthz/envoy | grep -q '^200 ok' && break; sleep 1; done
 health client /healthz/envoy | grep -q '^200 ok'
 # The redirect listener is back with it: a decrypted call works again.
+"${COMPOSE[@]}" run --rm -T --no-deps client streamcheck --addr envoy:18443 --ca /certs/ca.crt --wait 30s | tail -1 | grep -q '"stop_reason":"end_turn"'
+
+echo "--- rootFingerprint changes when the intermediate moves to a new root"
+fp_before=$(health client /healthz/certs | grep -Eo '"rootFingerprint":"[0-9a-f]{64}"')
+"${COMPOSE[@]}" stop node-controller >/dev/null 2>&1
+"${COMPOSE[@]}" run --rm -T --no-deps new-root >/dev/null 2>&1
+"${COMPOSE[@]}" up -d --no-deps node-controller >/dev/null 2>&1
+for _ in $(seq 1 30); do health client /healthz/certs | grep -q '^200 ' && break; sleep 1; done
+fp_after=$(health client /healthz/certs | grep -Eo '"rootFingerprint":"[0-9a-f]{64}"')
+echo "$fp_before -> $fp_after"
+[ -n "$fp_after" ] && [ "$fp_before" != "$fp_after" ]
+# Envoy now serves leaves under the new root: a client that trusts only the new one verifies.
 "${COMPOSE[@]}" run --rm -T --no-deps client streamcheck --addr envoy:18443 --ca /certs/ca.crt --wait 30s | tail -1 | grep -q '"stop_reason":"end_turn"'
 
 echo "--- envoy access log"

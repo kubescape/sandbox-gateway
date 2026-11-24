@@ -27,7 +27,12 @@ services:
     # Decrypted requests go to the mock provider's cluster, not to the real hosts.
     command: ["--gen-ca", "--ca-cert", "/certs/ca.crt", "--ca-key", "/certs/ca.key",
               "--node-name", "it-node", "--view-file", "/etc/it/node.yaml",
-              "--decrypt-cluster", "mock_anthropic"]
+              "--decrypt-cluster", "mock_anthropic",
+              # Small and fast on purpose, so run.sh can watch the rules work: a cap of
+              # three names (two exact hosts and one learned), and leaves that live 40
+              # seconds, so they are renewed several times during the run.
+              "--name-cap", "3", "--leaf-ttl", "40s", "--renew-every", "5s",
+              "--debug-addr", "0.0.0.0:9101"]
     volumes:
     - run-gateway:/run/kubescape-sandbox
     - certs:/certs
@@ -108,6 +113,26 @@ services:
     entrypoint: ["sh", "-c", "chown 101:101 /run/sandbox-gateway && chmod 0750 /run/sandbox-gateway"]
     volumes:
     - envoy-admin:/run/sandbox-gateway
+
+  # Reaches the two unix sockets a pod on the node cannot: the node controller's gateway
+  # socket (to post a DNS sighting, as node-agent would) and Envoy's admin socket (to read
+  # listener stats). Envoy's user and group, which both sockets are open to.
+  sock-probe:
+    image: sandbox-gateway/test-fixtures:${IT_TAG:-it}
+    profiles: [tools]
+    user: "101:101"
+    volumes:
+    - run-gateway:/run/kubescape-sandbox
+    - envoy-admin:/run/sandbox-gateway
+
+  # Removes the stand-in root, so the node controller starts with a new one.
+  new-root:
+    image: envoyproxy/envoy:${ENVOY_VERSION:-v1.40.2}
+    profiles: [tools]
+    user: "0:0"
+    entrypoint: ["sh", "-c", "rm -f /certs/ca.crt /certs/ca.key"]
+    volumes:
+    - certs:/certs
 
   # The two clients stand for two pods. Each has the address node.yaml gives its pod,
   # because the listener picks a chain by the connection's source address.

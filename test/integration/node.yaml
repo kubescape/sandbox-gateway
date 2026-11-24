@@ -39,7 +39,10 @@ spec:
   mode: enforce
   http:
     default: {llm: allow, mcp: allow, other: allow}
-    decrypt: {exactHosts: [api.anthropic.com, api.openai.com]}
+    decrypt:
+      exactHosts: [api.anthropic.com, api.openai.com]
+      # Names under this pattern join only after a sighting (run.sh posts them).
+      hostPatterns: ["*.learned.example.com"]
 ---
 apiVersion: kubescape.io/v1alpha1
 kind: SandboxPolicy

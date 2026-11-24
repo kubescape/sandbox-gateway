@@ -228,3 +228,24 @@ Pods the view leaves out:
 `Snapshot.OnNode` lists the address of every pod on the node, selected or not. The health listener uses it to accept on-node sources only.
 
 `LoadStatic` builds the same view from a YAML file of `Pod`, `Namespace` and policy objects, for test programs with no API server.
+
+## What the integration test covers
+
+`test/integration/run.sh` runs the node controller image, Envoy at the pinned version, a test build of the processor and a mock provider. There is no API server and no redirect: the node is `test/integration/node.yaml`, and `test/origdst` supplies each connection's original destination. The node controller runs with a cap of three names and 40-second leaves so the rules show within one run.
+
+| Rule | Check |
+|---|---|
+| A pod is decrypted only for its own names | a second pod is passed through for a host only the first pod's policy names, and for a learned name its policy has no pattern for |
+| Unknown sources get nothing | a client address that is no pod's is reset, on both listeners |
+| Passthrough goes to the original destination | a passthrough connection lands on the recorded address whatever SNI it sent; one with no record is reset |
+| The SNI alone mints nothing | 1,500 handshakes with made-up names leave the leaves, the names and the listener unchanged, and Envoy's allocated memory within 32 MiB |
+| Adding a chain drains nothing | a connection held open across a sighting still answers; Envoy reports an in-place update |
+| A busy chain is kept | with the cap full and a connection on the only learned name, a new sighting waits and is counted over the cap |
+| An idle chain is removed | once the connection ends, the learned name is evicted, the waiting one joins, and the evicted name is passed through again |
+| Leaves are renewed in place | past the first leaves' expiry a call still verifies, and `decryptValidUntil` has moved |
+| No handshake waits on SDS | with the node controller stopped a decrypted call still works |
+| Each health path has its own process | stopping the processor or the node controller fails that path only |
+| No listener without the node controller | an Envoy started while it is down refuses connections on the health port |
+| The root can change | with a new root the fingerprint changes and a client trusting only the new root verifies |
+
+Not covered here: the node status object (no API server; unit tests only), overload, and a SigV4-signed request through the `accept-encoding: identity` rewrite.
