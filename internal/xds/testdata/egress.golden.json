@@ -556,51 +556,11 @@
     {
       "filters": [
         {
-          "name": "envoy.filters.network.rbac",
-          "typedConfig": {
-            "@type": "type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC",
-            "rules": {
-              "action": "DENY",
-              "policies": {
-                "from_loopback": {
-                  "permissions": [
-                    {
-                      "any": true
-                    }
-                  ],
-                  "principals": [
-                    {
-                      "directRemoteIp": {
-                        "addressPrefix": "127.0.0.0",
-                        "prefixLen": 8
-                      }
-                    }
-                  ]
-                }
-              }
-            },
-            "statPrefix": "passthrough_loop_guard"
-          }
-        },
-        {
-          "name": "envoy.filters.network.sni_dynamic_forward_proxy",
-          "typedConfig": {
-            "@type": "type.googleapis.com/envoy.extensions.filters.network.sni_dynamic_forward_proxy.v3.FilterConfig",
-            "dnsCacheConfig": {
-              "name": "passthrough_cache",
-              "dnsLookupFamily": "V4_ONLY",
-              "hostTtl": "60s",
-              "maxHosts": 4096
-            },
-            "portValue": 443
-          }
-        },
-        {
           "name": "envoy.filters.network.tcp_proxy",
           "typedConfig": {
             "@type": "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy",
             "statPrefix": "passthrough",
-            "cluster": "dfp_passthrough",
+            "cluster": "orig_dst",
             "accessLog": [
               {
                 "name": "envoy.access_loggers.stdout",
@@ -614,7 +574,7 @@
                       "downstream": "%DOWNSTREAM_REMOTE_ADDRESS%",
                       "flags": "%RESPONSE_FLAGS%",
                       "kind": "passthrough",
-                      "listener": "%DOWNSTREAM_LOCAL_ADDRESS%",
+                      "orig_dst": "%DOWNSTREAM_LOCAL_ADDRESS%",
                       "sni": "%REQUESTED_SERVER_NAME%",
                       "start": "%START_TIME%",
                       "upstream_host": "%UPSTREAM_HOST%"
@@ -764,6 +724,12 @@
     }
   },
   "listenerFilters": [
+    {
+      "name": "envoy.filters.listener.original_dst",
+      "typedConfig": {
+        "@type": "type.googleapis.com/envoy.extensions.filters.listener.original_dst.v3.OriginalDst"
+      }
+    },
     {
       "name": "envoy.filters.listener.tls_inspector",
       "typedConfig": {

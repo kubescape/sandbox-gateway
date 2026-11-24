@@ -7,7 +7,8 @@
 #   redirected pod connection -> tls_inspector reads the SNI
 #     - the pod's policy decrypts that name: the name's own chain terminates TLS with a
 #       leaf from the node controller (SDS) -> ext_proc -> re-originated to the provider
-#     - anything else from a pod on this node: passed through undecrypted
+#     - anything else from a pod on this node: passed through undecrypted, to the
+#       destination the pod was connecting to
 #     - a source that is no pod on this node: no chain, the connection is reset
 #
 # The chains themselves are internal/xds/templates/*.yaml.
@@ -67,20 +68,13 @@ static_resources:
           validation_context:
             trusted_ca: { filename: /etc/ssl/certs/ca-certificates.crt }
 
-  # Passthrough connections, forwarded by SNI. Its own cache: a flood of passthrough names
-  # must not fill the one decrypted hosts resolve through.
-  - name: dfp_passthrough
+  # Passthrough connections go to their original destination: the address the pod was
+  # connecting to, which the listener's original_dst filter restored from the kernel's
+  # connection table. A connection with no restored address is refused here.
+  - name: orig_dst
+    type: ORIGINAL_DST
     lb_policy: CLUSTER_PROVIDED
-    cluster_type:
-      name: envoy.clusters.dynamic_forward_proxy
-      typed_config:
-        "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
-        # Must equal the cache in internal/xds/templates/passthrough_chain.yaml.
-        dns_cache_config:
-          name: passthrough_cache
-          dns_lookup_family: V4_ONLY
-          max_hosts: 4096
-          host_ttl: 60s
+    connect_timeout: 5s
 
   # The node controller: listeners (LDS) and leaf certificates (SDS).
   - name: xds

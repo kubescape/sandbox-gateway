@@ -104,9 +104,10 @@ Each PR is a draft with SUB-9949 in the title. They stack in this order; a later
 | 2 | `feat/SUB-9949-host-set` | Width check with the shared vectors, total cap, eviction that skips busy names, per-pod names |
 | 3 | `feat/SUB-9949-node-view` | Informers on pods, namespaces and both policy kinds; the per-node snapshot |
 | 4 | `feat/SUB-9949-xds` | Intermediate holder, listener builder, LDS, SDS rework, sightings socket, new bootstrap, integration stack on LDS |
-| 5 | `feat/SUB-9949-passthrough-health` | Passthrough to the original destination, health listener, overload, the hardening list |
-| 6 | `feat/SUB-9949-node-status` | `SandboxGatewayNodeStatus` writer |
-| 7 | `test/SUB-9949-integration` | The remaining integration tests and the SigV4 check |
+| 5 | `feat/SUB-9949-passthrough` | Passthrough to the original destination, with the test's BPF stand-in |
+| 6 | `feat/SUB-9949-health` | Health listener, overload |
+| 7 | `feat/SUB-9949-node-status` | `SandboxGatewayNodeStatus` writer |
+| 8 | `test/SUB-9949-integration` | The remaining integration tests and the SigV4 check |
 
 ## PR 2: host set
 
@@ -143,7 +144,7 @@ Files: `internal/ca/authority.go`, `internal/xds/listener.go`, `lds.go`, `intern
 - [ ] 4.8 Bootstrap: admin on the socket, LDS over gRPC, the static clusters. Remove the explicit-proxy and internal listeners.
 - [ ] 4.9 Integration stack on LDS: the existing checks pass unchanged, plus a second client address that is passed through for a name the first is decrypted for.
 
-## PR 5: passthrough, health, overload
+## PRs 5 and 6: passthrough, then health and overload
 
 - [ ] 5.1 `test/origdst/`: the program and a loader that fills `conns`, built in the test image. The integration job runs it privileged.
 - [ ] 5.2 `original_dst` listener filter and the `ORIGINAL_DST` cluster on the passthrough chain. Tests: a passthrough connection reaches the address in `conns`; one with no entry is reset; a pod's passthrough host is not decrypted when another pod's policy names it.
@@ -151,13 +152,13 @@ Files: `internal/ca/authority.go`, `internal/xds/listener.go`, `lds.go`, `intern
 - [ ] 5.4 Overload manager: measure open item 2 first, then heap and connection monitors, request shedding with a fixed JSON body, never `stop_accepting_connections`.
 - [ ] 5.5 Upstream TLS checks the SAN; a `Host` that differs from the SNI is refused.
 
-## PR 6: node status
+## PR 7: node status
 
 - [ ] 6.1 Tests first with a fake dynamic client: the object is created with an owner reference to the Node, then `/status` is updated with the resource version from the read; every field of C5 is written; `rejectedPatterns` is capped at 64.
 - [ ] 6.2 Sources: Envoy's admin socket (up, version, overload), the processor's health body (up, evaluator, degraded decisions), the host set, the authority.
 - [ ] 6.3 Written every 30 seconds and on a change, with a floor of 5 seconds between writes.
 
-## PR 7: remaining integration tests
+## PR 8: remaining integration tests
 
 - [ ] 7.1 A 1,500-name SNI flood mints nothing and Envoy's memory stays flat.
 - [ ] 7.2 Adding a chain does not drain a live stream; an idle chain is removed and a busy one kept.

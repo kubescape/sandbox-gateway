@@ -47,7 +47,7 @@ func main() {
 	interTTL := flag.Duration("intermediate-ttl", 24*time.Hour, "validity of the stand-in intermediate; replaced at half of it")
 	port := flag.Uint("listener-port", 18443, "port of the redirect listener")
 	decryptCluster := flag.String("decrypt-cluster", "dfp", "bootstrap cluster decrypted requests are routed to")
-	passthroughCluster := flag.String("passthrough-cluster", "dfp_passthrough", "bootstrap cluster passthrough connections are forwarded through")
+	passthroughCluster := flag.String("passthrough-cluster", "orig_dst", "bootstrap cluster passthrough connections are forwarded through")
 	rootCert := flag.String("ca-cert", "", "root certificate (PEM) the stand-in intermediate is signed by; empty creates one in memory")
 	rootKey := flag.String("ca-key", "", "key of -ca-cert (PEM)")
 	genRoot := flag.Bool("gen-ca", false, "create the -ca-cert and -ca-key files if they do not exist (test stacks)")

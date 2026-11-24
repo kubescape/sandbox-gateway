@@ -1,7 +1,7 @@
 // Package xds builds the listeners Envoy runs and serves them over LDS.
 //
 // The redirect listener has one filter chain per decrypted hostname and one
-// passthrough chain. Which chain a connection gets is decided by the
+// passthrough chain, which forwards to the connection's original destination. Which chain a connection gets is decided by the
 // listener's matcher from the pod's address and the SNI together, so a pod
 // is decrypted only for the names its own policy asks for.
 //
@@ -36,10 +36,9 @@ import (
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/dynamic_forward_proxy/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
+	originaldstv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/original_dst/v3"
 	tlsinspectorv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/tls_inspector/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
-	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/rbac/v3"
-	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/sni_dynamic_forward_proxy/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 )
@@ -76,7 +75,7 @@ func (c Config) withDefaults() Config {
 	def(&c.XDSCluster, "xds")
 	def(&c.ExtProcCluster, "ext_proc")
 	def(&c.DecryptCluster, "dfp")
-	def(&c.PassthroughCluster, "dfp_passthrough")
+	def(&c.PassthroughCluster, "orig_dst")
 	return c
 }
 
@@ -148,6 +147,10 @@ func (c Config) Egress(in Input) (*listenerv3.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
+	originalDst, err := anypb.New(&originaldstv3.OriginalDst{})
+	if err != nil {
+		return nil, err
+	}
 	m, err := podMatcher(in.Pods, hasChain)
 	if err != nil {
 		return nil, err
@@ -159,10 +162,19 @@ func (c Config) Egress(in Input) (*listenerv3.Listener, error) {
 		}}},
 		// No proxy_protocol filter, on purpose: it would replace the remote address with
 		// one the pod writes, and the pod's identity is keyed on that address.
-		ListenerFilters: []*listenerv3.ListenerFilter{{
-			Name:       "envoy.filters.listener.tls_inspector",
-			ConfigType: &listenerv3.ListenerFilter_TypedConfig{TypedConfig: tlsInspector},
-		}},
+		ListenerFilters: []*listenerv3.ListenerFilter{
+			// Restores the address the pod was connecting to, which the kernel answers
+			// from the connection table. The passthrough chain forwards there. It does
+			// not hand the connection to another listener (use_original_dst is unset).
+			{
+				Name:       "envoy.filters.listener.original_dst",
+				ConfigType: &listenerv3.ListenerFilter_TypedConfig{TypedConfig: originalDst},
+			},
+			{
+				Name:       "envoy.filters.listener.tls_inspector",
+				ConfigType: &listenerv3.ListenerFilter_TypedConfig{TypedConfig: tlsInspector},
+			},
+		},
 		FilterChains:       chains,
 		FilterChainMatcher: m,
 	}, nil

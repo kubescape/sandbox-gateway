@@ -4,8 +4,8 @@
 # processor's transaction record shows it parsed the same stream and named the pod. The
 # processor runs a test evaluator: a request for "denied-model" gets its 403. Its policy
 # objects come from policies.yaml; a request to a decrypted host they do not list is refused. Refusals
-# checked too: a Host header that is not the decrypted name, a passthrough name that
-# resolves to loopback, and a connection that is not in the connection table. A client
+# checked too: a Host header that is not the decrypted name, a passthrough connection
+# with no recorded destination, and a connection that is not in the connection table. A client
 # must not be able to choose the address the processor looks it up by, with an
 # X-Forwarded-For header or a PROXY protocol header. The shipped processor image must
 # refuse to start without the kernel tables.
@@ -29,6 +29,13 @@ trap cleanup EXIT
 "${COMPOSE[@]}" build
 "${COMPOSE[@]}" --profile tools build processor-image
 "${COMPOSE[@]}" up -d
+echo "--- original-destination stand-in"
+for _ in $(seq 1 60); do
+  "${COMPOSE[@]}" logs --no-color origdst 2>/dev/null | grep -q 'attached: SO_ORIGINAL_DST' && break
+  sleep 1
+done
+"${COMPOSE[@]}" logs --no-color --no-log-prefix origdst | tail -3
+"${COMPOSE[@]}" logs --no-color origdst | grep -q 'attached: SO_ORIGINAL_DST'
 echo "--- envoy version"
 "${COMPOSE[@]}" exec -T envoy envoy --version | grep -F "/${ENVOY_VERSION#v}/"
 
@@ -93,15 +100,30 @@ sleep 1
 grep -q '"authority":"attacker.example"' generated/host-header.json
 grep -q '"rule":"framework.host-not-decrypted"' generated/host-header.json
 
-echo "--- a name that resolves to loopback does not loop through the listener"
-if "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:18443 --ca /certs/ca.crt --host localhost --wait 0; then
-  echo "FAIL: a passthrough to loopback completed"; exit 1
+echo "--- a passthrough connection goes to its original destination, whatever the SNI"
+# The name resolves to loopback and to nothing the mock serves. The connection must still
+# land on the mock, where the connection table says this pod was going.
+if out=$("${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:18443 --ca /certs/ca.crt --host localhost --wait 0 2>&1); then
+  echo "FAIL: a passthrough connection was served a certificate the client trusts"; exit 1
 fi
-sleep 3
-# Without the loop guard this count runs into the hundreds within a second.
-hops=$("${COMPOSE[@]}" logs --no-color --no-log-prefix envoy | grep -c '"kind":"passthrough"' || true)
-echo "passthrough connections logged: $hops"
-[ "$hops" -le 5 ]
+echo "$out" | tail -1
+echo "$out" | grep -q 'certificate is valid for mock-internal'
+# Envoy logs a passthrough connection when it closes, which can trail the client's exit.
+for _ in $(seq 1 20); do
+  "${COMPOSE[@]}" logs --no-color --no-log-prefix envoy | grep '"kind":"passthrough"' | grep '"sni":"localhost"' | tail -1 > generated/passthrough.json || true
+  [ -s generated/passthrough.json ] && break
+  sleep 1
+done
+cat generated/passthrough.json
+grep -q '"upstream_host":"172.30.0.30:443"' generated/passthrough.json
+grep -q '"orig_dst":"172.30.0.30:443"' generated/passthrough.json
+
+echo "--- a passthrough connection with no recorded destination is reset"
+if out=$("${COMPOSE[@]}" run --rm -T client-noentry streamcheck --addr envoy:18443 --ca /certs/ca.crt --host pypi.org --wait 0 2>&1); then
+  echo "FAIL: a connection with no entry in the connection table was forwarded"; exit 1
+fi
+echo "$out" | tail -1
+echo "$out" | grep -Eq 'connection reset|EOF'
 
 echo "--- the address the processor sees is the socket's, whatever the client claims"
 forged=198.51.100.77

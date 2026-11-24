@@ -6,6 +6,8 @@
 # api.anthropic.com for it, so its decrypt-list guard has something to refuse.)
 # other-pod is decrypted for api.openai.com only: when it asks for api.anthropic.com it
 # must be passed through, though another pod's policy names that host.
+# unredirected-pod is selected by a policy too, but the test's connection table has no
+# entry for its address: a passthrough connection from it has no destination.
 apiVersion: v1
 kind: Namespace
 metadata: {name: it}
@@ -21,6 +23,12 @@ kind: Pod
 metadata: {namespace: it, name: other-pod, labels: {app: other}}
 spec: {nodeName: it-node}
 status: {phase: Running, podIPs: [{ip: 172.30.0.22}]}
+---
+apiVersion: v1
+kind: Pod
+metadata: {namespace: it, name: unredirected-pod, labels: {app: other}}
+spec: {nodeName: it-node}
+status: {phase: Running, podIPs: [{ip: 172.30.0.24}]}
 ---
 apiVersion: kubescape.io/v1alpha1
 kind: SandboxPolicy

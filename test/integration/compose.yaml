@@ -1,6 +1,7 @@
 # Integration stack: the node controller image, the processor built against a stub connection
 # table (test/processor-it), Envoy at the pinned version, and the mock provider. There is no eBPF
-# redirect and no node-agent here, so the clients dial Envoy directly. The node
+# redirect and no node-agent here, so the clients dial Envoy directly, and test/origdst
+# stands in for the kernel's record of where each connection was going. The node
 # controller reads the node from node.yaml and serves Envoy its listeners; the processor's
 # stub table says which pod a connection is. run.sh also checks that the shipped processor
 # image refuses to start without the kernel tables.
@@ -59,14 +60,30 @@ services:
   mock-anthropic:
     build: { context: ../.., dockerfile: test/Dockerfile }
     image: sandbox-gateway/test-fixtures:${IT_TAG:-it}
-    # --tls-listen :443 with the alias: a passthrough connection for api.anthropic.com is
-    # forwarded by name and lands here, on a leaf that is not the gateway's (CN
-    # mock-internal). That is how run.sh tells a passthrough from a decrypted connection,
-    # without reaching the real host.
+    # --tls-listen :443 at a fixed address: this is the "original destination" the test's
+    # connection table records for both pods. A passthrough connection must land here, on
+    # a leaf that is not the gateway's (CN mock-internal), whatever SNI the client sent.
     command: ["mock-anthropic", "--listen", ":8080", "--tls-listen", ":443"]
     networks:
       default:
-        aliases: [api.anthropic.com]
+        ipv4_address: 172.30.0.30
+
+  # Stands in for the part of the redirect that tells Envoy where a connection was going
+  # (test/origdst). No redirect runs here, so it fills the connection table for every
+  # port of the two pods' addresses. It attaches a BPF program at the cgroup root, hence
+  # privileged and the host's cgroup namespace; the program only answers for sockets on
+  # the gateway listener's port.
+  origdst:
+    build: { context: ../.., dockerfile: test/origdst/Dockerfile }
+    image: sandbox-gateway/origdst:${IT_TAG:-it}
+    privileged: true
+    cgroup: host
+    network_mode: none
+    command: ["--pin", "/sys/fs/bpf/${IT_PROJECT:-sandbox-gateway-it}",
+              "--fill", "172.30.0.21=172.30.0.30:443,172.30.0.22=172.30.0.30:443"]
+    volumes:
+    - /sys/fs/cgroup:/sys/fs/cgroup
+    - /sys/fs/bpf:/sys/fs/bpf
 
   envoy:
     image: envoyproxy/envoy:${ENVOY_VERSION:-v1.40.2}
@@ -74,6 +91,7 @@ services:
       node-controller: { condition: service_started }
       processor: { condition: service_started }
       mock-anthropic: { condition: service_started }
+      origdst: { condition: service_started }
       admin-dir: { condition: service_completed_successfully }
     command: ["envoy", "-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
     volumes:
@@ -109,6 +127,13 @@ services:
     networks:
       default:
         ipv4_address: 172.30.0.22
+
+  # A pod in node.yaml that the connection table has no entry for.
+  client-noentry:
+    <<: *client
+    networks:
+      default:
+        ipv4_address: 172.30.0.24
 
   # An address that is no pod's in node.yaml.
   client-unknown:

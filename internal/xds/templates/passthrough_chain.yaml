@@ -1,33 +1,15 @@
 # The passthrough chain: no TLS termination, no certificate. A connection lands here when
 # the pod's policy does not ask to decrypt the name it sent.
 #
-# It forwards by SNI for now. The workload controls the SNI, so this is replaced by
-# forwarding to the original destination the kernel recorded (plan PR 5).
+# It goes where the pod was connecting to: the original destination the kernel recorded
+# for the connection, which the original_dst listener filter restored. The SNI is the
+# workload's to choose and is never used to pick the destination; forwarding by it would
+# let a pod reach any host through the gateway.
+#
+# A connection with no recorded destination has nowhere to go: the ORIGINAL_DST cluster
+# refuses it and Envoy resets it. It cannot loop back into the listener.
 name: passthrough
 filters:
-# Loop guard: a name that resolves to loopback would make Envoy connect to this listener
-# again and pass the same ClientHello through without end. A connection from loopback can
-# only be Envoy itself, so it is refused.
-- name: envoy.filters.network.rbac
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC
-    stat_prefix: passthrough_loop_guard
-    rules:
-      action: DENY
-      policies:
-        from_loopback:
-          permissions: [{ any: true }]
-          principals: [{ direct_remote_ip: { address_prefix: 127.0.0.0, prefix_len: 8 } }]
-- name: envoy.filters.network.sni_dynamic_forward_proxy
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.filters.network.sni_dynamic_forward_proxy.v3.FilterConfig
-    port_value: 443
-    # Must equal the dfp_passthrough cluster's cache in the bootstrap.
-    dns_cache_config:
-      name: passthrough_cache
-      dns_lookup_family: V4_ONLY
-      max_hosts: 4096
-      host_ttl: 60s
 - name: envoy.filters.network.tcp_proxy
   typed_config:
     "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
@@ -44,7 +26,9 @@ filters:
             sni: "%REQUESTED_SERVER_NAME%"
             chain: "%FILTER_CHAIN_NAME%"
             downstream: "%DOWNSTREAM_REMOTE_ADDRESS%"
-            listener: "%DOWNSTREAM_LOCAL_ADDRESS%"
+            # The restored original destination, or the listener's own address when the
+            # connection had none.
+            orig_dst: "%DOWNSTREAM_LOCAL_ADDRESS%"
             upstream_host: "%UPSTREAM_HOST%"
             flags: "%RESPONSE_FLAGS%"
             bytes_sent: "%BYTES_SENT%"

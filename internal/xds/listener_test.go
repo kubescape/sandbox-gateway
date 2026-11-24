@@ -300,3 +300,33 @@ func TestChainSettings(t *testing.T) {
 		t.Error("the chain uses a plain SDS secret")
 	}
 }
+
+func TestPassthroughGoesToTheOriginalDestination(t *testing.T) {
+	l, err := Config{}.Egress(Input{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// original_dst must run before the chain is picked and before any filter
+	// that waits for bytes, so the address is restored for every connection.
+	var filters []string
+	for _, f := range l.GetListenerFilters() {
+		filters = append(filters, f.GetName())
+	}
+	if want := "envoy.filters.listener.original_dst,envoy.filters.listener.tls_inspector"; strings.Join(filters, ",") != want {
+		t.Fatalf("listener filters = %v, want %s", filters, want)
+	}
+	// The filter must not hand the connection to another listener.
+	if l.GetUseOriginalDst().GetValue() {
+		t.Fatal("use_original_dst must stay unset")
+	}
+	js := string(stable(t, l))
+	if !strings.Contains(js, `"cluster": "orig_dst"`) {
+		t.Error("the passthrough chain must forward to the original-destination cluster")
+	}
+	// Nothing on the passthrough path may pick a destination from the SNI.
+	for _, banned := range []string{"sni_dynamic_forward_proxy", "sni_cluster", "dynamic_forward_proxy"} {
+		if strings.Contains(js, banned) {
+			t.Errorf("the listener with no decrypt chain contains %s", banned)
+		}
+	}
+}

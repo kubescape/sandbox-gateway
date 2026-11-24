@@ -9,7 +9,7 @@ scope: repo
 
 The node controller is the gateway's control process on one node. It decides which hostnames Envoy decrypts there and for which pods, serves Envoy its listeners and certificates, and holds the node's intermediate CA. The program is `cmd/node-controller`; the loop is `internal/controller`.
 
-The plan for what is not built yet (passthrough to the original destination, the health listener, overload settings, the node status object) is `docs/superpowers/plans/2026-11-24-node-controller.md`.
+The plan for what is not built yet (the health listener, overload settings, the node status object) is `docs/superpowers/plans/2026-11-24-node-controller.md`.
 
 ## What runs where
 
@@ -42,7 +42,19 @@ Envoy waits for its first listeners without a timeout (`initial_fetch_timeout: 0
 
 A pod is "selected" when a policy object with an `http` section applies to it (see "Node view"). Pod addresses are in the matcher and never in a chain. Envoy applies a matcher change in place and drains nothing. A change to a chain replaces the chain and cuts the streams on it at the drain time, so chains only ever get added or removed.
 
-The passthrough chain forwards by SNI today. The plan replaces that with the original destination the kernel recorded.
+### Passthrough
+
+A passthrough connection goes where the pod was connecting to, and nowhere else. The SNI is the workload's to choose, so it never picks the destination: forwarding by it would let a pod reach any host through the gateway.
+
+Envoy does not know that destination by itself. The redirect rewrites the address at connect time, so there is no NAT entry for the kernel to answer `SO_ORIGINAL_DST` from. The pieces:
+
+1. A `cgroup/getsockopt` BPF program answers `getsockopt(SOL_IP, SO_ORIGINAL_DST)` for sockets on the listener's port. It looks the socket's peer address and port up in `conns` and returns the original destination recorded there.
+2. The listener's first filter is Envoy's stock `original_dst`, which asks that question and restores the address on the connection. It does not hand the connection to another listener.
+3. The passthrough chain is a `tcp_proxy` to the `orig_dst` cluster (type `ORIGINAL_DST`), which connects to the restored address.
+
+A connection with no `conns` entry gets no answer, so nothing is restored. The cluster refuses such a connection and Envoy resets it; it cannot loop back into the listener.
+
+The program has to be loaded by whatever owns `conns`, which is the redirect loader. This repo carries a copy for the integration test only: `test/origdst/` (the C source, a loader that also fills `conns`, and its image). The listener is IPv4, so only `SOL_IP` is handled.
 
 A decrypt chain:
 
@@ -105,7 +117,7 @@ The name joins the host set when a valid pattern on the node covers it. `address
 | `-leaf-ttl`, `-renew-every` | 1h, 1m | leaves |
 | `-intermediate-ttl` | 24h | the stand-in intermediate |
 | `-listener-port` | 18443 | the redirect listener |
-| `-decrypt-cluster`, `-passthrough-cluster` | `dfp`, `dfp_passthrough` | bootstrap clusters the chains route to |
+| `-decrypt-cluster`, `-passthrough-cluster` | `dfp`, `orig_dst` | bootstrap clusters the chains route to |
 | `-view-file` | | pods and policy objects from a YAML file, for test stacks |
 | `-debug-addr` | off | `/stats` and `/debug/vars`, no authentication |
 
