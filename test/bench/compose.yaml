@@ -1,0 +1,17 @@
+# The latency bench: an overlay on the integration stack (test/integration/compose.yaml).
+# The processor runs the test evaluator in enforce mode, as there. The mock streams 40
+# text deltas 20 ms apart, on its plain listener for Envoy and on its TLS listener
+# (:8443, its own self-signed leaf) for the direct path. latbench runs both paths.
+#
+#   test/bench/latency.sh
+
+services:
+  mock-anthropic:
+    command: ["mock-anthropic", "--listen", ":8080", "--tls-listen", ":8443",
+              "--words", "40", "--chunk-delay", "20ms"]
+
+  latbench:
+    image: sandbox-gateway/test-fixtures:it
+    profiles: [bench]
+    depends_on: [envoy]
+    command: ["latbench", "-n", "${BENCH_RUNS:-200}", "-direct", "mock-anthropic:8443", "-proxied", "envoy:443"]

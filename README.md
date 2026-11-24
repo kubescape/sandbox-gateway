@@ -25,7 +25,7 @@ Envoy 1.40 is the minimum version. CI runs 1.40.2.
 | `internal/sse`, `internal/streamfmt`, `internal/renumber`, `internal/eventstream`, `internal/wsframe`, `pkg/jsonscan` | Stream parsing: server-sent events, the Anthropic and OpenAI stream formats, removing and renumbering streamed items, AWS event stream (Bedrock), WebSocket frames, and request JSON fields. |
 | `internal/record`, `internal/otlpemit` | The verdict record (contract C7), and sending it as OTLP logs. |
 | `deploy/envoy/envoy.yaml` | The Envoy config. |
-| `test/` | Test fixtures (`mock-anthropic`, `sniflood`, `latbench`, `streamcheck`, `processor-it`) and the integration stack. |
+| `test/` | Test fixtures (`mock-anthropic`, `sniflood`, `latbench`, `streamcheck`, `processor-it`), the integration stack, the SDK job (`test/sdk`) and the latency bench (`test/bench`). |
 
 ## Build and test
 
