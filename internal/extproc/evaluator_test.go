@@ -2,9 +2,11 @@ package extproc
 
 import (
 	"context"
+	"errors"
 	"io"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -202,7 +204,10 @@ func TestNoEvaluatorPassesEverything(t *testing.T) {
 // Review focus: Classify stops reading. The write of the next chunk is
 // bounded, the writer returns, and the request is refused.
 func TestClassifyStallBounded(t *testing.T) {
-	stall := release(t)
+	stall := make(chan struct{})
+	var once sync.Once
+	free := func() { once.Do(func() { close(stall) }) }
+	t.Cleanup(free)
 	f := allowAll()
 	f.classifyHook = func(body io.Reader) {
 		_, _ = body.Read(make([]byte, 64<<10)) // the first chunk
@@ -222,10 +227,52 @@ func TestClassifyStallBounded(t *testing.T) {
 		t.Fatalf("response = %v", r)
 	}
 	waitIdle(t, h.srv, 1) // the stalled Classify is stuck; no writer is left
+	// Review: the stalled Classify holds a slot, so it is counted as stuck
+	// from the timeout until it returns.
+	if n := h.srv.StuckEvaluatorCalls(); n != 1 {
+		t.Fatalf("stuck = %d at the timeout, want 1", n)
+	}
 	must(t, st.CloseSend())
 	if rec := h.waitRecords(t, 1)[0]; !strings.HasPrefix(rec.EvaluatorError, "classify: ") || rec.Verdict.Rule != RuleEvaluatorTimeout {
 		t.Fatalf("record: %+v", rec)
 	}
+	free()
+	waitIdle(t, h.srv, 0)
+	if n := h.srv.StuckEvaluatorCalls(); n != 0 {
+		t.Fatalf("stuck = %d after Classify returned, want 0", n)
+	}
+}
+
+// Review: Evaluate's context ends at the budget, not when the stream does, so
+// an evaluator that honours its context gives its slot back in time.
+func TestEvaluateContextEndsAtBudget(t *testing.T) {
+	ended := make(chan error, 1)
+	f := allowAll()
+	f.evaluateHook = func(ctx context.Context) {
+		<-ctx.Done()
+		ended <- ctx.Err()
+	}
+	st, h := start(t, Config{Evaluator: f, ChunkBudget: testBudget})
+	sendHeaders(t, st)
+	begun := time.Now()
+	sendBody(t, st, reqBody, true)
+	select {
+	case err := <-ended:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("context ended with %v, want the deadline", err)
+		}
+		if took := time.Since(begun); took > testBudget+300*time.Millisecond {
+			t.Fatalf("context ended after %v", took)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Evaluate's context did not end while the stream stayed open")
+	}
+	recv(t, st)
+	waitIdle(t, h.srv, 0) // the slot is back, the stream still open
+	if n := h.srv.StuckEvaluatorCalls(); n != 0 {
+		t.Fatalf("stuck = %d", n)
+	}
+	must(t, st.CloseSend())
 }
 
 // Every way a transaction ends leaves no goroutine of it behind.

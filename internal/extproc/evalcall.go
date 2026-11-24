@@ -90,8 +90,7 @@ func (cl *call[T]) wait(d time.Duration) (T, error) {
 	defer cl.mu.Unlock()
 	switch {
 	case !cl.finished:
-		cl.given = true
-		cl.c.stuck.Add(1)
+		cl.markStuck()
 		return zero, errTimeout
 	case cl.panicked:
 		return zero, errPanic
@@ -99,10 +98,35 @@ func (cl *call[T]) wait(d time.Duration) (T, error) {
 	return cl.v, nil
 }
 
-// run makes one bounded call: begin, then wait d.
+// abandon gives up on a call that the caller will not wait for: if it is
+// still running, it counts as stuck until it returns.
+func (cl *call[T]) abandon() {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	if !cl.finished {
+		cl.markStuck()
+	}
+}
+
+// markStuck counts the call as stuck, once. Called with mu held.
+func (cl *call[T]) markStuck() {
+	if !cl.given {
+		cl.given = true
+		cl.c.stuck.Add(1)
+	}
+}
+
+// run makes one bounded call: begin, then wait d. f gets a context that ends
+// at d, so an evaluator that honours its context gives its slot back at the
+// budget; one that ignores it keeps the slot and counts as stuck.
 func run[T any](c *calls, ctx context.Context, d time.Duration, f func(context.Context) T) (T, error) {
-	cl, err := begin(c, ctx, f)
+	ctx, cancel := context.WithTimeout(ctx, d)
+	cl, err := begin(c, ctx, func(ctx context.Context) T {
+		defer cancel()
+		return f(ctx)
+	})
 	if err != nil {
+		cancel()
 		var zero T
 		return zero, err
 	}

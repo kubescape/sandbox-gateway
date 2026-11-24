@@ -112,6 +112,9 @@ func (s *Server) feed(t *txn, chunk []byte) error {
 		return nil
 	case <-timer.C:
 		t.eval.abort() // unblocks the writer
+		// The request fails without waiting for Classify. If it is still
+		// running it holds its slot, so it counts as stuck until it returns.
+		t.eval.classify.abandon()
 		err := <-errc
 		s.cfg.Log.Debug("body write to the evaluator aborted", "txn", t.rec.TransactionID, "error", err)
 		return errTimeout

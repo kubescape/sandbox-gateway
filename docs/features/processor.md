@@ -79,7 +79,8 @@ With an evaluator, one request goes like this:
 Every call into the evaluator is bounded, because Go cannot stop a function that ignores its context:
 
 - Each call runs in its own goroutine and holds one of `-max-evaluator-calls` slots until it returns. A call past its deadline keeps its slot and counts as stuck; `/stats` shows `stuckEvaluatorCalls`.
-- `Classify`, each write of a body chunk to it, and `Evaluate` get `-chunk-budget` each. `DenyResponse` and `StreamError` get 200 ms.
+- `Classify`, each write of a body chunk to it, and `Evaluate` get `-chunk-budget` each. `DenyResponse` and `StreamError` get 200 ms. The context `Evaluate` gets ends at its budget, so an evaluator that honours it gives the slot back in time.
+- A `Classify` still running when a body write times out counts as stuck until it returns.
 - When `Classify` or `Evaluate` stalls, panics, or `Evaluate` finds no slot, the request is refused with `DenyResponse`, rule `framework.evaluator-timeout`.
 - When `DenyResponse` itself finds no slot, stalls or panics, the processor sends its own 403, `{"error":{"type":"gateway_error","message":"request blocked by the gateway"}}`. A deny verdict stands even then, on any pod.
 - When no slot is free to start `Classify`, the request cannot begin evaluation and the pod's fail posture decides: an `allow` pod passes, a `deny` pod gets the processor's 403 with rule `framework.evaluator-saturated`. Both records are `degraded`.
