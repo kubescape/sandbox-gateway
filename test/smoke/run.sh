@@ -40,7 +40,11 @@ docker exec "$NODE" sh -c 'mount | grep -q "on /sys/fs/bpf type bpf" || mount -t
 "${KIND[@]}" load docker-image --name "$CLUSTER" sandbox-gateway/processor:smoke sandbox-gateway/test-fixtures:smoke
 
 echo "--- policy CRDs and one policy, from the pinned kubescape/storage"
+# Download it first: on a fresh runner the module is not in the cache yet, and
+# go list -m then names no directory.
+go mod download github.com/kubescape/storage
 STORAGE=$(go list -m -f '{{.Dir}}' github.com/kubescape/storage)
+[ -d "$STORAGE/artifacts/sandboxpolicy" ] || { echo "FAIL: no storage artifacts in '$STORAGE'"; exit 1; }
 "${KUBECTL[@]}" apply -f "$STORAGE/artifacts/sandboxpolicy/sandboxpolicy.crd.yaml" \
   -f "$STORAGE/artifacts/sandboxpolicy/clustersandboxpolicy.crd.yaml"
 "${KUBECTL[@]}" wait --for condition=established --timeout 60s \

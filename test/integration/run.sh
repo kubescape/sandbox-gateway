@@ -61,8 +61,14 @@ sleep 1
 grep -q '"rule":"framework.host-not-decrypted"' generated/not-decrypted-record.json
 
 echo "--- a Host header that differs from the decrypted name is refused"
+# The decrypt-list guard refuses it at the request headers, before Envoy's router would
+# answer 404: no policy decrypts the name the Host header gives.
 "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt \
-  --host-header attacker.example --expect-status 404 --wait 0
+  --host-header attacker.example --expect-status 403 --wait 0
+sleep 1
+"${COMPOSE[@]}" logs --no-color --no-log-prefix processor | grep '"msg":"transaction"' | tail -1 | tee generated/host-header.json
+grep -q '"authority":"attacker.example"' generated/host-header.json
+grep -q '"rule":"framework.host-not-decrypted"' generated/host-header.json
 
 echo "--- a name that resolves to loopback does not loop through the listener"
 if "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt --host localhost --wait 0; then
