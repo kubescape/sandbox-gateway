@@ -16,11 +16,11 @@ func TestTrackerPerFormat(t *testing.T) {
 		items  []Item
 	}{
 		{"anthropic", anthropicBaseline(), Anthropic, "tool_use", []Item{
-			{Anthropic, 0, "text", ""}, {Anthropic, 1, "tool_use", "bash"}}},
+			{Format: Anthropic, Index: 0, Kind: "text", Name: ""}, {Format: Anthropic, Index: 1, Kind: "tool_use", Name: "bash"}}},
 		{"openai chat", chatBaseline(), OpenAIChat, "tool_calls", []Item{
-			{OpenAIChat, 0, "function", "bash"}, {OpenAIChat, 1, "function", "bash"}}},
+			{Format: OpenAIChat, Index: 0, Kind: "function", Name: "bash"}, {Format: OpenAIChat, Index: 1, Kind: "function", Name: "bash"}}},
 		{"openai responses", responsesBaseline(), OpenAIResponses, "completed", []Item{
-			{OpenAIResponses, 0, "function_call", "bash"}, {OpenAIResponses, 1, "message", ""}}},
+			{Format: OpenAIResponses, Index: 0, Kind: "function_call", Name: "bash"}, {Format: OpenAIResponses, Index: 1, Kind: "message", Name: ""}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var tr Tracker
@@ -89,7 +89,12 @@ func TestEventIndexes(t *testing.T) {
 		t.Fatalf("%+v", e)
 	}
 	e = Parse(sse.Event{Data: `{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"x"}},{"index":2,"id":"c","function":{"name":"f"}}]},"finish_reason":null}]}`})
-	if !reflect.DeepEqual(e.ToolIndexes, []int{0, 2}) || len(e.Starts) != 1 || e.Starts[0].Index != 2 || e.Starts[0].Name != "f" {
+	if !reflect.DeepEqual(e.ToolCalls, []ToolRef{{0, 0}, {0, 2}}) || len(e.Starts) != 1 || e.Starts[0].Index != 2 || e.Starts[0].Name != "f" {
+		t.Fatalf("%+v", e)
+	}
+	// Tool call indexes are per choice: two choices can each have call 0.
+	e = Parse(sse.Event{Data: `{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"f"}}]}},{"index":1,"delta":{"tool_calls":[{"index":0,"id":"b","function":{"name":"g"}}]}}]}`})
+	if !reflect.DeepEqual(e.ToolCalls, []ToolRef{{0, 0}, {1, 0}}) || len(e.Starts) != 2 || e.Starts[1].Choice != 1 || e.Starts[1].Name != "g" {
 		t.Fatalf("%+v", e)
 	}
 }
