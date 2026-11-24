@@ -7,9 +7,109 @@ scope: repo
 
 # Node controller
 
-The node controller is the gateway's control process on one node. It decides which hostnames Envoy decrypts there, and for which pods. The program is `cmd/node-controller`.
+The node controller is the gateway's control process on one node. It decides which hostnames Envoy decrypts there and for which pods, serves Envoy its listeners and certificates, and holds the node's intermediate CA. The program is `cmd/node-controller`; the loop is `internal/controller`.
 
-This page describes what is in the code today. The plan for the rest is `docs/superpowers/plans/2026-11-24-node-controller.md`. Until its later PRs land, `cmd/node-controller` still runs the seeded SDS server with the older `hostset.Set`; the host set and the node view described below are built and tested but not wired in yet.
+The plan for what is not built yet (passthrough to the original destination, the health listener, overload settings, the node status object) is `docs/superpowers/plans/2026-11-24-node-controller.md`.
+
+## What runs where
+
+Envoy's bootstrap (`deploy/envoy/envoy.yaml`) holds only the clusters and the admin socket. The listeners come from the node controller, because the decrypted names and the pods allowed to reach each one keep changing.
+
+| Socket | Served by | Used by | For |
+|---|---|---|---|
+| `/run/kubescape-sandbox/xds.sock` | node controller (gRPC) | Envoy | listeners (LDS) and leaf certificates (SDS) |
+| `/run/kubescape-sandbox/gateway.sock` | node controller (HTTP) | node-agent | `POST /v1/sightings` |
+| `/run/kubescape-sandbox/extproc.sock` | processor | Envoy | `ext_proc` |
+| `/run/sandbox-gateway/envoy-admin.sock` | Envoy | node controller | stats: open connections per hostname |
+
+Envoy's admin interface has no authentication and can stop Envoy. On the host network a loopback port is open to every process on the node, so admin is a unix socket (mode 0660, the node controller is in Envoy's group). Its directory, `/run/sandbox-gateway`, is private to the gateway pod. It is not `/run/kubescape-sandbox`, which node-agent mounts too.
+
+Envoy waits for its first listeners without a timeout (`initial_fetch_timeout: 0s`). An Envoy that starts while the node controller is down serves nothing until the node controller answers; it never comes up looking healthy with no redirect listener.
+
+## The redirect listener
+
+`internal/xds` builds one listener, `egress_tls`, on port 18443 (`-listener-port`). It has:
+
+- one filter chain per name in the host set, `decrypt/<name>`, rendered from `internal/xds/templates/decrypt_chain.yaml`. There is never a wildcard chain;
+- one `passthrough` chain (`passthrough_chain.yaml`);
+- a matcher (`filter_chain_matcher`) that picks the chain from the connection's source address and then its SNI.
+
+| Connection | Chain |
+|---|---|
+| from a pod, SNI is a name that pod is decrypted for | that name's decrypt chain |
+| from a pod, any other SNI, or none | `passthrough` |
+| from an address that is no selected pod's on this node | none: Envoy resets it |
+
+A pod is "selected" when a policy object with an `http` section applies to it (see "Node view"). Pod addresses are in the matcher and never in a chain. Envoy applies a matcher change in place and drains nothing. A change to a chain replaces the chain and cuts the streams on it at the drain time, so chains only ever get added or removed.
+
+The passthrough chain forwards by SNI today. The plan replaces that with the original destination the kernel recorded.
+
+A decrypt chain:
+
+- terminates TLS with the name's leaf, a plain SDS secret named after the host. Session resumption is off. The SDS config has `initial_fetch_timeout: 0s`: a chain whose leaf has not arrived does not go live, and the name keeps passing through until it does;
+- runs `ext_proc` in `FULL_DUPLEX_STREAMED` mode with `failure_mode_allow: false`, passing `source.address`;
+- routes only its own name. The virtual host's domains are the name and `name:443`; a `Host` that differs from the SNI gets a 404. The dynamic forward proxy resolves the `Host`, so this also pins the upstream to the chain's name, and the upstream certificate is checked against it;
+- sets `accept-encoding: identity` on the upstream request, after `ext_proc`, and removes `alt-svc` from responses;
+- takes the remote address from the socket (`use_remote_address`, `skip_xff_append`) and allows WebSocket upgrades;
+- has its own stat prefix, `egress_<name with dots as underscores>`.
+
+The listener never parses PROXY protocol: the pod writes the first bytes of the connection, and the pod's identity is keyed on the remote address.
+
+## Reconcile
+
+`internal/controller` rebuilds the listener when the node view changes, when a sighting arrives, when the intermediate is replaced, and every 5 seconds. One run:
+
+1. Reads `http.egress_*.downstream_cx_active` from Envoy's admin socket. When Envoy cannot be asked, every name counts as busy.
+2. If Envoy has accepted the last listener sent, sweeps the retired names that are idle (see "Names with open connections").
+3. Applies the node view to the host set.
+4. Mints a leaf for every name in the set. A name whose leaf cannot be minted gets no chain. With no intermediate there are no decrypt chains and everything passes through.
+5. Computes each pod's names, builds the listener and hands it to the LDS server, which pushes only when it differs from the last one.
+
+Nothing is built before the node view has synced: a listener from half a view would drop chains in use.
+
+LDS is state of the world over one gRPC stream. A listener Envoy rejects (NACK) is logged and counted, and Envoy keeps the last one it accepted.
+
+## Certificates
+
+`internal/ca.Authority` holds the node's intermediate and the leaves signed with it. The intermediate's key stays in the process's memory.
+
+- A leaf lives one hour (`-leaf-ttl`) and is re-minted once it is past half of that. The SDS server checks each stream's names every minute (`-renew-every`) and pushes a leaf that changed. Envoy never asks again on its own.
+- A leaf's chain is the leaf and the intermediate. Pods trust the root.
+- A leaf is minted only for a name in the host set (`sds.Gated`).
+- Replacing the intermediate drops every leaf. The next reconcile mints them again and the SDS server pushes them at once.
+- `Authority.State` reports `CanDecrypt` (false when there is no intermediate, or the one held has less than one leaf lifetime left), `ValidUntil` (the earliest expiry among the leaves held and the intermediate) and the root's SHA-256 fingerprint.
+
+Until the operator issues node intermediates, `ca.SelfSigned` stands in: the process signs its own intermediate (24 hours, `-intermediate-ttl`, replaced at half) from a root it creates in memory. `-ca-cert`, `-ca-key` and `-gen-ca` put that root on disk, for test stacks whose client has to trust it.
+
+## Sightings
+
+node-agent posts a hostname it saw in a workload's DNS answers:
+
+```
+POST /v1/sightings   on /run/kubescape-sandbox/gateway.sock
+{"name": "myres.openai.azure.com", "addresses": ["20.0.0.1"], "bindingIds": [7]}
+200 {"changed": true}
+```
+
+The name joins the host set when a valid pattern on the node covers it. `addresses` and `bindingIds` are accepted and not used: node-agent keeps the address set, and a learned name reaches a pod when one of that pod's own patterns covers it. A body over 64 KiB is refused.
+
+## Flags
+
+| Flag | Default | |
+|---|---|---|
+| `-listen` | `unix:///run/kubescape-sandbox/xds.sock` | LDS and SDS |
+| `-gateway-socket` | `unix:///run/kubescape-sandbox/gateway.sock` | sightings |
+| `-envoy-admin` | `/run/sandbox-gateway/envoy-admin.sock` | Envoy's admin socket |
+| `-node-name` | `$NODE_NAME` | the node whose pods are watched |
+| `-name-cap` | 256 | names with a certificate and a chain |
+| `-leaf-ttl`, `-renew-every` | 1h, 1m | leaves |
+| `-intermediate-ttl` | 24h | the stand-in intermediate |
+| `-listener-port` | 18443 | the redirect listener |
+| `-decrypt-cluster`, `-passthrough-cluster` | `dfp`, `dfp_passthrough` | bootstrap clusters the chains route to |
+| `-view-file` | | pods and policy objects from a YAML file, for test stacks |
+| `-debug-addr` | off | `/stats` and `/debug/vars`, no authentication |
+
+Sockets are created with mode 0660. `SANDBOX_GATEWAY_SOCKET_GID` sets their group, so Envoy can connect.
 
 ## Host set
 
@@ -21,14 +121,14 @@ Policy objects give two lists. An exact host is in the set as soon as an object 
 
 One cap covers every name, exact and learned together (default 256). It bounds how many certificates the node mints whatever the policies say.
 
-- An exact host takes a free slot. With none free, it takes the slot of the learned name seen longest ago that has no open connections.
-- A sighted name does the same.
-- When the set is full and nothing can be evicted, the name is left out. Its traffic passes through undecrypted, and it is counted in `Counts().OverCap`.
+- An exact host takes a free slot. With none free, the learned name seen longest ago that has no open connections is retired for it, and the host joins once that name has been swept.
+- A sighted name does the same. node-agent posts a sighting once, so the set remembers a name that is waiting.
+- While a name waits, and when the set is full of exact hosts or busy names, its traffic passes through undecrypted and it is counted in `Counts().OverCap`.
 - Names already in the set keep their place. A new exact host that sorts earlier does not displace one that has a chain.
 
 ### Names with open connections
 
-Removing a chain cuts the streams on it, so a name with open connections is never removed. When no object wants a name any more and it is busy, it stays in the set, retired: it keeps its chain and its certificate, it still holds a slot, and no pod's list contains it, so no new connection is decrypted for it. `Sweep` drops it once it is idle.
+Removing a chain cuts the streams on it, so a name with open connections is never removed, and no name leaves in one step. A name no object wants any more, or a learned name evicted to make room, is first retired: it keeps its chain, its certificate and its slot, and no pod's list contains it, so no new connection is decrypted for it. `Sweep` removes a retired name once it is idle. The reconcile loop sweeps only after Envoy has accepted the listener that stopped mapping pods to the name. From that point no new connection can reach the chain, so a count of zero stays zero.
 
 ### Pattern width
 

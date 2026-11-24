@@ -12,7 +12,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 export ENVOY_VERSION="${ENVOY_VERSION:-v1.40.2}"
-COMPOSE=(docker compose -f compose.yaml)
+export IT_TAG="${IT_TAG:-it}"
+COMPOSE=(docker compose -p "${IT_PROJECT:-sandbox-gateway-it}" -f compose.yaml)
 
 cleanup() {
   status=$?
@@ -43,8 +44,30 @@ grep -q '"stop_reason":"end_turn"' generated/record.json
 grep -Eq '"sse_events":[1-9]' generated/record.json
 grep -q '"pod":"it-pod"' generated/record.json
 
+echo "--- a pod is decrypted only for the hosts its own policy names"
+# other-pod's policy names api.openai.com. It is decrypted for that host: the leaf is the
+# gateway's. (The 403 is the processor's decrypt-list guard, which knows only it-pod.)
+"${COMPOSE[@]}" run --rm -T client-other streamcheck --addr envoy:18443 --ca /certs/ca.crt \
+  --host api.openai.com --expect-status 403 --wait 0 | tee generated/other-decrypted.json
+grep -q '"leaf_issuer":"Kubescape Sandbox Gateway' generated/other-decrypted.json
+# It asks for api.anthropic.com, which only it-pod's policy names. It must be passed
+# through: the certificate it sees is the mock's own, not a gateway leaf.
+if out=$("${COMPOSE[@]}" run --rm -T client-other streamcheck --addr envoy:18443 --ca /certs/ca.crt \
+    --host api.anthropic.com --wait 0 2>&1); then
+  echo "FAIL: other-pod was decrypted for a host only another pod's policy names"; exit 1
+fi
+echo "$out" | tail -1
+echo "$out" | grep -q 'certificate is valid for mock-internal'
+
+echo "--- a source that is no pod on the node gets no chain"
+if out=$("${COMPOSE[@]}" run --rm -T client-unknown streamcheck --addr envoy:18443 --ca /certs/ca.crt --wait 0 2>&1); then
+  echo "FAIL: an unknown source was served"; exit 1
+fi
+echo "$out" | tail -1
+echo "$out" | grep -Eq 'connection reset|EOF'
+
 echo "--- the test evaluator blocks a request for the denied model, with its DenyResponse"
-"${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt \
+"${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:18443 --ca /certs/ca.crt \
   --model denied-model --expect-status 403 --wait 0 | tee generated/denied.json
 grep -q 'denied by the integration test evaluator' generated/denied.json
 sleep 1
@@ -53,7 +76,7 @@ grep -q '"rule":"it.denied-model"' generated/denied-record.json
 grep -q '"ended":"denied"' generated/denied-record.json
 
 echo "--- a decrypted host that no policy decrypts is refused by the decrypt-list guard"
-"${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt \
+"${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:18443 --ca /certs/ca.crt \
   --host api.openai.com --expect-status 403 --wait 0 | tee generated/not-decrypted.json
 grep -q 'request blocked by the gateway' generated/not-decrypted.json
 sleep 1
@@ -63,7 +86,7 @@ grep -q '"rule":"framework.host-not-decrypted"' generated/not-decrypted-record.j
 echo "--- a Host header that differs from the decrypted name is refused"
 # The decrypt-list guard refuses it at the request headers, before Envoy's router would
 # answer 404: no policy decrypts the name the Host header gives.
-"${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt \
+"${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:18443 --ca /certs/ca.crt \
   --host-header attacker.example --expect-status 403 --wait 0
 sleep 1
 "${COMPOSE[@]}" logs --no-color --no-log-prefix processor | grep '"msg":"transaction"' | tail -1 | tee generated/host-header.json
@@ -71,7 +94,7 @@ grep -q '"authority":"attacker.example"' generated/host-header.json
 grep -q '"rule":"framework.host-not-decrypted"' generated/host-header.json
 
 echo "--- a name that resolves to loopback does not loop through the listener"
-if "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt --host localhost --wait 0; then
+if "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:18443 --ca /certs/ca.crt --host localhost --wait 0; then
   echo "FAIL: a passthrough to loopback completed"; exit 1
 fi
 sleep 3
@@ -82,9 +105,9 @@ echo "passthrough connections logged: $hops"
 
 echo "--- the address the processor sees is the socket's, whatever the client claims"
 forged=198.51.100.77
-"${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt --x-forwarded-for "$forged" >/dev/null
+"${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:18443 --ca /certs/ca.crt --x-forwarded-for "$forged" >/dev/null
 # With a PROXY line in front, the bytes are not a TLS ClientHello, so the call must fail.
-if "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt --wait 0 \
+if "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:18443 --ca /certs/ca.crt --wait 0 \
     --proxy-header "PROXY TCP4 $forged 192.0.2.1 4242 443" >/dev/null 2>&1; then
   echo "FAIL: a connection that starts with a PROXY protocol header was served"; exit 1
 fi
@@ -97,13 +120,13 @@ fi
 echo "--- a connection that is not in the connection table is refused"
 PROCESSOR_MODE=--reject-all "${COMPOSE[@]}" up -d --force-recreate processor
 # --no-deps: otherwise compose sees the processor's changed command and recreates it.
-"${COMPOSE[@]}" run --rm -T --no-deps client streamcheck --addr envoy:443 --ca /certs/ca.crt --expect-status 403 --wait 30s
+"${COMPOSE[@]}" run --rm -T --no-deps client streamcheck --addr envoy:18443 --ca /certs/ca.crt --expect-status 403 --wait 30s
 "${COMPOSE[@]}" logs --no-color --no-log-prefix processor | grep '"msg":"transaction"' | tail -1 | tee generated/rejected.json
 grep -q '"reject_reason":"no_connection_entry"' generated/rejected.json
 "${COMPOSE[@]}" up -d --force-recreate processor
 
 echo "--- the shipped processor image does not start without the kernel tables"
-if out=$(docker run --rm sandbox-gateway/processor:it 2>&1); then
+if out=$(docker run --rm "sandbox-gateway/processor:$IT_TAG" 2>&1); then
   echo "FAIL: the processor started with no connection tables"; exit 1
 fi
 echo "$out" | tail -1

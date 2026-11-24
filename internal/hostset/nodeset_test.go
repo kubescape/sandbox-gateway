@@ -49,14 +49,40 @@ func TestCapHoldsWithMoreExactHostsThanSlots(t *testing.T) {
 func TestExactHostTakesAnIdleLearnedSlot(t *testing.T) {
 	busy := busySet{}
 	s := NewNodeSet(3, busy.is)
-	s.Apply(Wanted{Exact: []string{"api.anthropic.com"}, Patterns: []string{"*.openai.azure.com"}})
+	w := Wanted{Exact: []string{"api.anthropic.com"}, Patterns: []string{"*.openai.azure.com"}}
+	s.Apply(w)
 	for _, n := range []string{"a.openai.azure.com", "b.openai.azure.com"} {
 		if !s.Observe(n) {
 			t.Fatalf("%s should join", n)
 		}
 	}
 	busy["a.openai.azure.com"] = true // the older one has open connections
-	s.Apply(Wanted{Exact: []string{"api.anthropic.com", "api.openai.com"}, Patterns: []string{"*.openai.azure.com"}})
+	w.Exact = append(w.Exact, "api.openai.com")
+
+	// Round one: the idle learned name is retired, not removed. It keeps its
+	// chain, no pod is decrypted for it, and the exact host waits.
+	s.Apply(w)
+	if s.Contains("api.openai.com") || !s.Contains("b.openai.azure.com") {
+		t.Fatalf("names = %v: nothing may leave or join in the same step", s.Names())
+	}
+	if got := s.NamesFor(nil, []string{"*.openai.azure.com"}, nil); !reflect.DeepEqual(got, []string{"a.openai.azure.com"}) {
+		t.Fatalf("the retired name must be in no pod's list, got %v", got)
+	}
+	if c := s.Counts(); c.Evictions != 1 || c.OverCap != 1 {
+		t.Fatalf("counts = %+v", c)
+	}
+	// Applying again before the sweep retires nothing more.
+	s.Apply(w)
+	if c := s.Counts(); c.Evictions != 1 {
+		t.Fatalf("one newcomer needs one slot: %+v", c)
+	}
+	// Round two, after Envoy took the listener: the slot is freed and filled.
+	if !s.Sweep() {
+		t.Fatal("the retired name is idle")
+	}
+	if !s.Apply(w) {
+		t.Fatal("the exact host should join now")
+	}
 	if !s.Contains("api.openai.com") || !s.Contains("a.openai.azure.com") || s.Contains("b.openai.azure.com") {
 		t.Fatalf("names = %v: the idle learned name should have gone, not the busy one", s.Names())
 	}
@@ -68,7 +94,8 @@ func TestExactHostTakesAnIdleLearnedSlot(t *testing.T) {
 func TestFullOfBusyNamesPassesTheNewcomerThrough(t *testing.T) {
 	busy := busySet{"a.openai.azure.com": true, "b.openai.azure.com": true}
 	s := NewNodeSet(2, busy.is)
-	s.Apply(Wanted{Patterns: []string{"*.openai.azure.com"}})
+	w := Wanted{Patterns: []string{"*.openai.azure.com"}}
+	s.Apply(w)
 	s.Observe("a.openai.azure.com")
 	s.Observe("b.openai.azure.com")
 	if s.Observe("c.openai.azure.com") {
@@ -85,13 +112,37 @@ func TestFullOfBusyNamesPassesTheNewcomerThrough(t *testing.T) {
 	if c := s.Counts(); c.OverCap != 1 {
 		t.Fatalf("counts = %+v", c)
 	}
-	// Once a slot is idle the name gets in and is no longer over the cap.
+	// The sighting is posted once, so the set remembers it. When a name goes
+	// idle it is retired at the next Apply, and after the sweep the waiting
+	// name joins without being sighted again.
 	delete(busy, "a.openai.azure.com")
-	if !s.Observe("c.openai.azure.com") {
-		t.Fatal("an idle slot exists now")
+	s.Apply(w)
+	if c := s.Counts(); c.Evictions != 1 || s.Contains("c.openai.azure.com") {
+		t.Fatalf("counts = %+v, names = %v", c, s.Names())
+	}
+	s.Sweep()
+	if !s.Apply(w) || !s.Contains("c.openai.azure.com") || s.Contains("a.openai.azure.com") {
+		t.Fatalf("names = %v", s.Names())
 	}
 	if c := s.Counts(); c.OverCap != 0 || c.Evictions != 1 {
 		t.Fatalf("counts = %+v", c)
+	}
+}
+
+func TestEvictedNameSightedAgainWaitsLikeANewcomer(t *testing.T) {
+	s := NewNodeSet(1, nil)
+	w := Wanted{Patterns: []string{"*.openai.azure.com"}}
+	s.Apply(w)
+	s.Observe("a.openai.azure.com")
+	s.Observe("b.openai.azure.com") // retires a
+	s.Observe("a.openai.azure.com") // a is on its way out: it waits too
+	if got := s.NamesFor(nil, w.Patterns, nil); len(got) != 0 {
+		t.Fatalf("a is retired and b is waiting, got %v", got)
+	}
+	s.Sweep()
+	s.Apply(w)
+	if got := s.Names(); len(got) != 1 {
+		t.Fatalf("the cap is one name, got %v", got)
 	}
 }
 
@@ -163,7 +214,11 @@ func TestLearnedNameLeavesWithItsPattern(t *testing.T) {
 	s := NewNodeSet(8, nil)
 	s.Apply(Wanted{Patterns: []string{"*.openai.azure.com"}})
 	s.Observe("myres.openai.azure.com")
-	if !s.Apply(Wanted{}) || s.Contains("myres.openai.azure.com") {
+	s.Apply(Wanted{})
+	if !s.Contains("myres.openai.azure.com") {
+		t.Fatal("the name is retired first and keeps its chain")
+	}
+	if !s.Sweep() || s.Contains("myres.openai.azure.com") {
 		t.Fatal("a learned name goes when no pattern covers it")
 	}
 }
@@ -202,5 +257,15 @@ func TestNameOverTheCapIsInNoPodsList(t *testing.T) {
 	s.Apply(Wanted{Exact: []string{"a.example.com", "b.example.com"}})
 	if got := s.NamesFor([]string{"a.example.com", "b.example.com"}, nil, nil); !reflect.DeepEqual(got, []string{"a.example.com"}) {
 		t.Fatalf("got %v", got)
+	}
+}
+
+func TestObserveRejectsNonHostnames(t *testing.T) {
+	s := NewNodeSet(8, nil)
+	s.Apply(Wanted{Patterns: []string{"*.openai.azure.com"}})
+	for _, n := range []string{"a b.openai.azure.com", "x\n.openai.azure.com", "-x.openai.azure.com", "*.openai.azure.com", "é.openai.azure.com"} {
+		if s.Observe(n) || s.Contains(n) {
+			t.Errorf("%q must not join the set", n)
+		}
 	}
 }

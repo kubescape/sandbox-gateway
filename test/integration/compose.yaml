@@ -1,30 +1,40 @@
 # Integration stack: the node controller image, the processor built against a stub connection
 # table (test/processor-it), Envoy at the pinned version, and the mock provider. There is no eBPF
-# redirect and no node-agent here, so the client dials Envoy directly and the stub table says
-# which pod it is. run.sh also checks that the shipped processor image refuses to start without
-# the kernel tables.
+# redirect and no node-agent here, so the clients dial Envoy directly. The node
+# controller reads the node from node.yaml and serves Envoy its listeners; the processor's
+# stub table says which pod a connection is. run.sh also checks that the shipped processor
+# image refuses to start without the kernel tables.
 #
 #   test/integration/run.sh
+#
+# Two checkouts on one machine share the Docker daemon. To run both at once, give one of
+# them its own project name and image tag: IT_PROJECT=it-b IT_TAG=it-b test/integration/run.sh
+# (the client addresses are fixed, so each run still needs the 172.30.0.0/24 network free).
 
 name: sandbox-gateway-it
 
 services:
   node-controller:
     build: { context: ../.., dockerfile: build/Dockerfile.node-controller }
-    image: sandbox-gateway/node-controller:it
+    image: sandbox-gateway/node-controller:${IT_TAG:-it}
     # The images run as a non-root user. Sockets are 0660 and handed to Envoy's group
     # (gid 101 in the official image), which the process must belong to.
     group_add: ["101"]
     environment:
       SANDBOX_GATEWAY_SOCKET_GID: "101"
-    command: ["--gen-ca", "--listen", "unix:///run/kubescape-sandbox/sds.sock",
-              "--allow-hosts", "api.anthropic.com,api.openai.com"]
+    # No API server here: the node (two pods and their policy objects) is node.yaml.
+    # Decrypted requests go to the mock provider's cluster, not to the real hosts.
+    command: ["--gen-ca", "--ca-cert", "/certs/ca.crt", "--ca-key", "/certs/ca.key",
+              "--node-name", "it-node", "--view-file", "/etc/it/node.yaml",
+              "--decrypt-cluster", "mock_anthropic"]
     volumes:
     - run-gateway:/run/kubescape-sandbox
     - certs:/certs
+    - ./node.yaml:/etc/it/node.yaml:ro
+    - envoy-admin:/run/sandbox-gateway
 
   processor:
-    image: sandbox-gateway/test-fixtures:it
+    image: sandbox-gateway/test-fixtures:${IT_TAG:-it}
     depends_on: [mock-anthropic]
     group_add: ["101"]
     environment:
@@ -43,30 +53,76 @@ services:
   # pinned maps; the stack itself runs processor-it.
   processor-image:
     build: { context: ../.., dockerfile: build/Dockerfile.processor }
-    image: sandbox-gateway/processor:it
+    image: sandbox-gateway/processor:${IT_TAG:-it}
     profiles: [tools]
 
   mock-anthropic:
     build: { context: ../.., dockerfile: test/Dockerfile }
-    image: sandbox-gateway/test-fixtures:it
-    command: ["mock-anthropic", "--listen", ":8080"]
+    image: sandbox-gateway/test-fixtures:${IT_TAG:-it}
+    # --tls-listen :443 with the alias: a passthrough connection for api.anthropic.com is
+    # forwarded by name and lands here, on a leaf that is not the gateway's (CN
+    # mock-internal). That is how run.sh tells a passthrough from a decrypted connection,
+    # without reaching the real host.
+    command: ["mock-anthropic", "--listen", ":8080", "--tls-listen", ":443"]
+    networks:
+      default:
+        aliases: [api.anthropic.com]
 
   envoy:
     image: envoyproxy/envoy:${ENVOY_VERSION:-v1.40.2}
-    depends_on: [node-controller, processor, mock-anthropic]
+    depends_on:
+      node-controller: { condition: service_started }
+      processor: { condition: service_started }
+      mock-anthropic: { condition: service_started }
+      admin-dir: { condition: service_completed_successfully }
     command: ["envoy", "-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
     volumes:
     - run-gateway:/run/kubescape-sandbox
+    - envoy-admin:/run/sandbox-gateway
     - ./generated/envoy.yaml:/etc/envoy/envoy.yaml:ro
 
-  client:
-    image: sandbox-gateway/test-fixtures:it
+  # Envoy creates its admin socket in a directory only the gateway's containers share. A
+  # new volume belongs to root, so this hands it to Envoy's user (101) before Envoy starts.
+  # In a pod this is an emptyDir.
+  admin-dir:
+    image: envoyproxy/envoy:${ENVOY_VERSION:-v1.40.2}
+    user: "0:0"
+    entrypoint: ["sh", "-c", "chown 101:101 /run/sandbox-gateway && chmod 0750 /run/sandbox-gateway"]
+    volumes:
+    - envoy-admin:/run/sandbox-gateway
+
+  # The two clients stand for two pods. Each has the address node.yaml gives its pod,
+  # because the listener picks a chain by the connection's source address.
+  client: &client
+    image: sandbox-gateway/test-fixtures:${IT_TAG:-it}
     profiles: [tools]
     depends_on: [envoy]
-    command: ["streamcheck", "--addr", "envoy:443", "--ca", "/certs/ca.crt"]
+    command: ["streamcheck", "--addr", "envoy:18443", "--ca", "/certs/ca.crt"]
     volumes:
     - certs:/certs:ro
+    networks:
+      default:
+        ipv4_address: 172.30.0.21
+
+  client-other:
+    <<: *client
+    networks:
+      default:
+        ipv4_address: 172.30.0.22
+
+  # An address that is no pod's in node.yaml.
+  client-unknown:
+    <<: *client
+    networks:
+      default:
+        ipv4_address: 172.30.0.23
+
+networks:
+  default:
+    ipam:
+      config: [{ subnet: 172.30.0.0/24, ip_range: 172.30.0.128/25 }]
 
 volumes:
+  envoy-admin: {}
   run-gateway: {}
   certs: {}

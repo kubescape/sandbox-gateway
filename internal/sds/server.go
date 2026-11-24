@@ -1,9 +1,9 @@
-// Package sds serves per-SNI TLS certificates to Envoy's on_demand_secret
-// certificate selector over the Secret Discovery Service.
+// Package sds serves leaf certificates to Envoy over the Secret Discovery
+// Service.
 //
-// Envoy derives the secret name from the ClientHello (the SNI mapper makes the
-// name equal to the SNI), subscribes to it, and pauses the handshake until we
-// answer. We serve both transports:
+// Each decrypt chain names one secret, the chain's hostname. Envoy subscribes
+// when the chain is added, so no handshake waits on this server, and keeps
+// the secret until a newer one is pushed. Both transports are served:
 //
 //   - Delta (preferred): a refused name goes back in removed_resources, so
 //     Envoy fails that handshake at once.
@@ -35,9 +35,28 @@ import (
 // SecretTypeURL is the xDS type of a Secret resource.
 const SecretTypeURL = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret"
 
-// LeafSource mints a certificate for a name. *ca.Minter satisfies it.
+// LeafSource mints a certificate for a name. *ca.Authority satisfies it.
 type LeafSource interface {
-	Leaf(sni string) (ca.Leaf, error)
+	Leaf(name string) (ca.Leaf, error)
+}
+
+// ErrNotInSet is returned for a name the host set does not hold.
+var ErrNotInSet = errors.New("sds: name is not in the host set")
+
+// Gated is a LeafSource that mints only for names Allow accepts. A name that
+// arrives here came from a filter chain, so it should always be in the set;
+// the gate holds when it is not.
+type Gated struct {
+	Allow  func(name string) bool
+	Leaves LeafSource
+}
+
+// Leaf implements LeafSource.
+func (g Gated) Leaf(name string) (ca.Leaf, error) {
+	if !g.Allow(name) {
+		return ca.Leaf{}, fmt.Errorf("%w: %q", ErrNotInSet, name)
+	}
+	return g.Leaves.Leaf(name)
 }
 
 // Stats are counters the debug endpoint exposes.
@@ -58,8 +77,27 @@ type Server struct {
 	nonce  atomic.Uint64
 	// RenewEvery is how often each delta stream re-checks its subscribed names and
 	// pushes any leaf the minter has renewed. Envoy asks for a secret once and keeps
-	// it, so without this push a leaf expires in place (gap 4). 0 disables it.
+	// it, so without this push a leaf expires in place. 0 disables it.
 	RenewEvery time.Duration
+
+	kickMu sync.Mutex
+	kick   chan struct{} // closed and remade by Kick
+}
+
+// Kick makes every stream check its names for a newer leaf now, without
+// waiting for the next RenewEvery tick. Call it after the intermediate was
+// replaced.
+func (s *Server) Kick() {
+	s.kickMu.Lock()
+	close(s.kick)
+	s.kick = make(chan struct{})
+	s.kickMu.Unlock()
+}
+
+func (s *Server) kicked() <-chan struct{} {
+	s.kickMu.Lock()
+	defer s.kickMu.Unlock()
+	return s.kick
 }
 
 // New returns an SDS server backed by leaves.
@@ -67,7 +105,7 @@ func New(leaves LeafSource, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{leaves: leaves, log: log}
+	return &Server{leaves: leaves, log: log, kick: make(chan struct{})}
 }
 
 // secretFor builds the Secret resource for name, or returns an error if the
@@ -85,7 +123,16 @@ func (s *Server) secretFor(name string) (*tlsv3.Secret, string, error) {
 			CertificateChain: &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: leaf.CertPEM}},
 			PrivateKey:       &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: leaf.KeyPEM}},
 		}},
-	}, strconv.FormatInt(leaf.NotAfter.UnixNano(), 10), nil
+	}, version(leaf), nil
+}
+
+// version names one leaf. The serial is unique per certificate; the expiry
+// stands in for a source that sets none.
+func version(leaf ca.Leaf) string {
+	if leaf.Serial != "" {
+		return leaf.Serial
+	}
+	return strconv.FormatInt(leaf.NotAfter.UnixNano(), 10)
 }
 
 func (s *Server) nextNonce() string { return strconv.FormatUint(s.nonce.Add(1), 10) }
@@ -139,30 +186,34 @@ func (s *Server) DeltaSecrets(stream secretv3.SecretDiscoveryService_DeltaSecret
 		return stream.Send(resp)
 	}
 
-	if s.RenewEvery > 0 {
-		done := make(chan struct{})
-		defer close(done)
-		go func() {
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		var tick <-chan time.Time
+		if s.RenewEvery > 0 {
 			t := time.NewTicker(s.RenewEvery)
 			defer t.Stop()
-			for {
-				select {
-				case <-done:
-					return
-				case <-t.C:
-					mu.Lock()
-					names := make([]string, 0, len(sent))
-					for n := range sent {
-						names = append(names, n)
-					}
-					mu.Unlock()
-					if err := send(names, true); err != nil {
-						s.log.Warn("sds renew push", "error", err)
-					}
-				}
+			tick = t.C
+		}
+		for {
+			kicked := s.kicked()
+			select {
+			case <-done:
+				return
+			case <-tick:
+			case <-kicked:
 			}
-		}()
-	}
+			mu.Lock()
+			names := make([]string, 0, len(sent))
+			for n := range sent {
+				names = append(names, n)
+			}
+			mu.Unlock()
+			if err := send(names, true); err != nil {
+				s.log.Warn("sds renew push", "error", err)
+			}
+		}
+	}()
 
 	for {
 		req, err := stream.Recv()

@@ -50,7 +50,7 @@ The identity is only as good as `source.address`, so the listener must report th
 
 `test/integration/run.sh` sends both a forged `X-Forwarded-For` header and a PROXY protocol line and fails if the processor sees the forged address.
 
-The explicit-proxy listener (`explicit_proxy`, port 3128) cannot serve decrypted hosts with this processor. A connection that arrives through it has no socket address to look up and no `conns` entry, so every request on its decrypting chain is refused with `no_source_address`.
+The proof of concept's explicit-proxy listener (port 3128) is gone from the gateway's Envoy config. A connection that arrived through it had no socket address to look up and no `conns` entry, so the processor refused every request on it with `no_source_address`.
 
 ### Map layout
 

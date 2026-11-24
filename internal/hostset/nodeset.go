@@ -42,9 +42,15 @@ const (
 // together, so the number of minted names holds whatever the policies say.
 //
 // Exact hosts come first: a new one takes a free slot, then the slot of the
-// least recently seen learned name that has no open connections. A name with
-// open connections is never removed; when no policy wants it any more it is
-// kept, retired, until it is idle.
+// least recently seen learned name that has no open connections.
+//
+// A name never leaves in one step, because removing a chain cuts the streams
+// on it. A name nobody wants any more, or one evicted to make room, is first
+// retired: it keeps its chain and its slot, and NamesFor stops returning it,
+// so no new connection is decrypted for it. Sweep removes a retired name once
+// it is idle. The caller sweeps only after Envoy has taken the listener that
+// no longer maps any pod to the name; from then on its connection count can
+// only fall.
 //
 // NodeSet is safe for concurrent use. The busy callback runs with the set
 // locked and must not call back into it.
@@ -55,12 +61,20 @@ type NodeSet struct {
 	exact    map[string]bool
 	lru      *list.List // learned names, front = most recently seen
 	learned  map[string]*list.Element
-	retired  map[string]kind // no longer wanted, kept while busy
+	retired  map[string]retiree
 	patterns []pattern
 	rejected []string            // patterns and exact entries refused, sorted
 	overE    int                 // wanted exact hosts left out
-	overL    map[string]struct{} // sighted names left out
+	overL    map[string]struct{} // sighted names waiting for a slot
 	evicted  int64
+}
+
+// retiree is a name on its way out.
+type retiree struct {
+	kind kind
+	// evicted: retired to make room. Such a name is not taken back when it
+	// is sighted again; it waits for a slot like any newcomer.
+	evicted bool
 }
 
 // NewNodeSet builds an empty set. cap <= 0 means 256. busy reports whether a
@@ -75,7 +89,7 @@ func NewNodeSet(cap int, busy func(name string) bool) *NodeSet {
 	return &NodeSet{
 		cap: cap, busy: busy,
 		exact: map[string]bool{}, lru: list.New(), learned: map[string]*list.Element{},
-		retired: map[string]kind{}, overL: map[string]struct{}{},
+		retired: map[string]retiree{}, overL: map[string]struct{}{},
 	}
 }
 
@@ -125,18 +139,15 @@ func (s *NodeSet) Apply(w Wanted) (changed bool) {
 	}
 	sort.Strings(s.rejected)
 
-	// Retired names: back in when wanted again, gone once idle.
-	for name, k := range s.retired {
+	// Retired names that are wanted again stay where they are, as members.
+	for name, r := range s.retired {
 		switch {
 		case want[name]:
 			delete(s.retired, name)
 			s.exact[name] = true
-		case k == kindLearned && s.matches(name):
+		case !r.evicted && r.kind == kindLearned && s.matches(name):
 			delete(s.retired, name)
 			s.learned[name] = s.lru.PushFront(name)
-		case !s.busy(name):
-			delete(s.retired, name)
-			changed = true
 		}
 	}
 	// Exact hosts nobody wants any more.
@@ -147,10 +158,8 @@ func (s *NodeSet) Apply(w Wanted) (changed bool) {
 		delete(s.exact, name)
 		if s.matches(name) {
 			s.learned[name] = s.lru.PushFront(name)
-		} else if s.busy(name) {
-			s.retired[name] = kindExact
 		} else {
-			changed = true
+			s.retired[name] = retiree{kind: kindExact}
 		}
 	}
 	// Learned names whose pattern is gone, or that are now exact.
@@ -163,11 +172,7 @@ func (s *NodeSet) Apply(w Wanted) (changed bool) {
 		case !s.matches(name):
 			s.lru.Remove(el)
 			delete(s.learned, name)
-			if s.busy(name) {
-				s.retired[name] = kindLearned
-			} else {
-				changed = true
-			}
+			s.retired[name] = retiree{kind: kindLearned}
 		}
 	}
 	// New exact hosts, in name order so the outcome does not depend on map order.
@@ -180,18 +185,38 @@ func (s *NodeSet) Apply(w Wanted) (changed bool) {
 	sort.Strings(add)
 	s.overE = 0
 	for _, name := range add {
-		if s.size() >= s.cap && !s.evictOne() {
+		if s.size() >= s.cap {
 			s.overE++
 			continue
 		}
 		s.exact[name] = true
 		changed = true
 	}
+	// Sighted names that were waiting, with the slots exact hosts left.
 	for name := range s.overL {
 		if !s.matches(name) {
 			delete(s.overL, name)
 		}
 	}
+	var waiting []string
+	for name := range s.overL {
+		waiting = append(waiting, name)
+	}
+	sort.Strings(waiting)
+	for _, name := range waiting {
+		if s.size() >= s.cap {
+			break
+		}
+		if _, leaving := s.retired[name]; leaving {
+			continue
+		}
+		delete(s.overL, name)
+		s.learned[name] = s.lru.PushFront(name)
+		changed = true
+	}
+	// Whoever is still left out needs a slot: start idle learned names on
+	// their way out, one for each.
+	s.makeRoom(s.overE + len(s.overL))
 	return changed
 }
 
@@ -206,26 +231,36 @@ func (s *NodeSet) matches(name string) bool {
 	return false
 }
 
-// evictOne removes the least recently seen learned name that has no open
-// connections. The caller holds the lock.
-func (s *NodeSet) evictOne() bool {
-	for el := s.lru.Back(); el != nil; el = el.Prev() {
-		name := el.Value.(string)
-		if s.busy(name) {
-			continue
+// makeRoom retires idle learned names, least recently seen first, until as
+// many slots are on their way to being free as there are names left out.
+// Exact hosts are never evicted. The caller holds the lock.
+func (s *NodeSet) makeRoom(leftOut int) {
+	leaving := 0
+	for _, r := range s.retired {
+		if r.evicted {
+			leaving++
 		}
-		s.lru.Remove(el)
-		delete(s.learned, name)
-		s.evicted++
-		return true
 	}
-	return false
+	for el := s.lru.Back(); el != nil && leaving < leftOut; {
+		prev := el.Prev()
+		name := el.Value.(string)
+		if !s.busy(name) {
+			s.lru.Remove(el)
+			delete(s.learned, name)
+			s.retired[name] = retiree{kind: kindLearned, evicted: true}
+			s.evicted++
+			leaving++
+		}
+		el = prev
+	}
 }
 
 // Observe records a hostname from a workload's DNS answers. It reports
 // whether the set changed. A name joins only when a valid pattern on the
-// node covers it; when the set is full it replaces an idle learned name, and
-// when every learned name is busy it is left out and counted.
+// node covers it. When the set is full the name waits: an idle learned name
+// is retired for it, and it joins at an Apply after that name has been
+// swept. When every learned name is busy it keeps waiting, and counts as
+// over the cap for as long as it does.
 func (s *NodeSet) Observe(name string) (changed bool) {
 	name = normalize(name)
 	if !validHostname(name) {
@@ -243,15 +278,16 @@ func (s *NodeSet) Observe(name string) (changed bool) {
 	if !s.matches(name) {
 		return false
 	}
-	if _, ok := s.retired[name]; ok {
+	if r, ok := s.retired[name]; ok && !r.evicted {
 		delete(s.retired, name)
 		s.learned[name] = s.lru.PushFront(name)
 		return false
 	}
-	if s.size() >= s.cap && !s.evictOne() {
+	if _, leaving := s.retired[name]; leaving || s.size() >= s.cap {
 		if len(s.overL) < overCapMemory {
 			s.overL[name] = struct{}{}
 		}
+		s.makeRoom(s.overE + len(s.overL))
 		return false
 	}
 	delete(s.overL, name)
@@ -259,8 +295,9 @@ func (s *NodeSet) Observe(name string) (changed bool) {
 	return true
 }
 
-// Sweep drops retired names that have become idle and reports whether any
-// went.
+// Sweep removes retired names that are idle and reports whether any went.
+// Call it only once Envoy has taken a listener built after those names were
+// retired; a slot it frees is filled by the next Apply.
 func (s *NodeSet) Sweep() (changed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -363,14 +400,14 @@ func (s *NodeSet) NamesFor(exact, patterns, passthrough []string) []string {
 	return out
 }
 
-// Counts returns the set's size against the cap. Retired names count under
-// the kind they had.
+// Counts returns the set's size against the cap. A retired name still holds
+// its slot and counts under the kind it had.
 func (s *NodeSet) Counts() Counts {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c := Counts{Exact: len(s.exact), Learned: len(s.learned), Cap: s.cap, OverCap: s.overE + len(s.overL), Evictions: s.evicted}
-	for _, k := range s.retired {
-		if k == kindExact {
+	for _, r := range s.retired {
+		if r.kind == kindExact {
 			c.Exact++
 		} else {
 			c.Learned++

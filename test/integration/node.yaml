@@ -1,0 +1,45 @@
+# The node as the integration stack's node controller sees it, in place of an API server:
+# two pods at the fixed addresses of the two client containers, and the policy object
+# that selects each.
+#
+# it-pod is decrypted for both hosts. (The processor's own policy file lists only
+# api.anthropic.com for it, so its decrypt-list guard has something to refuse.)
+# other-pod is decrypted for api.openai.com only: when it asks for api.anthropic.com it
+# must be passed through, though another pod's policy names that host.
+apiVersion: v1
+kind: Namespace
+metadata: {name: it}
+---
+apiVersion: v1
+kind: Pod
+metadata: {namespace: it, name: it-pod, labels: {app: agent}}
+spec: {nodeName: it-node}
+status: {phase: Running, podIPs: [{ip: 172.30.0.21}]}
+---
+apiVersion: v1
+kind: Pod
+metadata: {namespace: it, name: other-pod, labels: {app: other}}
+spec: {nodeName: it-node}
+status: {phase: Running, podIPs: [{ip: 172.30.0.22}]}
+---
+apiVersion: kubescape.io/v1alpha1
+kind: SandboxPolicy
+metadata: {namespace: it, name: agent}
+spec:
+  selector: {podSelector: {matchLabels: {app: agent}}}
+  containers: ["*"]
+  mode: enforce
+  http:
+    default: {llm: allow, mcp: allow, other: allow}
+    decrypt: {exactHosts: [api.anthropic.com, api.openai.com]}
+---
+apiVersion: kubescape.io/v1alpha1
+kind: SandboxPolicy
+metadata: {namespace: it, name: other}
+spec:
+  selector: {podSelector: {matchLabels: {app: other}}}
+  containers: ["*"]
+  mode: enforce
+  http:
+    default: {llm: allow, mcp: allow, other: allow}
+    decrypt: {exactHosts: [api.openai.com]}

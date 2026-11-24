@@ -1,26 +1,20 @@
-// Package hostset keeps the set of hostnames the gateway decrypts on one node
-// (decision #5, 2026-11-10).
+// Package hostset keeps the set of hostnames the gateway decrypts on one node.
 //
-// The compiled policy gives two lists: exact hosts and host patterns. Exact
-// hosts are always in the set. A pattern never goes to Envoy as a pattern:
-// a hostname that matches one joins the set only after the node agent has seen
-// it in a workload's DNS answers (Observe). The SNI a client sends is never
-// enough. Learned names are capped per node, least recently seen evicted first,
-// so a pod resolving many made-up names under a pattern can't grow the set
-// without bound.
+// Policy objects give two lists: exact hosts and host patterns. An exact host
+// is in the set as soon as an object on the node asks for it. A pattern never
+// goes to Envoy as a pattern: a hostname that matches one joins the set only
+// after node-agent has seen it in a workload's DNS answers. The SNI a client
+// sends is never enough. One cap covers every name in the set, so a pod
+// resolving many made-up names under a pattern, or a policy listing many
+// hosts, cannot grow it without bound.
 //
-// The output (Hosts) is a plain list of exact names: Envoy gets one filter
-// chain per name with a prefetched certificate, and the SDS server mints only
-// for names in the set. Envoy never opens an SDS subscription for a name that
-// isn't in the set, which is what locked nodes out in the SNI flood (AC5).
+// Envoy gets one filter chain per name with its own certificate, and leaves
+// are minted only for names in the set.
 package hostset
 
 import (
-	"container/list"
 	"errors"
-	"sort"
 	"strings"
-	"sync"
 )
 
 // Pattern syntax, as the policy catalog writes it:
@@ -106,41 +100,6 @@ func globLabel(p, s string) bool {
 	return true
 }
 
-// Set is safe for concurrent use.
-type Set struct {
-	mu       sync.Mutex
-	exact    map[string]bool
-	patterns []pattern
-	cap      int
-	lru      *list.List // front = most recently seen; values are hostnames
-	learned  map[string]*list.Element
-	evicted  int // learned names dropped by the cap
-}
-
-// New builds a set. capLearned bounds the names learned through patterns; it
-// does not limit exact hosts. capLearned <= 0 means 64.
-func New(exact, patterns []string, capLearned int) (*Set, error) {
-	if capLearned <= 0 {
-		capLearned = 64
-	}
-	s := &Set{exact: map[string]bool{}, cap: capLearned, lru: list.New(), learned: map[string]*list.Element{}}
-	for _, h := range exact {
-		h = normalize(h)
-		if h == "" || strings.Contains(h, "*") {
-			return nil, errors.New("not an exact host: " + h)
-		}
-		s.exact[h] = true
-	}
-	for _, p := range patterns {
-		pt, err := parsePattern(p)
-		if err != nil {
-			return nil, err
-		}
-		s.patterns = append(s.patterns, pt)
-	}
-	return s, nil
-}
-
 func normalize(h string) string {
 	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(h), "."))
 }
@@ -166,86 +125,6 @@ func validHostname(name string) bool {
 		}
 	}
 	return true
-}
-
-// Contains reports whether name is in the set now (exact or learned). The SDS
-// server mints only for names this returns true for.
-func (s *Set) Contains(name string) bool {
-	name = normalize(name)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.exact[name] {
-		return true
-	}
-	_, ok := s.learned[name]
-	return ok
-}
-
-// Observe records a hostname from a workload's DNS answers. It returns true when
-// the set changed (a new name joined, possibly evicting the oldest one), so the
-// caller knows to rebuild Envoy's listener. A name already learned is refreshed;
-// a name that matches no pattern, or is already exact, is ignored.
-func (s *Set) Observe(name string) (changed bool) {
-	name = normalize(name)
-	if !validHostname(name) {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.exact[name] {
-		return false
-	}
-	if el, ok := s.learned[name]; ok {
-		s.lru.MoveToFront(el)
-		return false
-	}
-	matched := false
-	for _, pt := range s.patterns {
-		if pt.match(name) {
-			matched = true
-			break
-		}
-	}
-	if !matched {
-		return false
-	}
-	s.learned[name] = s.lru.PushFront(name)
-	for s.lru.Len() > s.cap {
-		old := s.lru.Back()
-		s.lru.Remove(old)
-		delete(s.learned, old.Value.(string))
-		s.evicted++
-	}
-	return true
-}
-
-// Hosts returns every name in the set, sorted: exact hosts and learned names.
-func (s *Set) Hosts() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]string, 0, len(s.exact)+len(s.learned))
-	for h := range s.exact {
-		out = append(out, h)
-	}
-	for h := range s.learned {
-		out = append(out, h)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// Learned returns the number of names learned through patterns.
-func (s *Set) Learned() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.lru.Len()
-}
-
-// Evicted returns how many learned names the cap has dropped.
-func (s *Set) Evicted() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.evicted
 }
 
 // Match reports whether host matches one policy host pattern, in the syntax
