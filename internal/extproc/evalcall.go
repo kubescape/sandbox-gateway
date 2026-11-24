@@ -39,7 +39,8 @@ type call[T any] struct {
 	done     chan struct{}
 	mu       sync.Mutex
 	finished bool
-	given    bool // wait already returned: a later finish is a stuck call ending
+	at       time.Time // when the call returned
+	given    bool      // counted as stuck: its finish decrements the count
 	v        T
 	panicked bool
 }
@@ -59,7 +60,7 @@ func begin[T any](c *calls, ctx context.Context, f func(context.Context) T) (*ca
 		defer func() {
 			_ = recover()
 			cl.mu.Lock()
-			cl.finished, cl.v, cl.panicked = true, v, panicked
+			cl.finished, cl.at, cl.v, cl.panicked = true, time.Now(), v, panicked
 			if cl.given {
 				c.stuck.Add(-1)
 			}
@@ -79,8 +80,16 @@ func begin[T any](c *calls, ctx context.Context, f func(context.Context) T) (*ca
 // wait returns the call's result, or errTimeout when it has not returned
 // within d. After a timeout the call counts as stuck until it returns.
 func (cl *call[T]) wait(d time.Duration) (T, error) {
+	return cl.waitUntil(time.Now().Add(d))
+}
+
+// waitUntil returns the call's result if the call returned by deadline, and
+// errTimeout otherwise. A result that comes after the deadline is refused
+// even when the waiter sees it, so which side of the deadline a result falls
+// on decides the outcome, not the order the scheduler wakes things in.
+func (cl *call[T]) waitUntil(deadline time.Time) (T, error) {
 	var zero T
-	timer := time.NewTimer(d)
+	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 	select {
 	case <-cl.done:
@@ -92,6 +101,8 @@ func (cl *call[T]) wait(d time.Duration) (T, error) {
 	case !cl.finished:
 		cl.markStuck()
 		return zero, errTimeout
+	case cl.at.After(deadline):
+		return zero, errTimeout // late: refused, though no longer running
 	case cl.panicked:
 		return zero, errPanic
 	}
@@ -116,11 +127,14 @@ func (cl *call[T]) markStuck() {
 	}
 }
 
-// run makes one bounded call: begin, then wait d. f gets a context that ends
-// at d, so an evaluator that honours its context gives its slot back at the
-// budget; one that ignores it keeps the slot and counts as stuck.
+// run makes one bounded call: begin, then wait until d has passed. f gets a
+// context that ends at the same deadline the result must arrive by, so an
+// evaluator that honours its context gives its slot back at the budget, and
+// one that answers after it is refused. One that ignores its context keeps
+// the slot and counts as stuck.
 func run[T any](c *calls, ctx context.Context, d time.Duration, f func(context.Context) T) (T, error) {
-	ctx, cancel := context.WithTimeout(ctx, d)
+	deadline := time.Now().Add(d)
+	ctx, cancel := context.WithDeadline(ctx, deadline)
 	cl, err := begin(c, ctx, func(ctx context.Context) T {
 		defer cancel()
 		return f(ctx)
@@ -130,5 +144,5 @@ func run[T any](c *calls, ctx context.Context, d time.Duration, f func(context.C
 		var zero T
 		return zero, err
 	}
-	return cl.wait(d)
+	return cl.waitUntil(deadline)
 }

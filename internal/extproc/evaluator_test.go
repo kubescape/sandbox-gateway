@@ -267,12 +267,20 @@ func TestEvaluateContextEndsAtBudget(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Evaluate's context did not end while the stream stayed open")
 	}
-	recv(t, st)
+	// Review: the verdict comes back after the deadline (the hook returns
+	// once the context has ended), so it is refused: the request gets the
+	// timeout denial, whatever the scheduler woke first.
+	if r := recv(t, st); !is403(r) || immediateBody(r) != fakeDenyBody(RuleEvaluatorTimeout) {
+		t.Fatalf("late allow verdict was accepted: %v", r)
+	}
 	waitIdle(t, h.srv, 0) // the slot is back, the stream still open
 	if n := h.srv.StuckEvaluatorCalls(); n != 0 {
 		t.Fatalf("stuck = %d", n)
 	}
 	must(t, st.CloseSend())
+	if rec := h.waitRecords(t, 1)[0]; rec.EvaluatorError != "evaluate: "+errTimeout.Error() {
+		t.Fatalf("record: %+v", rec)
+	}
 }
 
 // Every way a transaction ends leaves no goroutine of it behind.
