@@ -1,7 +1,8 @@
 // Command node-controller is the gateway's control process on one node. It
 // serves Envoy its listeners (LDS) and leaf certificates (SDS), keeps the
 // node's host set from the policy objects and node-agent's DNS sightings,
-// answers the certificate health path, and holds the node's intermediate CA.
+// answers the certificate health path, holds the node's intermediate CA and
+// writes the node's SandboxGatewayNodeStatus.
 package main
 
 import (
@@ -31,6 +32,7 @@ import (
 	"github.com/kubescape/sandbox-gateway/internal/envoyadmin"
 	"github.com/kubescape/sandbox-gateway/internal/gatewaysock"
 	"github.com/kubescape/sandbox-gateway/internal/hostset"
+	"github.com/kubescape/sandbox-gateway/internal/nodestatus"
 	"github.com/kubescape/sandbox-gateway/internal/nodeview"
 	"github.com/kubescape/sandbox-gateway/internal/runutil"
 	"github.com/kubescape/sandbox-gateway/internal/sds"
@@ -41,6 +43,7 @@ func main() {
 	listen := flag.String("listen", "unix:///run/kubescape-sandbox/xds.sock", "gRPC address Envoy fetches listeners and certificates from: unix:///path or host:port")
 	gatewaySock := flag.String("gateway-socket", "unix:///run/kubescape-sandbox/gateway.sock", "HTTP address for node-agent's DNS sightings (POST /v1/sightings) and the health listener's certificate path (GET /healthz/certs)")
 	adminSock := flag.String("envoy-admin", "/run/sandbox-gateway/envoy-admin.sock", "Envoy's admin unix socket; read for open connections per hostname")
+	processorHealth := flag.String("processor-health-socket", "/run/kubescape-sandbox/processor-health.sock", "the processor's health unix socket; read for the node status")
 	node := flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this pod runs on (default $NODE_NAME)")
 	viewFile := flag.String("view-file", "", "read pods and policy objects from this YAML file, not from the API server (test stacks)")
 	nameCap := flag.Int("name-cap", 256, "most hostnames with a certificate and a filter chain on this node, exact and learned together")
@@ -80,6 +83,7 @@ func main() {
 
 	// The node view.
 	var view nodeview.Source
+	var client dynamic.Interface // nil with -view-file: no API server, so no status object
 	if *viewFile != "" {
 		if view, err = nodeview.LoadStatic(*viewFile, *node); err != nil {
 			fatal(log, "view file", err)
@@ -92,15 +96,15 @@ func main() {
 		if err != nil {
 			fatal(log, "in-cluster config", err)
 		}
-		client, err := dynamic.NewForConfig(restCfg)
-		if err != nil {
+		if client, err = dynamic.NewForConfig(restCfg); err != nil {
 			fatal(log, "kubernetes client", err)
 		}
 		view = nodeview.NewInformers(client, *node)
 	}
 	go view.Run(ctx)
 
-	activity := &controller.Activity{Stats: envoyadmin.New(*adminSock).Stats}
+	admin := envoyadmin.New(*adminSock)
+	activity := &controller.Activity{Stats: admin.Stats}
 	set := hostset.NewNodeSet(*nameCap, activity.Busy)
 	lds := xds.NewLDS(log)
 	secrets := sds.New(sds.Gated{Allow: set.Contains, Leaves: authority}, log)
@@ -111,6 +115,18 @@ func main() {
 		Config: xds.Config{Port: uint32(*port), HealthPort: uint32(*healthPort), DecryptCluster: *decryptCluster, PassthroughCluster: *passthroughCluster},
 	}
 	go ctrl.Run(ctx)
+
+	// The node's status object, for the backend.
+	if client != nil {
+		status := &nodestatus.Writer{
+			Client: client, Node: *node, Log: log,
+			Sources: nodestatus.Sources{
+				Envoy: admin.ServerInfo, Stats: admin.Stats, Processor: nodestatus.ProbeProcessor(*processorHealth),
+				Hosts: set.Counts, Rejected: set.RejectedPatterns, Certs: authority.State,
+			},
+		}
+		go status.Run(ctx)
+	}
 
 	// Sightings from node-agent.
 	sock := &gatewaysock.Handler{Observe: set.Observe, Changed: ctrl.Kick, Log: log, Certs: func() gatewaysock.Certs {

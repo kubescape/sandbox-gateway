@@ -9,7 +9,7 @@ scope: repo
 
 The node controller is the gateway's control process on one node. It decides which hostnames Envoy decrypts there and for which pods, serves Envoy its listeners and certificates, and holds the node's intermediate CA. The program is `cmd/node-controller`; the loop is `internal/controller`.
 
-The plan for what is not built yet (overload settings, the node status object) is `docs/superpowers/plans/2026-11-24-node-controller.md`.
+The plan for what is not built yet (overload settings) is `docs/superpowers/plans/2026-11-24-node-controller.md`.
 
 ## What runs where
 
@@ -126,6 +126,30 @@ POST /v1/sightings   on /run/kubescape-sandbox/gateway.sock
 
 The name joins the host set when a valid pattern on the node covers it. `addresses` and `bindingIds` are accepted and not used: node-agent keeps the address set, and a learned name reaches a pod when one of that pod's own patterns covers it. A body over 64 KiB is refused.
 
+## Node status
+
+`internal/nodestatus` writes one `SandboxGatewayNodeStatus` object per node (`kubescape.io/v1alpha1`, cluster-scoped, named after the node). It is a snapshot: every field is written each time, and `observedAt` says how old it is. A reader must check `observedAt` and not only that the object exists.
+
+| Field | From |
+|---|---|
+| `envoy.up`, `envoy.version` | Envoy's admin socket (`/server_info`); down when it does not answer or is not live |
+| `processor.up`, `processor.evaluator` | the processor's health path; `unavailable` unless it answers 200 and says `available` |
+| `overloaded` | true when any of Envoy's `overload.*.active` gauges is set |
+| `hosts.exact`, `hosts.learned`, `hosts.cap` | the host set |
+| `rejectedPatterns` | the host set's refused entries, at most 64 |
+| `passedThroughOverCap` | names wanted now and left out by the cap |
+| `evictions` | learned names evicted since the node controller started |
+| `degradedDecisions` | the processor's count; while the processor is down, the last one it reported |
+| `decryptValidUntil` | the authority; absent with no intermediate |
+
+The object is written when it changes and at least every 30 seconds, never more often than every 5.
+
+The writer creates the object if it is missing, with an owner reference to the Node so it is collected when the node goes. The reference does not block the Node's deletion. If the Node cannot be read the object is created without an owner. The status goes through the `status` subresource with the resource version just read.
+
+RBAC it needs: `get` and `create` on `sandboxgatewaynodestatuses`, `update` on `sandboxgatewaynodestatuses/status`, and `get` on `nodes` for the owner reference.
+
+With `-view-file` there is no API server and no status object is written.
+
 ## Flags
 
 | Flag | Default | |
@@ -139,7 +163,8 @@ The name joins the host set when a valid pattern on the node covers it. `address
 | `-intermediate-ttl` | 24h | the stand-in intermediate |
 | `-listener-port`, `-health-port` | 18443, 18444 | the redirect and health listeners |
 | `-decrypt-cluster`, `-passthrough-cluster` | `dfp`, `orig_dst` | bootstrap clusters the chains route to |
-| `-view-file` | | pods and policy objects from a YAML file, for test stacks |
+| `-processor-health-socket` | `/run/kubescape-sandbox/processor-health.sock` | read for the node status |
+| `-view-file` | | pods and policy objects from a YAML file, for test stacks; no status object is written |
 | `-debug-addr` | off | `/stats` and `/debug/vars`, no authentication |
 
 Sockets are created with mode 0660. `SANDBOX_GATEWAY_SOCKET_GID` sets their group, so Envoy can connect.
