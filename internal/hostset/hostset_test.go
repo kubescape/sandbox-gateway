@@ -111,3 +111,21 @@ func TestObserveRejectsNonHostnames(t *testing.T) {
 		t.Fatal("a valid name was not learned")
 	}
 }
+
+func TestMatch(t *testing.T) {
+	for _, c := range []struct {
+		pattern, host string
+		want          bool
+	}{
+		{"*.example.com", "api.example.com", true},
+		{"*.example.com", "example.com", false},
+		{"bedrock-runtime.*.amazonaws.com", "bedrock-runtime.us-east-1.amazonaws.com", true},
+		{"bedrock-runtime.*.amazonaws.com", "bedrock.us-east-1.amazonaws.com", false},
+		{"*.example.com", "API.Example.com.", true},
+		{"*", "anything.com", false},
+	} {
+		if got := Match(c.pattern, c.host); got != c.want {
+			t.Errorf("Match(%q, %q) = %v, want %v", c.pattern, c.host, got, c.want)
+		}
+	}
+}

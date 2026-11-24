@@ -2,7 +2,7 @@
 
 A per-node L7 egress gateway for the Kubescape AI sandbox. It sits between sandboxed pods and AI providers: Envoy terminates the pod's TLS with a certificate minted for that hostname, an external processor reads the request and the streamed response, and the bytes go on to the provider unchanged.
 
-This repo holds the gateway's node controller, its processor and the Envoy config. The eBPF redirect that sends pod connections here lives in [kubescape/node-agent](https://github.com/kubescape/node-agent). Rule evaluation is pluggable through `pkg/plugin`: a build registers an evaluator and calls `pkg/processor.Main()`. The processor built here registers none, so it parses and records traffic, makes no decisions and blocks nothing.
+This repo holds the gateway's node controller, its processor and the Envoy config. The eBPF redirect that sends pod connections here lives in [kubescape/node-agent](https://github.com/kubescape/node-agent). Rule evaluation is pluggable through `pkg/plugin`: a build registers an evaluator and calls `pkg/processor.Main()`. The processor built here registers none, so it parses and records traffic and evaluates nothing; it still refuses a decrypted request to a host no policy decrypts.
 
 ## Status
 
@@ -21,6 +21,7 @@ Envoy 1.40 is the minimum version. CI runs 1.40.2.
 | `internal/sds`, `internal/ca`, `internal/hostset` | SDS protocol, certificate minting, and the set of hosts the node may decrypt (exact hosts, plus pattern hosts seen in DNS, capped per node). |
 | `internal/extproc`, `internal/app` | The processor itself, and the code that wires and runs it. |
 | `internal/conntable`, `internal/lookup` | Who sent a request: the connection and bindings tables node-agent pins, and node-agent's workload lookup. |
+| `internal/policysource`, `internal/stale` | The processor's informers on the policy objects, and when a workload's policy is too old to trust. |
 | `internal/sse`, `internal/streamfmt`, `internal/renumber`, `internal/eventstream`, `internal/wsframe`, `pkg/jsonscan` | Stream parsing: server-sent events, the Anthropic and OpenAI stream formats, removing and renumbering streamed items, AWS event stream (Bedrock), WebSocket frames, and request JSON fields. |
 | `internal/otlpemit` | Sends transaction records as OTLP logs. |
 | `deploy/envoy/envoy.yaml` | The Envoy config. |

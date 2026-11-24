@@ -1,0 +1,16 @@
+# What the processor's informers need: list and watch on both policy kinds,
+# across all namespaces, so a cluster-wide binding.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: sandbox-gateway-processor}
+rules:
+- apiGroups: [kubescape.io]
+  resources: [sandboxpolicies, clustersandboxpolicies]
+  verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: sandbox-gateway-processor}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: sandbox-gateway-processor}
+subjects:
+- {kind: ServiceAccount, name: processor, namespace: smoke}

@@ -135,8 +135,8 @@ func (s *Server) decide(t *txn) (blocked *extprocv3.ProcessingResponse, meta *st
 	t.rec.Provider, t.rec.Model = cls.provider, cls.model
 	t.provider.Store(cls.provider)
 	req := plugin.Request{
-		Workload: t.workload(),
-		Host:     t.rec.Authority, Method: t.rec.Method, Path: t.rec.Path,
+		Workload: t.workload(), Sections: t.sections, Degraded: t.rec.Degraded,
+		Host: t.rec.Authority, Method: t.rec.Method, Path: t.rec.Path,
 		Headers: t.headers, Model: cls.model, HasModel: cls.hasModel,
 	}
 	ev := s.cfg.Evaluator
@@ -147,13 +147,43 @@ func (s *Server) decide(t *txn) (blocked *extprocv3.ProcessingResponse, meta *st
 		return s.evaluationFailed(t, "evaluate", err), nil
 	}
 	t.rec.Verdict = recordVerdict(v)
-	if v.Action == plugin.ActionDeny {
-		if v.Mode == plugin.ModeEnforce {
-			return s.block(t, v), nil
-		}
-		t.rec.WouldDeny = true
+	in := t.in
+	in.HasEvaluator, in.Verdict = true, v
+	o := decide(in)
+	t.rec.Degraded = t.rec.Degraded || o.Degraded
+	if o.Block {
+		return s.block(t, v), nil
 	}
+	// An audit deny, and an enforce deny the table let through because the
+	// decision is degraded on an allow pod.
+	t.rec.WouldDeny = v.Action == plugin.ActionDeny
 	return nil, s.auditMeta(t)
+}
+
+// policyStage resolves the workload's policies, asks the staleness tracker,
+// and runs the decision table before any body is read. With no policy source
+// it says to evaluate, and nothing else.
+func (s *Server) policyStage(t *txn) outcome {
+	t.in = input{HasEvaluator: s.cfg.Evaluator != nil, Sections: 1, HostInDecryptList: true}
+	if t.rec.Identity != nil {
+		t.in.Posture = t.rec.Identity.Posture
+	}
+	if s.cfg.Policies == nil {
+		return outcome{CallEvaluate: true}
+	}
+	sections, outdated, missing := s.cfg.Policies.Resolve(t.policies)
+	var cgroup uint64
+	if t.rec.Identity != nil {
+		cgroup = t.rec.Identity.CgroupID
+	}
+	unresolved := outdated + missing
+	t.sections = sections
+	t.in.Sections, t.in.Unresolved = len(sections), unresolved
+	t.in.Stale = s.cfg.Stale.Observe(cgroup, t.lookupFailingSince, s.cfg.Policies.LostSince(), unresolved > 0)
+	t.in.HostInDecryptList = inDecryptList(sections, t.rec.Authority)
+	o := decide(t.in)
+	t.rec.Degraded = o.Degraded
+	return o
 }
 
 // evaluationFailed refuses a request whose evaluation began and could not

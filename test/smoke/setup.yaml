@@ -1,0 +1,26 @@
+# The smoke test's namespace, the processor's service account (no RBAC yet:
+# run.sh grants it later, see rbac.yaml) and the pod that pins the maps.
+apiVersion: v1
+kind: Namespace
+metadata: {name: smoke}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: processor, namespace: smoke}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: pinmaps, namespace: smoke}
+spec:
+  restartPolicy: Never
+  containers:
+  - name: pinmaps
+    image: sandbox-gateway/test-fixtures:smoke
+    imagePullPolicy: Never
+    command: [pinmaps]
+    securityContext: {privileged: true, runAsUser: 0, runAsGroup: 0}
+    volumeMounts:
+    - {name: bpf, mountPath: /sys/fs/bpf}
+  volumes:
+  - name: bpf
+    hostPath: {path: /sys/fs/bpf, type: Directory}

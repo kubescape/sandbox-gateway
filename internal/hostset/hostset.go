@@ -247,3 +247,13 @@ func (s *Set) Evicted() int {
 	defer s.mu.Unlock()
 	return s.evicted
 }
+
+// Match reports whether host matches one policy host pattern, in the syntax
+// described above. An invalid pattern matches nothing.
+func Match(pattern, host string) bool {
+	pt, err := parsePattern(pattern)
+	if err != nil {
+		return false
+	}
+	return pt.match(normalize(host))
+}

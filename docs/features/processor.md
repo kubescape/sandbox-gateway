@@ -73,7 +73,7 @@ With an evaluator, one request goes like this:
 
 1. At the request headers the processor starts `Classify` with the read end of a pipe. A request with no body, and a WebSocket upgrade, get an empty body and are decided at the headers; WebSocket frames are never fed to the evaluator.
 2. Each body chunk is written to the pipe and forwarded one chunk behind, so the newest chunk waits for the verdict. A blocked request therefore never reaches the provider whole.
-3. At the end of the body, or at the trailers, the pipe is closed, `Classify` returns, and `Evaluate` gets the `Request`: the workload (with the fail posture from the `bindings` table and the policy references from the lookup), host, method, path, headers, model. `Sections` is empty and `Degraded` false until the policy source is wired in.
+3. At the end of the body, or at the trailers, the pipe is closed, `Classify` returns, and `Evaluate` gets the `Request`: the workload (with the fail posture from the `bindings` table and the policy references from the lookup), host, method, path, headers, model, the cached policy sections and whether the decision is degraded (see "Policies and degraded decisions").
 4. A verdict of `deny` in `enforce` mode blocks the request with the evaluator's `DenyResponse`. A `deny` in `audit` mode passes and the record has `would_deny`. Anything else passes and the held chunk is released.
 
 Every call into the evaluator is bounded, because Go cannot stop a function that ignores its context:
@@ -89,6 +89,30 @@ Every call into the evaluator is bounded, because Go cannot stop a function that
 The watchdog ends a response whose chunk takes longer than `-chunk-budget` with the evaluator's `StreamError` frame and end of stream. With no evaluator, or a `StreamError` that cannot answer in 200 ms, the stream ends with no frame.
 
 The record carries `provider`, `model`, the `verdict` (action, mode, rule, origin, policy uid and revision), `would_deny`, `degraded` and `evaluator_error`, which says which call failed and how. The access log shows `rule_id`, `action`, `mode`, `would_deny`, `degraded` and `model`.
+
+## Policies and degraded decisions
+
+The processor runs its own informers on `SandboxPolicy` and `ClusterSandboxPolicy` (`internal/policysource`, contract C11), with the pod's service account, which needs `list` and `watch` on both kinds across all namespaces. For each request it resolves the policy references the lookup names by UID in the informer cache, and hands the evaluator the `http` section of each, unmerged, as `Request.Sections`. A reference cached at another generation yields the cached copy; a UID the cache does not hold is missing.
+
+The pod's fail posture never comes from those sections, because the section that is missing can be the one that says `deny`. It comes from the `bindings` table.
+
+A workload's policy is stale from the earliest of: node-agent's lookup serving from its cache, either informer losing the API server (each informer keeps its own outage clock), or a referenced policy not resolving. After `-stale-after` (5m) its decisions are degraded (`internal/stale`). A workload keeps its clock while it is idle. It leaves the tracker only when its policy resolves or when its removal is confirmed: a request finds its cgroup unbound, or the once-a-minute sweep of the kernel bindings table does not find it. The tracker times at most 65,536 workloads and never drops a live one to make room. A newly unresolved workload that arrives while it is full gets an entry of unknown age, up to 65,536 more, and is degraded at once; it stays degraded when a slot opens later. If even those run out, the tracker can no longer tell which workload it turned away, so until the processor restarts every workload it newly admits starts with an unknown age. A sweep removes an entry only if no request observed it after the sweep read the bindings table.
+
+The informers index the objects by UID themselves, so an object deleted and created again under the same name no longer resolves under its old UID. Every list and watch call is counted where it is made: a failure starts that informer's outage clock, a success or any event ends it. Each request gets its own copy of the sections.
+
+Before any body is read, a decision table (`internal/extproc/decide.go`) settles what does not need the evaluator. The first matching row wins:
+
+| Condition | Result |
+|---|---|
+| No covering policy cached, evaluator present, posture `deny` | the processor's own 403 at the headers, rule `framework.no-cached-policy`, degraded; the evaluator is not called |
+| No covering policy cached, otherwise | passes, degraded, nothing evaluated |
+| Host not in the decrypt list, decision fresh or posture `deny` | the processor's own 403 at the headers, rule `framework.host-not-decrypted` |
+| Host not in the decrypt list, degraded, posture `allow` | passes, degraded |
+| No evaluator | passes |
+
+Otherwise `Evaluate` runs, and an enforce-mode deny blocks unless the decision is degraded on an `allow` pod, which passes and is recorded as `would_deny`. The decrypt list is the union over the cached sections of `decrypt.exactHosts` and the names matching `decrypt.hostPatterns`, minus `decrypt.passthrough`. The decrypt-list guard runs without an evaluator too.
+
+Both blocks above happen at the request headers, so none of the request reaches the provider; the provider is not known yet, so the answer is the processor's own 403. `GET /healthz/processor` on `-health-socket` answers 503 until both informers have synced once and delivered that list to their handlers, then 200 with `{"evaluator":"available|unavailable","degradedDecisions":N,"stuckEvaluatorCalls":N}`.
 
 ## Streams
 
@@ -113,6 +137,8 @@ The record's `stop_reason` comes from `streamfmt`: Anthropic's `stop_reason`, Op
 | `-lookup-refresh` | `5s` | ask node-agent again once a cached answer is this old |
 | `-chunk-budget` | `3s` | the stall watchdog, and the budget of each evaluator call and body write; `0` turns the watchdog off |
 | `-max-evaluator-calls` | `64` | evaluator calls in flight, stuck ones included |
+| `-stale-after` | `5m` | how long a workload's policy may go without a source before its decisions are degraded |
+| `-health-socket` | `unix:///run/kubescape-sandbox/processor-health.sock` | where `GET /healthz/processor` is served |
 | `-otlp-endpoint`, `-records` | empty | where records go besides the log |
 | `-debug-addr` | `127.0.0.1:9102` | debug server, no authentication |
 
@@ -120,4 +146,6 @@ The record's `stop_reason` comes from `streamfmt`: Anthropic's `stop_reason`, Op
 
 `go test -race ./...` covers the packages. `internal/extproc` tests the evaluator seam against a fake evaluator whose calls can be made to stall or panic. The pinned-map test in `internal/conntable` needs root and runs as root in CI.
 
-`test/integration/run.sh` runs Envoy with `test/processor-it`, which is the same server against an in-memory table that names one fixed pod, because the stack has no eBPF redirect. The fixture runs with `-evaluator`, a test evaluator that denies the model `denied-model`. It checks a streamed call end to end, that the record names the pod, that a request for the denied model gets the evaluator's 403 and a `denied` record, that a client cannot change the address the processor sees, that an empty table refuses the request, and that the shipped processor image will not start without the maps.
+`test/integration/run.sh` runs Envoy with `test/processor-it`, which is the same server against an in-memory table that names one fixed pod, because the stack has no eBPF redirect. The fixture runs with `-evaluator`, a test evaluator that denies the model `denied-model`, and with `-policies test/integration/policies.yaml` instead of an API server. It checks a streamed call end to end, that the record names the pod, that a request for the denied model gets the evaluator's 403 and a `denied` record, that a decrypted host the policy does not list is refused by the decrypt-list guard, that a client cannot change the address the processor sees, that an empty table refuses the request, and that the shipped processor image will not start without the maps.
+
+`test/smoke/run.sh` (CI job "Processor image smoke") runs the shipped image itself in kind: as its own user, against empty `conns` and `bindings` maps pinned in the node's bpffs (`test/smoke/pinmaps`), with a service account against a real API server and the storage CRDs. The account starts with no RBAC, so the health path must answer 503; once a ClusterRole with `list` and `watch` on both kinds is bound to it, the informers sync and it must answer 200 with `"evaluator":"unavailable"`. The same image with no maps must exit with "open the connection tables". The processor opens the maps as a non-root user with no capabilities. A kernel that refuses `bpf()` to unprivileged users (`kernel.unprivileged_bpf_disabled` on older kernels) would need `CAP_BPF` for it; the smoke job shows what the CI runner's kernel allows.

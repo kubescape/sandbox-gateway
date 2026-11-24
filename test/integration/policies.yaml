@@ -1,0 +1,19 @@
+# The policy object the integration stack's stub pod is covered by. It
+# decrypts api.anthropic.com only, so a request to api.openai.com, which the
+# stack's Envoy also decrypts, is refused by the decrypt-list guard.
+apiVersion: kubescape.io/v1alpha1
+kind: SandboxPolicy
+metadata:
+  name: it
+  namespace: it
+  uid: 00000000-0000-0000-0000-000000000001
+  generation: 1
+spec:
+  selector: {podSelector: {}}
+  containers: ["*"]
+  mode: enforce
+  http:
+    default: {llm: allow, mcp: allow, other: allow}
+    onUnavailable: allow
+    decrypt:
+      exactHosts: [api.anthropic.com]

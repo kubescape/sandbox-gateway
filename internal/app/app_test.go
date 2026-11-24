@@ -2,11 +2,14 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -141,5 +144,128 @@ func TestEvaluatorUnavailableReported(t *testing.T) {
 	}
 	if _, ok := stats(srv, nil)["stuckEvaluatorCalls"]; !ok {
 		t.Fatal("stats do not report stuck evaluator calls")
+	}
+}
+
+// fakePolicies is a policy source whose sync the test controls, holding no
+// objects.
+type fakePolicies struct{ synced atomic.Bool }
+
+func (f *fakePolicies) Resolve([]plugin.PolicyRef) ([]plugin.PolicySection, int, int) {
+	return nil, 0, 0
+}
+func (f *fakePolicies) LostSince() time.Time    { return time.Time{} }
+func (f *fakePolicies) Synced() bool            { return f.synced.Load() }
+func (f *fakePolicies) Run(ctx context.Context) { <-ctx.Done() }
+
+// boundTable says every connection is from one bound allow pod.
+type boundTable struct{}
+
+func (boundTable) Conn(conntable.Key) (conntable.Conn, bool, error) {
+	return conntable.Conn{CgroupID: 7, BindingID: 1, OrigDst: netip.MustParseAddrPort("192.0.2.1:443")}, true, nil
+}
+func (boundTable) Binding(uint64) (conntable.Binding, bool, error) {
+	return conntable.Binding{BindingID: 1, Posture: conntable.PostureAllow}, true, nil
+}
+
+// healthGet asks the health socket and returns the status and body.
+func healthGet(t *testing.T, sock string) (int, map[string]any) {
+	t.Helper()
+	c := http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", sock)
+	}}}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		resp, err := c.Get("http://processor/healthz/processor")
+		if err == nil {
+			defer func() { _ = resp.Body.Close() }()
+			var body map[string]any
+			_ = json.NewDecoder(resp.Body).Decode(&body)
+			return resp.StatusCode, body
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func runWithHealth(t *testing.T, p PolicySource, conns conntable.Table) (grpcSock, healthSock string) {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	grpcSock, healthSock = filepath.Join(dir, "p.sock"), filepath.Join(dir, "h.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Config{Listen: "unix://" + grpcSock, HealthSocket: "unix://" + healthSock,
+			Conns: conns, Policies: p, DebugAddr: ""})
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+	return grpcSock, healthSock
+}
+
+func TestHealthFailsUntilFirstSync(t *testing.T) {
+	p := &fakePolicies{}
+	_, hs := runWithHealth(t, p, emptyTable{})
+	if code, _ := healthGet(t, hs); code != http.StatusServiceUnavailable {
+		t.Fatalf("before the sync: %d", code)
+	}
+	p.synced.Store(true)
+	code, body := healthGet(t, hs)
+	if code != http.StatusOK || body["evaluator"] != "unavailable" {
+		t.Fatalf("after the sync: %d %v", code, body)
+	}
+	if _, ok := body["degradedDecisions"]; !ok {
+		t.Fatalf("no degradedDecisions in %v", body)
+	}
+}
+
+// A request from an allow pod with nothing cached is degraded, and the health
+// body counts it.
+func TestDegradedCounterInHealthBody(t *testing.T) {
+	p := &fakePolicies{}
+	p.synced.Store(true)
+	gs, hs := runWithHealth(t, p, boundTable{})
+	healthGet(t, hs) // up
+	conn, err := grpc.NewClient("passthrough:///p", grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", gs)
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	st, err := extprocv3.NewExternalProcessorClient(conn).Process(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attrs, _ := structpb.NewStruct(map[string]any{"source.address": "10.0.0.5:4242"})
+	if err := st.Send(&extprocv3.ProcessingRequest{
+		Attributes: map[string]*structpb.Struct{"envoy.filters.http.ext_proc": attrs},
+		Request: &extprocv3.ProcessingRequest_RequestHeaders{RequestHeaders: &extprocv3.HttpHeaders{
+			Headers: &corev3.HeaderMap{Headers: []*corev3.HeaderValue{{Key: ":path", RawValue: []byte("/v1/messages")}}}, EndOfStream: true}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Recv(); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.CloseSend()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		_, body := healthGet(t, hs)
+		if body["degradedDecisions"] == float64(1) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("health body = %v", body)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

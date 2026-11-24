@@ -94,3 +94,16 @@ jobs:
       # Envoy with deploy/envoy/envoy.yaml, the two images and the mock provider: one streamed call.
       - name: Streamed call through Envoy
         run: test/integration/run.sh
+
+  smoke:
+    name: Processor image smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      # The shipped processor image in kind: real pinned maps, its own user, a
+      # service account against a real API server (test/smoke/run.sh).
+      - name: Shipped processor image in kind
+        run: test/smoke/run.sh

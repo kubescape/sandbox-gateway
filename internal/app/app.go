@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/kubescape/sandbox-gateway/internal/extproc"
 	"github.com/kubescape/sandbox-gateway/internal/otlpemit"
 	"github.com/kubescape/sandbox-gateway/internal/runutil"
+	"github.com/kubescape/sandbox-gateway/internal/stale"
 	"github.com/kubescape/sandbox-gateway/pkg/plugin"
 )
 
@@ -35,13 +37,29 @@ type Config struct {
 	// evaluator as unavailable.
 	Evaluator         plugin.Evaluator
 	MaxEvaluatorCalls int
-	ChunkBudget       time.Duration
-	Faults            extproc.Faults
-	RecordsFile       string // also append records here as JSON lines
-	OTLPEndpoint      string
-	DebugAddr         string
-	Log               *slog.Logger
+	// Policies is the policy source; Run starts it. nil turns the policy
+	// stage off and the health path answers 200 from the start (tests only).
+	Policies   PolicySource
+	StaleAfter time.Duration
+	// HealthSocket serves GET /healthz/processor (decision 3); empty turns it off.
+	HealthSocket string
+	ChunkBudget  time.Duration
+	Faults       extproc.Faults
+	RecordsFile  string // also append records here as JSON lines
+	OTLPEndpoint string
+	DebugAddr    string
+	Log          *slog.Logger
 }
+
+// PolicySource is the policy informers as Run needs them.
+type PolicySource interface {
+	extproc.PolicySource
+	Synced() bool
+	Run(ctx context.Context)
+}
+
+// DefaultHealthSocket is where the processor serves its health path.
+const DefaultHealthSocket = "unix:///run/kubescape-sandbox/processor-health.sock"
 
 // Flags registers the flags every processor build shares and returns the
 // Config they fill. The caller sets Conns, Lookup and Evaluator.
@@ -52,6 +70,8 @@ func Flags(fs *flag.FlagSet) *Config {
 	fs.IntVar(&c.Faults.EarlyEOSAfterEvents, "fault-early-eos-after-events", 0, "TEST ONLY: end the response after N SSE events with synthetic terminal events")
 	fs.DurationVar(&c.ChunkBudget, "chunk-budget", extproc.DefaultChunkBudget, "watchdog and evaluator budget: end the response fail-closed if one chunk takes longer than this, and fail a request whose evaluator call does; 0 disables the watchdog")
 	fs.IntVar(&c.MaxEvaluatorCalls, "max-evaluator-calls", extproc.DefaultMaxEvaluatorCalls, "evaluator calls in flight, stuck ones included; past it a request is decided by the pod's fail posture")
+	fs.DurationVar(&c.StaleAfter, "stale-after", extproc.DefaultStaleAfter, "a workload's policy this long without a source makes its decisions degraded")
+	fs.StringVar(&c.HealthSocket, "health-socket", DefaultHealthSocket, "where to serve GET /healthz/processor: unix:///path or host:port; empty disables")
 	fs.StringVar(&c.OTLPEndpoint, "otlp-endpoint", "", "OTLP/HTTP endpoint for transaction records (e.g. http://otel-collector:4318)")
 	fs.StringVar(&c.RecordsFile, "records", "", "also append transaction records as JSON lines to this file")
 	fs.StringVar(&c.DebugAddr, "debug-addr", "127.0.0.1:9102", "debug HTTP address; it has no authentication, so keep it on loopback; empty disables")
@@ -86,7 +106,24 @@ func Run(ctx context.Context, c Config) error {
 		go otlp.Run(time.Second, stop, func(err error) { log.Warn("otlp export", "error", err) })
 		log.Info("otlp export enabled", "endpoint", c.OTLPEndpoint)
 	}
+	if c.StaleAfter <= 0 {
+		c.StaleAfter = extproc.DefaultStaleAfter
+	}
+	tracker := stale.New(c.StaleAfter, time.Now)
+	if c.Conns != nil {
+		go tracker.Run(ctx, time.Minute, func(cgroupID uint64) (bool, error) {
+			_, ok, err := c.Conns.Binding(cgroupID)
+			return ok, err
+		})
+	}
+	var policies extproc.PolicySource
+	if c.Policies != nil {
+		policies = c.Policies
+		go c.Policies.Run(ctx)
+	}
 	srv := extproc.New(extproc.Config{
+		Policies:          policies,
+		Stale:             tracker,
 		Evaluator:         c.Evaluator,
 		MaxEvaluatorCalls: c.MaxEvaluatorCalls,
 		Conns:             c.Conns,
@@ -107,6 +144,15 @@ func Run(ctx context.Context, c Config) error {
 		},
 	})
 	runutil.ServeDebug(c.DebugAddr, func() any { return stats(srv, c.Evaluator) })
+	if c.HealthSocket != "" {
+		hl, err := runutil.Listen(c.HealthSocket)
+		if err != nil {
+			return fmt.Errorf("app: health socket: %w", err)
+		}
+		hs := &http.Server{Handler: health(srv, c.Evaluator, c.Policies), ReadHeaderTimeout: 5 * time.Second}
+		go func() { _ = hs.Serve(hl) }()
+		go func() { <-ctx.Done(); _ = hs.Close() }()
+	}
 	if c.Faults.StallAfterChunks > 0 || c.Faults.EarlyEOSAfterEvents > 0 {
 		log.Warn("fault injection enabled", "stall_after_chunks", c.Faults.StallAfterChunks, "early_eos_after_events", c.Faults.EarlyEOSAfterEvents)
 	}
@@ -134,11 +180,33 @@ func EvaluatorState(e plugin.Evaluator) string {
 	return "available"
 }
 
+// health serves GET /healthz/processor (decision 3): 503 until the policy
+// informers have synced once, then 200 with the evaluator state and the
+// counters the node controller reads.
+func health(srv *extproc.Server, e plugin.Evaluator, p PolicySource) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz/processor", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		if p != nil && !p.Synced() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"reason": "policy informers have not synced"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"evaluator":           EvaluatorState(e),
+			"degradedDecisions":   srv.DegradedDecisions(),
+			"stuckEvaluatorCalls": srv.StuckEvaluatorCalls(),
+		})
+	})
+	return mux
+}
+
 // stats is what the debug server's /stats answers.
 func stats(srv *extproc.Server, e plugin.Evaluator) map[string]any {
 	return map[string]any{
 		"active": srv.Active.Load(), "total": srv.Total.Load(),
 		"evaluator": EvaluatorState(e), "stuckEvaluatorCalls": srv.StuckEvaluatorCalls(),
+		"degradedDecisions": srv.DegradedDecisions(),
 	}
 }
 

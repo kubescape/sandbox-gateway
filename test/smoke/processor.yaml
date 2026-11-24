@@ -1,0 +1,41 @@
+# The shipped processor image, as its own user, against the maps pinmaps
+# pinned. The probe container shares the socket directory so run.sh can ask
+# the health path.
+apiVersion: v1
+kind: Pod
+metadata: {name: processor, namespace: smoke}
+spec:
+  serviceAccountName: processor
+  restartPolicy: Never
+  containers:
+  - name: processor
+    image: sandbox-gateway/processor:smoke
+    imagePullPolicy: Never
+    args: ["--debug-addr="]
+    volumeMounts:
+    - {name: bpf, mountPath: /sys/fs/bpf, readOnly: true}
+    - {name: run, mountPath: /run/kubescape-sandbox}
+  - name: probe
+    image: sandbox-gateway/test-fixtures:smoke
+    imagePullPolicy: Never
+    command: [healthget, idle]
+    volumeMounts:
+    - {name: run, mountPath: /run/kubescape-sandbox}
+  volumes:
+  - name: bpf
+    hostPath: {path: /sys/fs/bpf, type: Directory}
+  - name: run
+    emptyDir: {}
+---
+# The same image with no maps: it must not start.
+apiVersion: v1
+kind: Pod
+metadata: {name: processor-nomaps, namespace: smoke}
+spec:
+  serviceAccountName: processor
+  restartPolicy: Never
+  containers:
+  - name: processor
+    image: sandbox-gateway/processor:smoke
+    imagePullPolicy: Never
+    args: ["--maps-dir=/tmp/no-maps-here", "--debug-addr="]

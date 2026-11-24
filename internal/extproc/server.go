@@ -38,6 +38,7 @@ import (
 	"github.com/kubescape/sandbox-gateway/internal/eventstream"
 	"github.com/kubescape/sandbox-gateway/internal/lookup"
 	"github.com/kubescape/sandbox-gateway/internal/sse"
+	"github.com/kubescape/sandbox-gateway/internal/stale"
 	"github.com/kubescape/sandbox-gateway/internal/streamfmt"
 	"github.com/kubescape/sandbox-gateway/internal/wsframe"
 	"github.com/kubescape/sandbox-gateway/pkg/plugin"
@@ -103,8 +104,30 @@ type Config struct {
 	// Lookup names the workload that owns a cgroup. nil leaves the record with
 	// the kernel half of the identity only.
 	Lookup LookupFunc
-	Emit   func(Record) // called once per transaction; default logs JSON
-	Log    *slog.Logger
+	// Policies is the policy source (contract C11): the http sections of the
+	// objects a workload's lookup names. nil turns the policy stage off: no
+	// sections, nothing degraded, no decrypt-list guard. Only tests leave it
+	// nil; the processor always sets it.
+	Policies PolicySource
+	// Stale decides when a workload's policy is too old to trust. nil means a
+	// tracker with DefaultStaleAfter.
+	Stale *stale.Tracker
+	Emit  func(Record) // called once per transaction; default logs JSON
+	Log   *slog.Logger
+}
+
+// DefaultStaleAfter is how long a workload's policy may go without a source
+// before its decisions are degraded.
+const DefaultStaleAfter = 5 * time.Minute
+
+// PolicySource is what the server needs from the policy informers.
+type PolicySource interface {
+	// Resolve returns the cached http section of each reference, and counts
+	// the references cached at another generation and those not cached.
+	Resolve(refs []plugin.PolicyRef) (sections []plugin.PolicySection, outdated, missing int)
+	// LostSince is the start of the oldest outage not yet over; zero when
+	// connected.
+	LostSince() time.Time
 }
 
 // LookupFunc returns the workload that owns a cgroup. failingSince is zero
@@ -210,9 +233,15 @@ type Server struct {
 	cfg     Config
 	calls   *calls
 	feeders atomic.Int64 // goroutines writing a request chunk to the evaluator
-	Active  atomic.Int64
-	Total   atomic.Int64
+	// degraded counts the transactions decided with a degraded decision.
+	degraded atomic.Int64
+	Active   atomic.Int64
+	Total    atomic.Int64
 }
+
+// DegradedDecisions is the number of transactions so far whose decision was
+// degraded.
+func (s *Server) DegradedDecisions() int64 { return s.degraded.Load() }
 
 // StuckEvaluatorCalls is the number of evaluator calls still running past
 // their deadline.
@@ -230,6 +259,9 @@ func New(cfg Config) *Server {
 			log.Info("transaction", "record", json.RawMessage(b))
 		}
 	}
+	if cfg.Stale == nil {
+		cfg.Stale = stale.New(DefaultStaleAfter, time.Now)
+	}
 	return &Server{cfg: cfg, calls: newCalls(cfg.MaxEvaluatorCalls)}
 }
 
@@ -243,22 +275,25 @@ func (s *Server) budget() time.Duration {
 
 // txn is the per-stream state. One ext_proc stream is one HTTP transaction.
 type txn struct {
-	rec       Record
-	ctx       context.Context // ends when the transaction does
-	policies  []plugin.PolicyRef
-	headers   http.Header
-	eval      *evaluation // nil when the request is not being evaluated
-	held      []byte      // the newest request chunk, not forwarded until the verdict
-	holding   bool
-	wsIn      wsframe.Decoder
-	wsOut     wsframe.Decoder
-	reqEOSAt  time.Time
-	parser    sse.Parser
-	es        *eventstream.Decoder // set when the response is a Bedrock event stream
-	procTotal time.Duration
-	track     streamfmt.Tracker // items and stop reason of the response stream
-	eosSent   bool
-	emitted   bool
+	rec                Record
+	ctx                context.Context // ends when the transaction does
+	policies           []plugin.PolicyRef
+	lookupFailingSince time.Time
+	sections           []plugin.PolicySection
+	in                 input // the decision table's input, set by the policy stage
+	headers            http.Header
+	eval               *evaluation // nil when the request is not being evaluated
+	held               []byte      // the newest request chunk, not forwarded until the verdict
+	holding            bool
+	wsIn               wsframe.Decoder
+	wsOut              wsframe.Decoder
+	reqEOSAt           time.Time
+	parser             sse.Parser
+	es                 *eventstream.Decoder // set when the response is a Bedrock event stream
+	procTotal          time.Duration
+	track              streamfmt.Tracker // items and stop reason of the response stream
+	eosSent            bool
+	emitted            bool
 
 	// Shared with the watchdog goroutine.
 	provider      atomic.Value // string: the provider Classify named
@@ -367,6 +402,9 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 		if n := t.rec.ResponseChunks; n > 0 {
 			t.rec.ChunkProcAvgUs = t.procTotal.Microseconds() / int64(n)
 		}
+		if t.rec.Degraded {
+			s.degraded.Add(1)
+		}
 		s.cfg.Emit(t.rec)
 	}
 
@@ -433,6 +471,7 @@ func (s *Server) identify(ctx context.Context, t *txn) (rejectReason string) {
 		return "connection_table_error"
 	}
 	if !ok {
+		s.cfg.Stale.Forget(conn.CgroupID) // the workload is gone
 		return "not_bound"
 	}
 	// The connection carries the binding it was made under. If the cgroup's
@@ -452,6 +491,7 @@ func (s *Server) identify(ctx context.Context, t *txn) (rejectReason string) {
 		w, failingSince, err := s.cfg.Lookup(ctx, conn.CgroupID)
 		switch {
 		case errors.Is(err, lookup.ErrNotBound):
+			s.cfg.Stale.Forget(conn.CgroupID) // the workload is gone
 			return "not_bound"
 		case err != nil:
 			id.LookupError = err.Error()
@@ -471,6 +511,7 @@ func (s *Server) identify(ctx context.Context, t *txn) (rejectReason string) {
 			}
 		}
 		if !failingSince.IsZero() {
+			t.lookupFailingSince = failingSince
 			id.LookupFailingSince = failingSince.UTC().Format(time.RFC3339)
 		}
 	}
@@ -537,6 +578,20 @@ func (s *Server) handle(stream extprocv3.ExternalProcessor_ProcessServer, t *txn
 			Response: &extprocv3.ProcessingResponse_RequestHeaders{
 				RequestHeaders: &extprocv3.HeadersResponse{}},
 			DynamicMetadata: auditMetadata(identityFields(t.rec.Identity))}
+		pre := s.policyStage(t)
+		switch {
+		case pre.Block:
+			// Known before any body: a host no policy decrypts (decision 5),
+			// or a deny pod with nothing cached. Refused at the headers, so
+			// none of the request reaches the provider. The provider is not
+			// known yet, so the answer is the framework's own 403.
+			t.rec.Verdict = &Verdict{Action: plugin.ActionDeny, Mode: plugin.ModeEnforce, Rule: pre.Rule}
+			t.rec.Ended = "denied"
+			return immediate(frameworkDeny(), s.auditMeta(t)), nil
+		case !pre.CallEvaluate:
+			resp.DynamicMetadata = s.auditMeta(t)
+			return resp, nil
+		}
 		if s.cfg.Evaluator == nil {
 			return resp, nil
 		}

@@ -5,6 +5,8 @@
 //
 // By default every connection belongs to one fixed bound pod. With
 // -reject-all no connection is in the table, so every request is refused.
+// With -policies the policy objects come from a YAML file instead of an API
+// server, and the stub pod is covered by all of them.
 // With -evaluator a test evaluator is registered that denies requests for
 // the model "denied-model", in the mode -mode gives.
 package main
@@ -22,6 +24,7 @@ import (
 	"github.com/kubescape/sandbox-gateway/internal/app"
 	"github.com/kubescape/sandbox-gateway/internal/conntable"
 	"github.com/kubescape/sandbox-gateway/internal/lookup"
+	"github.com/kubescape/sandbox-gateway/internal/policysource"
 	"github.com/kubescape/sandbox-gateway/pkg/plugin"
 )
 
@@ -48,10 +51,16 @@ func (s stubTable) Binding(id uint64) (conntable.Binding, bool, error) {
 	return conntable.Binding{BindingID: 1, Posture: s.posture}, true, nil
 }
 
-func stubLookup(context.Context, uint64) (lookup.Workload, time.Time, error) {
-	w := lookup.Workload{Namespace: "it", Pod: "it-pod", Container: "main", BindingID: 1}
-	w.Controller.Kind, w.Controller.Name = "Deployment", "it"
-	return w, time.Time{}, nil
+// stubLookup names one fixed workload, covered by refs.
+func stubLookup(refs []plugin.PolicyRef) func(context.Context, uint64) (lookup.Workload, time.Time, error) {
+	return func(context.Context, uint64) (lookup.Workload, time.Time, error) {
+		w := lookup.Workload{Namespace: "it", Pod: "it-pod", Container: "main", BindingID: 1}
+		w.Controller.Kind, w.Controller.Name = "Deployment", "it"
+		for _, r := range refs {
+			w.Policies = append(w.Policies, lookup.PolicyRef{UID: r.UID, Generation: r.Generation})
+		}
+		return w, time.Time{}, nil
+	}
 }
 
 func main() {
@@ -60,12 +69,22 @@ func main() {
 	rejectAll := flag.Bool("reject-all", false, "no connection is in the table, so every request is refused")
 	withEvaluator := flag.Bool("evaluator", false, "register a test evaluator that denies the model "+deniedModel)
 	mode := flag.String("mode", plugin.ModeEnforce, "mode of the test evaluator's verdicts: audit or enforce")
+	policiesFile := flag.String("policies", "", "YAML file of policy objects to use instead of an API server; they all cover the stub pod")
 	flag.Parse()
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(log)
 	cfg.Log = log
 	cfg.Conns = stubTable{posture: *posture, rejectAll: *rejectAll}
-	cfg.Lookup = stubLookup
+	var refs []plugin.PolicyRef
+	if *policiesFile != "" {
+		static, err := policysource.LoadStatic(*policiesFile)
+		if err != nil {
+			log.Error("load the policies", "error", err)
+			os.Exit(1)
+		}
+		cfg.Policies, refs = static, static.Refs()
+	}
+	cfg.Lookup = stubLookup(refs)
 	if *withEvaluator {
 		plugin.Register(testEvaluator{mode: *mode})
 		cfg.Evaluator = plugin.Registered()
