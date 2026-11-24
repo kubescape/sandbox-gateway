@@ -257,10 +257,13 @@ func (s *NodeSet) makeRoom(leftOut int) {
 
 // Observe records a hostname from a workload's DNS answers. It reports
 // whether the set changed. A name joins only when a valid pattern on the
-// node covers it. When the set is full the name waits: an idle learned name
-// is retired for it, and it joins at an Apply after that name has been
-// swept. When every learned name is busy it keeps waiting, and counts as
-// over the cap for as long as it does.
+// node covers it. When the set is full the name waits: the next Apply retires
+// an idle learned name for it, and it joins at an Apply after that name has
+// been swept. When every learned name is busy it keeps waiting, and counts
+// as over the cap for as long as it does.
+//
+// Observe itself never retires a name. It can be called at any moment, and
+// the busy callback is only as fresh as the caller's last reading.
 func (s *NodeSet) Observe(name string) (changed bool) {
 	name = normalize(name)
 	if !validHostname(name) {
@@ -284,10 +287,12 @@ func (s *NodeSet) Observe(name string) (changed bool) {
 		return false
 	}
 	if _, leaving := s.retired[name]; leaving || s.size() >= s.cap {
+		// The name waits. Room is made for it at the next Apply and not here:
+		// which name is idle has to be judged on connection counts read just
+		// before, and a sighting can arrive seconds after the last reading.
 		if len(s.overL) < overCapMemory {
 			s.overL[name] = struct{}{}
 		}
-		s.makeRoom(s.overE + len(s.overL))
 		return false
 	}
 	delete(s.overL, name)

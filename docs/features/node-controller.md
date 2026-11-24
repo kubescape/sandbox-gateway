@@ -180,7 +180,7 @@ Policy objects give two lists. An exact host is in the set as soon as an object 
 One cap covers every name, exact and learned together (default 256). It bounds how many certificates the node mints whatever the policies say.
 
 - An exact host takes a free slot. With none free, the learned name seen longest ago that has no open connections is retired for it, and the host joins once that name has been swept.
-- A sighted name does the same. node-agent posts a sighting once, so the set remembers a name that is waiting.
+- A sighted name does the same. node-agent posts a sighting once, so the set remembers a name that is waiting. A sighting never evicts by itself: which name is idle is decided only in a reconcile, right after the connection counts are read, because a sighting can arrive seconds after the last reading.
 - While a name waits, and when the set is full of exact hosts or busy names, its traffic passes through undecrypted and it is counted in `Counts().OverCap`.
 - Names already in the set keep their place. A new exact host that sorts earlier does not displace one that has a chain.
 

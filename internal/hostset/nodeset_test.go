@@ -134,7 +134,8 @@ func TestEvictedNameSightedAgainWaitsLikeANewcomer(t *testing.T) {
 	w := Wanted{Patterns: []string{"*.openai.azure.com"}}
 	s.Apply(w)
 	s.Observe("a.openai.azure.com")
-	s.Observe("b.openai.azure.com") // retires a
+	s.Observe("b.openai.azure.com") // waits
+	s.Apply(w)                      // retires a for it
 	s.Observe("a.openai.azure.com") // a is on its way out: it waits too
 	if got := s.NamesFor(nil, w.Patterns, nil); len(got) != 0 {
 		t.Fatalf("a is retired and b is waiting, got %v", got)
@@ -267,5 +268,35 @@ func TestObserveRejectsNonHostnames(t *testing.T) {
 		if s.Observe(n) || s.Contains(n) {
 			t.Errorf("%q must not join the set", n)
 		}
+	}
+}
+
+// A sighting can arrive seconds after the connection counts were last read.
+// So Observe must not decide which name is idle: only Apply does, and the
+// caller refreshes the counts right before it.
+func TestObserveNeverRetiresAName(t *testing.T) {
+	busy := busySet{}
+	s := NewNodeSet(1, busy.is)
+	w := Wanted{Patterns: []string{"*.openai.azure.com"}}
+	s.Apply(w)
+	s.Observe("a.openai.azure.com")
+	// The counts on hand say a is idle. A connection has opened on it since.
+	if s.Observe("b.openai.azure.com") {
+		t.Fatal("the set is full")
+	}
+	if c := s.Counts(); c.Evictions != 0 || c.OverCap != 1 {
+		t.Fatalf("a sighting alone must not evict: %+v", c)
+	}
+	if got := s.NamesFor(nil, w.Patterns, nil); !reflect.DeepEqual(got, []string{"a.openai.azure.com"}) {
+		t.Fatalf("a must still be decrypted, got %v", got)
+	}
+	// The caller reads fresh counts, which show the connection, then applies.
+	busy["a.openai.azure.com"] = true
+	s.Apply(w)
+	if c := s.Counts(); c.Evictions != 0 || c.OverCap != 1 {
+		t.Fatalf("a busy name is not evicted: %+v", c)
+	}
+	if got := s.NamesFor(nil, w.Patterns, nil); !reflect.DeepEqual(got, []string{"a.openai.azure.com"}) {
+		t.Fatalf("a must still be decrypted, got %v", got)
 	}
 }
