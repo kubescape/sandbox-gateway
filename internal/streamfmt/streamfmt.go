@@ -62,7 +62,9 @@ type Event struct {
 	Starts   []Item // items whose first event this is
 	Stops    bool   // this event ends item Index
 	// ToolCalls are the tool calls an OpenAI chat chunk carries.
-	ToolCalls  []ToolRef
+	ToolCalls []ToolRef
+	// Finished are the OpenAI chat choices this chunk gives a finish reason.
+	Finished   []int
 	StopReason string
 	Done       bool // the stream is complete
 }
@@ -164,6 +166,7 @@ func chatEvent(p payload) Event {
 	for _, c := range p.Choices {
 		if c.FinishReason != nil && *c.FinishReason != "" {
 			e.StopReason = *c.FinishReason
+			e.Finished = append(e.Finished, c.Index)
 		}
 		for _, tc := range c.Delta.ToolCalls {
 			e.ToolCalls = append(e.ToolCalls, ToolRef{Choice: c.Index, Index: tc.Index})

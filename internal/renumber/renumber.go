@@ -82,7 +82,7 @@ type queued struct {
 // New returns an editor that removes the items remove picks.
 func New(remove Filter) *Editor {
 	e := &Editor{remove: remove, seen: map[itemKey]bool{}, undecided: map[itemKey]bool{}}
-	e.parser.MaxLine, e.parser.MaxEvent = maxLine, maxEvent
+	e.parser.MaxLine, e.parser.MaxEvent, e.parser.MarkDrops = maxLine, maxEvent, true
 	return e
 }
 
@@ -100,19 +100,21 @@ func (e *Editor) Feed(chunk []byte) ([]byte, error) {
 	if e.through {
 		return chunk, nil
 	}
-	droppedBefore := e.parser.Dropped
 	events := e.parser.Feed(chunk)
-	if e.parser.Dropped != droppedBefore {
-		if e.format == streamfmt.Unknown {
-			return e.passThrough(chunk), nil
-		}
-		return nil, e.fail()
-	}
 	carried := len(e.pending)
 	e.pending = append(e.pending, chunk...)
 	var out []byte
 	start := 0
+	// Events and drops come in stream order, so the format a drop is judged
+	// by is the one the events before it showed, wherever the chunk
+	// boundaries fall.
 	for _, ev := range events {
+		if ev.Dropped {
+			if e.format == streamfmt.Unknown {
+				return append(out, e.passThrough(start)...), nil
+			}
+			return nil, e.fail()
+		}
 		end := carried + ev.End
 		out = append(out, e.event(ev, e.pending[start:end])...)
 		start = end
@@ -120,7 +122,7 @@ func (e *Editor) Feed(chunk []byte) ([]byte, error) {
 	e.pending = append(e.pending[:0], e.pending[start:]...)
 	if len(e.pending)+e.queued > maxPending {
 		if e.format == streamfmt.Unknown {
-			return append(out, e.passThrough(nil)...), nil
+			return append(out, e.passThrough(0)...), nil
 		}
 		return nil, e.fail()
 	}
@@ -128,10 +130,10 @@ func (e *Editor) Feed(chunk []byte) ([]byte, error) {
 }
 
 // passThrough stops editing a stream whose format is not one the editor knows:
-// it returns what it holds and chunk, and Feed returns later chunks as they
-// come.
-func (e *Editor) passThrough(chunk []byte) []byte {
-	out := append(e.pending, chunk...)
+// it returns the bytes it holds from start on, and Feed returns later chunks
+// as they come.
+func (e *Editor) passThrough(start int) []byte {
+	out := e.pending[start:]
 	e.through, e.pending = true, nil
 	return out
 }
@@ -159,6 +161,13 @@ func (e *Editor) Flush() []byte {
 	var out []byte
 	start := 0
 	for _, ev := range e.parser.Close() {
+		if ev.Dropped {
+			if e.format == streamfmt.Unknown {
+				return append(out, e.passThrough(start)...)
+			}
+			e.fail()
+			return nil
+		}
 		out = append(out, e.event(ev, e.pending[start:])...)
 		start = len(e.pending)
 	}
@@ -205,8 +214,8 @@ func (e *Editor) event(ev sse.Event, raw []byte) []byte {
 // chatEvent handles an OpenAI chat event. A tool call is judged at its first
 // chunk that carries its id or name. Until every call in flight has had one,
 // the events are held, so a call named in a later chunk is still judged with
-// its name. The end of the choices (a finish reason, or [DONE]) settles the
-// calls that never got one.
+// its name. A choice's finish reason settles that choice's calls that never
+// got one; [DONE], or the end of the stream, settles the rest.
 func (e *Editor) chatEvent(ev sse.Event, raw []byte, p streamfmt.Event) []byte {
 	for _, it := range p.Starts {
 		delete(e.undecided, itemKey{it.Choice, it.Index})
@@ -216,27 +225,47 @@ func (e *Editor) chatEvent(ev sse.Event, raw []byte, p streamfmt.Event) []byte {
 			e.undecided[k] = true
 		}
 	}
-	if len(e.undecided) > 0 && !p.Done && p.StopReason == "" {
+	for _, c := range p.Finished {
+		e.judgeUnnamed(func(k itemKey) bool { return k.choice == c })
+	}
+	if p.Done {
+		e.judgeUnnamed(func(itemKey) bool { return true })
+	}
+	if len(e.undecided) > 0 {
 		e.queue = append(e.queue, queued{ev, bytes.Clone(raw), p})
 		e.queued += len(raw)
 		return nil
 	}
-	return append(e.settle(), e.chat(ev, raw, p)...)
+	return append(e.release(), e.chat(ev, raw, p)...)
 }
 
-// settle judges the tool calls that never got a name and returns the held
-// chat events, edited.
-func (e *Editor) settle() []byte {
+// judgeUnnamed asks the filter about the calls still waiting on a name that
+// match, with what they have: no name.
+func (e *Editor) judgeUnnamed(match func(itemKey) bool) {
 	for k := range e.undecided {
-		e.seen[k] = e.remove(streamfmt.Item{Format: streamfmt.OpenAIChat, Choice: k.choice, Index: k.index, Kind: "function"})
-		delete(e.undecided, k)
+		if match(k) {
+			e.seen[k] = e.remove(streamfmt.Item{Format: streamfmt.OpenAIChat, Choice: k.choice, Index: k.index, Kind: "function"})
+			delete(e.undecided, k)
+		}
 	}
+}
+
+// release returns the held chat events, edited. Every call they carry has
+// been judged.
+func (e *Editor) release() []byte {
 	var out []byte
 	for _, q := range e.queue {
 		out = append(out, e.chat(q.ev, q.raw, q.p)...)
 	}
 	e.queue, e.queued = nil, 0
 	return out
+}
+
+// settle judges every call still waiting on a name and returns the held chat
+// events, edited. It runs at the end of the stream.
+func (e *Editor) settle() []byte {
+	e.judgeUnnamed(func(itemKey) bool { return true })
+	return e.release()
 }
 
 func hasKey(m map[itemKey]bool, k itemKey) bool {

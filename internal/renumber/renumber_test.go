@@ -522,3 +522,55 @@ func TestRewriteKeepsOtherLines(t *testing.T) {
 		t.Fatalf("output:\n%q\nwant suffix\n%q", out, want)
 	}
 }
+
+// Review: whether an oversized event fails the stream must not depend on
+// where the chunks split. A drop is judged by the events that came before it.
+func TestOversizeJudgedInStreamOrder(t *testing.T) {
+	big := ev("content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"`+strings.Repeat("A", 5<<20)+`"}}`)
+	known := aStart + big + aEnd
+	for _, chunks := range [][]string{{known}, {aStart, big + aEnd}, {aStart + big[:100], big[100:] + aEnd}} {
+		out, err := feedAll(New(named("bash")), chunks...)
+		if !errors.Is(err, ErrEventTooLarge) {
+			t.Fatalf("%d chunks: err = %v, want ErrEventTooLarge", len(chunks), err)
+		}
+		if strings.Contains(out, "AAAA") {
+			t.Fatalf("%d chunks: the oversized event was forwarded", len(chunks))
+		}
+	}
+	// A drop before any known event passes the stream through, also when an
+	// Anthropic-looking event follows in the same chunk.
+	unknown := ev("message", `{"text":"`+strings.Repeat("A", 5<<20)+`"}`) + aStart + aBlock(0, "tool_use", "bash")
+	for _, chunks := range [][]string{{unknown}, {unknown[:100], unknown[100:]}} {
+		out, err := feedAll(New(named("bash")), chunks...)
+		if err != nil || out != unknown {
+			t.Fatalf("%d chunks: err = %v, changed = %v", len(chunks), err, out != unknown)
+		}
+	}
+}
+
+// Review: one choice finishing must not settle another choice's tool call
+// that is still waiting for its name.
+func TestChatFinishSettlesOnlyItsChoice(t *testing.T) {
+	chunk := func(choices string) string {
+		return ev("", `{"id":"c","object":"chat.completion.chunk","choices":[`+choices+`]}`)
+	}
+	unnamed := func(c int) string {
+		return fmt.Sprintf(`{"index":%d,"delta":{"tool_calls":[{"index":0,"function":{"arguments":""}}]},"finish_reason":null}`, c)
+	}
+	s := chunk(unnamed(0)+","+unnamed(1)) +
+		chunk(`{"index":0,"delta":{},"finish_reason":"tool_calls"}`) +
+		chunk(`{"index":1,"delta":{"tool_calls":[{"index":0,"id":"call_b","type":"function","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":null}`) +
+		chunk(`{"index":1,"delta":{},"finish_reason":"tool_calls"}`) + ev("", "[DONE]")
+	var asked []streamfmt.Item
+	out := run(func(it streamfmt.Item) bool { asked = append(asked, it); return it.Name == "bash" }, s)
+	if strings.Contains(out, "call_b") {
+		t.Fatalf("choice 1's bash call was forwarded:\n%s", out)
+	}
+	want := []streamfmt.Item{
+		{Format: streamfmt.OpenAIChat, Choice: 0, Index: 0, Kind: "function"},
+		{Format: streamfmt.OpenAIChat, Choice: 1, Index: 0, Kind: "function", Name: "bash"},
+	}
+	if !reflect.DeepEqual(asked, want) {
+		t.Fatalf("asked = %+v", asked)
+	}
+}
