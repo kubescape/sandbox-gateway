@@ -23,6 +23,7 @@ import (
 	"github.com/kubescape/sandbox-gateway/internal/conntable"
 	"github.com/kubescape/sandbox-gateway/internal/extproc"
 	"github.com/kubescape/sandbox-gateway/internal/otlpemit"
+	"github.com/kubescape/sandbox-gateway/internal/renumber"
 	"github.com/kubescape/sandbox-gateway/internal/runutil"
 	"github.com/kubescape/sandbox-gateway/internal/stale"
 	"github.com/kubescape/sandbox-gateway/pkg/plugin"
@@ -45,6 +46,8 @@ type Config struct {
 	HealthSocket string
 	ChunkBudget  time.Duration
 	Faults       extproc.Faults
+	// Remove is extproc.Config.Remove; only test programs set it.
+	Remove       func() renumber.Filter
 	RecordsFile  string // also append records here as JSON lines
 	OTLPEndpoint string
 	DebugAddr    string
@@ -129,6 +132,7 @@ func Run(ctx context.Context, c Config) error {
 		Conns:             c.Conns,
 		Lookup:            c.Lookup,
 		Faults:            c.Faults,
+		Remove:            c.Remove,
 		ChunkBudget:       c.ChunkBudget,
 		Log:               log,
 		Emit: func(r extproc.Record) {

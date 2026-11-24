@@ -37,6 +37,7 @@ import (
 	"github.com/kubescape/sandbox-gateway/internal/conntable"
 	"github.com/kubescape/sandbox-gateway/internal/eventstream"
 	"github.com/kubescape/sandbox-gateway/internal/lookup"
+	"github.com/kubescape/sandbox-gateway/internal/renumber"
 	"github.com/kubescape/sandbox-gateway/internal/sse"
 	"github.com/kubescape/sandbox-gateway/internal/stale"
 	"github.com/kubescape/sandbox-gateway/internal/streamfmt"
@@ -112,8 +113,13 @@ type Config struct {
 	// Stale decides when a workload's policy is too old to trust. nil means a
 	// tracker with DefaultStaleAfter.
 	Stale *stale.Tracker
-	Emit  func(Record) // called once per transaction; default logs JSON
-	Log   *slog.Logger
+	// Remove, when set, is called once per SSE response for the filter that
+	// picks the streamed items to remove; the rest are renumbered
+	// (internal/renumber). Removal has no rule yet (plan decision 8): only
+	// test programs set it.
+	Remove func() renumber.Filter
+	Emit   func(Record) // called once per transaction; default logs JSON
+	Log    *slog.Logger
 }
 
 // DefaultStaleAfter is how long a workload's policy may go without a source
@@ -202,7 +208,7 @@ type Record struct {
 	WatchdogFired     bool     `json:"watchdog_fired,omitempty"`
 	WebSocket         *WSStats `json:"websocket,omitempty"`
 	ObservabilityMode bool     `json:"observability_mode,omitempty"`
-	Ended             string   `json:"ended"` // eos | trailers | stream_closed | stream_error | watchdog | denied | rejected
+	Ended             string   `json:"ended"` // eos | trailers | stream_closed | stream_error | watchdog | edit_error | denied | rejected
 }
 
 // Verdict is the evaluator's verdict as the record carries it.
@@ -295,6 +301,7 @@ type txn struct {
 	reqEOSAt           time.Time
 	parser             sse.Parser
 	es                 *eventstream.Decoder // set when the response is a Bedrock event stream
+	editor             *renumber.Editor     // set when Config.Remove is
 	procTotal          time.Duration
 	track              streamfmt.Tracker // items and stop reason of the response stream
 	eosSent            bool
@@ -758,6 +765,9 @@ func (s *Server) responseChunk(stream extprocv3.ExternalProcessor_ProcessServer,
 		}
 	} else {
 		t.sseChunk(s, chunk, &forward, &eos)
+		if s.cfg.Remove != nil && !t.rec.EarlyEOS {
+			forward, eos = s.edit(t, forward, eos)
+		}
 	}
 
 	elapsed := time.Since(start)
@@ -776,6 +786,27 @@ func (s *Server) responseChunk(stream extprocv3.ExternalProcessor_ProcessServer,
 		}
 	}
 	return resp, nil
+}
+
+// edit runs the renumber editor over the bytes about to be forwarded. The
+// record still counts the stream as the provider sent it. An event too large
+// to edit ends the stream with the evaluator's StreamError (fail closed):
+// forwarding it unedited could leak a removed item.
+func (s *Server) edit(t *txn, forward []byte, eos bool) ([]byte, bool) {
+	if t.editor == nil {
+		t.editor = renumber.New(s.cfg.Remove())
+	}
+	out, err := t.editor.Feed(forward)
+	if err != nil {
+		s.cfg.Log.Warn("response edit failed; ending the stream", "txn", t.rec.TransactionID, "error", err)
+		t.eosSent = true
+		t.rec.Ended = "edit_error"
+		return append(out, s.streamError(t, "edit")...), true
+	}
+	if eos {
+		out = append(out, t.editor.Flush()...)
+	}
+	return out, eos
 }
 
 // sseChunk parses an SSE response chunk, tracks the Anthropic events, and

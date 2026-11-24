@@ -95,6 +95,16 @@ jobs:
       - name: Streamed call through Envoy
         run: test/integration/run.sh
 
+  sdk:
+    name: SDK streams
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false }
+      - name: Provider SDKs on streams with a tool call removed
+        run: test/integration/run.sh
+        env: { SDK: "1" }
+
   smoke:
     name: Processor image smoke
     runs-on: ubuntu-latest

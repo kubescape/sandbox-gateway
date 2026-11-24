@@ -8,7 +8,9 @@
 // With -policies the policy objects come from a YAML file instead of an API
 // server, and the stub pod is covered by all of them.
 // With -evaluator a test evaluator is registered that denies requests for
-// the model "denied-model", in the mode -mode gives.
+// the model "denied-model", in the mode -mode gives. With -remove-first-tool
+// the first tool or function call of each streamed response is removed and
+// the items after it renumbered, for the SDK job.
 package main
 
 import (
@@ -25,6 +27,8 @@ import (
 	"github.com/kubescape/sandbox-gateway/internal/conntable"
 	"github.com/kubescape/sandbox-gateway/internal/lookup"
 	"github.com/kubescape/sandbox-gateway/internal/policysource"
+	"github.com/kubescape/sandbox-gateway/internal/renumber"
+	"github.com/kubescape/sandbox-gateway/internal/streamfmt"
 	"github.com/kubescape/sandbox-gateway/pkg/plugin"
 )
 
@@ -63,12 +67,26 @@ func stubLookup(refs []plugin.PolicyRef) func(context.Context, uint64) (lookup.W
 	}
 }
 
+// firstTool returns a filter that removes the first tool or function call
+// item of one response.
+func firstTool() renumber.Filter {
+	done := false
+	return func(it streamfmt.Item) bool {
+		if done || (it.Kind != "tool_use" && it.Kind != "function" && it.Kind != "function_call") {
+			return false
+		}
+		done = true
+		return true
+	}
+}
+
 func main() {
 	cfg := app.Flags(flag.CommandLine)
 	posture := flag.String("posture", conntable.PostureAllow, "fail posture of the stub pod: allow or deny")
 	rejectAll := flag.Bool("reject-all", false, "no connection is in the table, so every request is refused")
 	withEvaluator := flag.Bool("evaluator", false, "register a test evaluator that denies the model "+deniedModel)
 	mode := flag.String("mode", plugin.ModeEnforce, "mode of the test evaluator's verdicts: audit or enforce")
+	removeFirstTool := flag.Bool("remove-first-tool", false, "remove the first tool or function call item of each streamed response")
 	policiesFile := flag.String("policies", "", "YAML file of policy objects to use instead of an API server; they all cover the stub pod")
 	flag.Parse()
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -85,12 +103,16 @@ func main() {
 		cfg.Policies, refs = static, static.Refs()
 	}
 	cfg.Lookup = stubLookup(refs)
+	if *removeFirstTool {
+		cfg.Remove = firstTool
+	}
 	if *withEvaluator {
 		plugin.Register(testEvaluator{mode: *mode})
 		cfg.Evaluator = plugin.Registered()
 	}
 	log.Warn("integration test build: stub connection table and lookup",
-		"reject_all", *rejectAll, "posture", *posture, "evaluator", *withEvaluator, "mode", *mode)
+		"reject_all", *rejectAll, "posture", *posture, "evaluator", *withEvaluator, "mode", *mode,
+		"remove_first_tool", *removeFirstTool)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()

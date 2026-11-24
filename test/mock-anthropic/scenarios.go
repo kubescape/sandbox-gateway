@@ -54,9 +54,15 @@ func anthropicScenario(w http.ResponseWriter, model string) bool {
 	w.Header().Set("content-type", "text/event-stream")
 	aStart(w, model)
 	switch model {
-	case "s4-a-baseline": // text, tool, text; stop_reason tool_use
+	case "s4-a-baseline": // text, tool; stop_reason tool_use
 		aText(w, 0, "Let me look.")
 		aTool(w, 1)
+		aEnd(w, "tool_use")
+	case "s4-a-text-tool-text": // text, tool, text; stop_reason tool_use. Removing the
+		// tool renumbers the second text block, which s4-a-baseline cannot show.
+		aText(w, 0, "Let me look.")
+		aTool(w, 1)
+		aText(w, 2, "Done.")
 		aEnd(w, "tool_use")
 	case "s4-a-renumbered": // tool removed, later block renumbered, stop rewritten
 		aText(w, 0, "Let me look.")

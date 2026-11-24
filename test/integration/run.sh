@@ -9,6 +9,11 @@
 # must not be able to choose the address the processor looks it up by, with an
 # X-Forwarded-For header or a PROXY protocol header. The shipped processor image must
 # refuse to start without the kernel tables.
+#
+# SDK=1 runs the SDK job instead: the processor removes the first tool or
+# function call of each response (-remove-first-tool), and the Python and Node
+# provider SDKs stream three scenarios through Envoy, trusting only the gateway
+# CA. test/sdk/check.py checks what they saw.
 set -euo pipefail
 cd "$(dirname "$0")"
 export ENVOY_VERSION="${ENVOY_VERSION:-v1.40.2}"
@@ -25,7 +30,27 @@ cleanup() {
 trap cleanup EXIT
 
 ./make-envoy-config.sh
+mkdir -p generated
 "${COMPOSE[@]}" build
+
+if [ "${SDK:-}" = 1 ]; then
+  export IT_POLICIES=./policies-sdk.yaml PROCESSOR_EDIT=--remove-first-tool
+  "${COMPOSE[@]}" --profile sdk build sdk-python sdk-node
+  "${COMPOSE[@]}" up -d
+  echo "--- SDKs on streams with the first tool call removed"
+  # Retries: the first run can race Envoy's listener coming up.
+  for _ in 1 2 3; do
+    "${COMPOSE[@]}" --profile sdk run --rm -T sdk-python > generated/sdk-python.jsonl && break
+    sleep 2
+  done
+  "${COMPOSE[@]}" --profile sdk run --rm -T sdk-node > generated/sdk-node.jsonl
+  cat generated/sdk-python.jsonl generated/sdk-node.jsonl
+  "${COMPOSE[@]}" --profile sdk run --rm -T -v "$PWD/generated:/out:ro" sdk-python \
+    python check.py /out/sdk-python.jsonl /out/sdk-node.jsonl
+  echo "PASS"
+  exit 0
+fi
+
 "${COMPOSE[@]}" --profile tools build processor-image
 "${COMPOSE[@]}" up -d
 echo "--- envoy version"

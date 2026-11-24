@@ -1,0 +1,9 @@
+# The Node SDK client for the SDK job (test/integration/run.sh with SDK=1).
+# --use-openssl-ca with SSL_CERT_FILE makes the gateway CA the only trusted
+# one, in place of Node's bundled roots.
+FROM node:22-slim
+WORKDIR /sdk
+RUN npm init -y >/dev/null && npm install --save-exact @anthropic-ai/sdk@1.6.0 openai@7.53.0
+COPY test/sdk/s4_sdks.mjs ./
+ENV SSL_CERT_FILE=/certs/ca.crt NODE_OPTIONS=--use-openssl-ca
+CMD ["node", "s4_sdks.mjs"]

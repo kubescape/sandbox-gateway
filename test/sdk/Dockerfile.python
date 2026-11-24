@@ -1,0 +1,7 @@
+# The Python SDK client for the SDK job (test/integration/run.sh with SDK=1).
+FROM python:3.13-slim
+RUN pip install --no-cache-dir anthropic==2.6.0 openai==3.46.0
+WORKDIR /sdk
+COPY test/sdk/s4_sdks.py test/sdk/check.py ./
+ENV GATEWAY_CA=/certs/ca.crt
+CMD ["python", "s4_sdks.py"]
