@@ -170,8 +170,10 @@ func chatEvent(p payload) Event {
 		}
 		for _, tc := range c.Delta.ToolCalls {
 			e.ToolCalls = append(e.ToolCalls, ToolRef{Choice: c.Index, Index: tc.Index})
-			// Only the first chunk of a tool call carries its id and name.
-			if tc.ID != "" || tc.Function.Name != "" {
+			// A tool call starts, for a filter, at the chunk that names it.
+			// Providers send the id and the name in the first chunk, but one
+			// that sends the id first must not have the call judged nameless.
+			if tc.Function.Name != "" {
 				kind := tc.Type
 				if kind == "" {
 					kind = "function"
