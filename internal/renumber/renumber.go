@@ -165,7 +165,7 @@ func (e *Editor) Flush() []byte {
 			if e.format == streamfmt.Unknown {
 				return append(out, e.passThrough(start)...)
 			}
-			e.fail()
+			_ = e.fail() // Flush has no error to return: the stream ends either way
 			return nil
 		}
 		out = append(out, e.event(ev, e.pending[start:])...)
