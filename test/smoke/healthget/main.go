@@ -1,7 +1,7 @@
 // Command healthget asks the processor's health socket for
 // GET /healthz/processor and prints the status code and the body on one
-// line. With "idle" it waits forever, so a pod can keep it as a container to
-// exec into.
+// line. With "idle" it waits for SIGTERM, so a pod can keep it as a container
+// to exec into.
 package main
 
 import (
@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 )
 
@@ -20,7 +22,13 @@ func main() {
 		os.Exit(2)
 	}
 	if os.Args[1] == "idle" {
-		select {}
+		// Not an empty select: with no other goroutine the runtime calls that a
+		// deadlock and exits. As PID 1 the process must also handle SIGTERM
+		// itself, or the pod waits out its grace period.
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGTERM, os.Interrupt)
+		<-sig
+		return
 	}
 	sock := os.Args[1]
 	c := http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
