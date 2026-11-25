@@ -23,7 +23,7 @@ scope: repo
 - Latency budget: +10 ms p99 time to first token, +1 ms p99 per streamed chunk, measured with `test/latbench`.
 - One identity source: the `conns` table, keyed on the pod socket's address and port, which Envoy reports as `source.address`. The processor never trusts an identity the client sends. A PROXY protocol identity is ignored and flagged.
 - A connection with no `conns` entry is rejected.
-- Bodies are parsed as streams. A 30 MiB prompt stays under 16 MiB of processor memory.
+- Bodies are parsed as streams. A 30 MiB prompt grows the processor's live heap by less than 16 MiB (task 6.3).
 - Policy counts as stale after five minutes without a source. That value and the watchdog budget are flags; the defaults are 5m and 3s.
 - A degraded decision follows the pod's fail posture, read from the `bindings` table and never from the cached sections.
 - Records carry no bodies.
@@ -49,7 +49,7 @@ The ticket leaves these open. Each is small, and each is stated here so a review
 ## Open items that need an answer
 
 1. `HTTPSection` does not exist yet. C6 and C11 use `v1alpha1.HTTPSection` from `kubescape/storage`. On 2026-11-22 the storage `main` branch has no `http` section and SUB-9943 is in To Do. PRs 2 and 3 below do not need the type. PRs 4, 5 and 6 do. The recommendation is to land the storage types first and pin PR 4 to that commit. The fallback, if the storage change slips, is to pin a pseudo-version of its branch. That is temporary: it is not a reproducible build and breaks if the branch is rewritten, so it is replaced by the merge commit on storage `main` as soon as the change merges, before PR 4 leaves draft. A local stand-in type would guess field names that are not fixed yet, so this plan does not use one.
-2. `request_position` on HTTP/2. C7 asks for the HTTP/2 stream id. Envoy's ext_proc attributes do not obviously carry it. Task 6.1 is a short spike. If Envoy cannot supply it, work stops there and the question goes back to the contract owner, because the backend join depends on that field.
+2. `request_position` on HTTP/2. C7 asks for the HTTP/2 stream id. Envoy's ext_proc attributes do not obviously carry it. Task 6.1 is a short spike. If Envoy cannot supply it, work stops there and the question goes back to the contract owner, because the backend join depends on that field. Status 2026-11-25: the spike found no stream id in Envoy 1.40, and an HTTP/1.1 count per connection cannot be proven continuous across a processor restart, so the processor never sends `request_position` (PR 6, `docs/features/processor.md`, "Request position"). The backend owner was asked on SUB-9954 whether its fallback join (the connection plus method, path and a time window) covers both protocols with the record's completion timestamp. No answer yet.
 
 ## Pull requests
 
@@ -398,7 +398,9 @@ The fixture binary covers behaviour with stub maps and a static policy source. T
 
 **Files:** create `internal/extproc/memory_test.go`.
 
-- [ ] `TestThirtyMiBPromptUnder16MiB`: a fake evaluator whose `Classify` uses `jsonscan.Fields`, enforce mode, a 30 MiB body sent in 64 KiB chunks from one reused buffer over `bufconn`. A sampler reads `runtime.MemStats.HeapAlloc` every millisecond; peak minus the baseline after `runtime.GC()` is under 16 MiB. Fix whatever it finds. Commit.
+- [x] `TestThirtyMiBPromptUnder16MiB`: a fake evaluator whose `Classify` uses `jsonscan.Fields`, enforce mode, a 30 MiB body sent in 64 KiB chunks from one reused buffer. A sampler reads the heap every millisecond; growth over the baseline after `runtime.GC()` is under 16 MiB. Fix whatever it finds. Commit.
+
+**Metric, agreed 2026-11-25 (changed from peak `HeapAlloc`).** The budget is for the processor's live heap (`/gc/heap/live:bytes`, what each GC finds still reachable), measured with the processor in a child process so the test client's allocations do not count. Peak `HeapAlloc` is logged, not asserted. It also counts each chunk's short-lived copies (gRPC's receive buffer, protobuf's copy of the body) until the next GC collects them, so its peak measures GC pacing, which `GOGC` and `GOMEMLIMIT` set, not what the processor keeps. Measured: live heap grows about 11 MiB for a 30 MiB prompt, and 10 to 12 MiB for 10 to 60 MiB; peak `HeapAlloc` grows about 20 to 22 MiB. Meeting 16 MiB on peak `HeapAlloc` would take a GC setting made for the test, or a gRPC codec that avoids the copies.
 
 ### Task 6.4: SDKs on renumbered streams
 
