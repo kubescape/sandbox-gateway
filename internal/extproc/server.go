@@ -177,9 +177,6 @@ type Record struct {
 	Method        string    `json:"method,omitempty"`
 	Path          string    `json:"path,omitempty"`
 	Protocol      string    `json:"protocol,omitempty"` // request.protocol from Envoy
-	// RequestPosition is the request's ordinal on its HTTP/1.x connection,
-	// from 1; 0 on HTTP/2, where it is not known.
-	RequestPosition int `json:"request_position,omitempty"`
 	// Provider and Model are what the evaluator's Classify returned.
 	Provider string   `json:"provider,omitempty"`
 	Model    string   `json:"model,omitempty"`
@@ -245,7 +242,6 @@ type Server struct {
 	feeders atomic.Int64 // goroutines writing a request chunk to the evaluator
 	// degraded counts the transactions decided with a degraded decision.
 	degraded atomic.Int64
-	pos      *positions
 	Active   atomic.Int64
 	Total    atomic.Int64
 }
@@ -273,7 +269,7 @@ func New(cfg Config) *Server {
 	if cfg.Stale == nil {
 		cfg.Stale = stale.New(DefaultStaleAfter, time.Now)
 	}
-	return &Server{cfg: cfg, calls: newCalls(cfg.MaxEvaluatorCalls), pos: newPositions(time.Now)}
+	return &Server{cfg: cfg, calls: newCalls(cfg.MaxEvaluatorCalls)}
 }
 
 // budget bounds one evaluator call or one write of the body to it.
@@ -577,8 +573,6 @@ func (s *Server) handle(stream extprocv3.ExternalProcessor_ProcessServer, t *txn
 			f := a.GetFields()
 			t.rec.Downstream = f["source.address"].GetStringValue()
 			t.rec.Protocol = f["request.protocol"].GetStringValue()
-			id, hasID := f["connection.id"]
-			t.rec.RequestPosition = s.pos.next(uint64(id.GetNumberValue()), hasID, t.rec.Downstream, t.rec.Protocol)
 		}
 		if reason := s.identify(stream.Context(), t); reason != "" {
 			t.rec.Ended, t.rec.RejectReason = "rejected", reason
@@ -720,6 +714,17 @@ func (s *Server) handle(stream extprocv3.ExternalProcessor_ProcessServer, t *txn
 			for _, ev := range t.parser.Close() {
 				t.rec.SSEEvents++
 				t.trackEvent(ev)
+			}
+			// The editor holds an event until it is complete, and one ended
+			// by a lone CR completes only at the end: forward what it still
+			// holds before the trailers, or it is lost.
+			if t.editor != nil {
+				if out := t.editor.Flush(); len(out) > 0 {
+					if err := t.send(stream, &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ResponseBody{
+						ResponseBody: streamed(out, false)}}); err != nil {
+						return nil, err
+					}
+				}
 			}
 		}
 		return &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ResponseTrailers{

@@ -156,37 +156,21 @@ func requestOn(t *testing.T, h *harness, connID float64, protocol string) any {
 	return h.waitRecords(t, before+1)[before].C7().Attrs()["request_position"]
 }
 
-func TestRequestPositionOnHTTP1(t *testing.T) {
-	_, h := start(t, Config{})
-	for want := 1; want <= 3; want++ {
-		if got := requestOn(t, h, 7, "HTTP/1.1"); got != want {
-			t.Fatalf("request %d on connection 7: position %v", want, got)
+// Review: the processor cannot tell from what Envoy sends that it saw a
+// connection's first request (a restart, or an evicted count, looks like a
+// new connection), so it never sends a position: the backend's fallback join
+// applies. Two servers stand in for a processor before and after a restart,
+// seeing requests on one open HTTP/1.1 connection.
+func TestNoRequestPositionAcrossRestart(t *testing.T) {
+	for _, srv := range []string{"before restart", "after restart"} {
+		_, h := start(t, Config{})
+		for i := 0; i < 2; i++ {
+			if got := requestOn(t, h, 7, "HTTP/1.1"); got != nil {
+				t.Fatalf("%s, request %d: position %v", srv, i+1, got)
+			}
 		}
-	}
-	if got := requestOn(t, h, 8, "HTTP/1.1"); got != 1 {
-		t.Fatalf("first request on connection 8: position %v", got)
-	}
-	if got := requestOn(t, h, 9, "HTTP/2"); got != nil {
-		t.Fatalf("HTTP/2 request has a position: %v", got)
-	}
-}
-
-func TestPositionsNeverGuessAfterOverflow(t *testing.T) {
-	p := newPositions(time.Now)
-	for id := uint64(1); id <= maxPositions; id++ {
-		p.next(id, true, testSource, "HTTP/1.1")
-	}
-	if n := p.next(maxPositions+1, true, testSource, "HTTP/1.1"); n != 0 {
-		t.Fatalf("a connection the full map turned away got position %d", n)
-	}
-	delete(p.conns, connKey{1, testSource}) // room again
-	if n := p.next(maxPositions+1, true, testSource, "HTTP/1.1"); n != 0 {
-		t.Fatalf("the turned-away connection got position %d later", n)
-	}
-	if n := p.next(maxPositions+2, true, testSource, "HTTP/1.1"); n != 1 {
-		t.Fatalf("a newer connection got position %d", n)
-	}
-	if n := p.next(5, false, testSource, "HTTP/1.1"); n != 0 {
-		t.Fatalf("no connection id: position %d", n)
+		if got := requestOn(t, h, 9, "HTTP/2"); got != nil {
+			t.Fatalf("%s, HTTP/2: position %v", srv, got)
+		}
 	}
 }

@@ -52,3 +52,44 @@ func TestRemoveRenumbersTheForwardedStream(t *testing.T) {
 		t.Fatalf("record: events %d stop %q", r.SSEEvents, r.StopReason)
 	}
 }
+
+// Review: a response that ends in trailers, whose last event is ended by lone
+// CRs, has that event forwarded before the trailers, not dropped in the editor.
+func TestRemoveFlushesBeforeTrailers(t *testing.T) {
+	_, h := start(t, Config{Remove: removeTools})
+	st := h.stream(t)
+	sendHeaders(t, st)
+	sendBody(t, st, reqBody, true)
+	recv(t, st)
+	must(t, st.Send(&extprocv3.ProcessingRequest{Request: &extprocv3.ProcessingRequest_ResponseHeaders{
+		ResponseHeaders: &extprocv3.HttpHeaders{Headers: hdrs(":status", "200", "content-type", "text/event-stream")}}}))
+	recv(t, st)
+	chunks := append([]string(nil), textToolText[:4]...)
+	chunks = append(chunks, "event: message_delta\rdata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\r\revent: message_stop\rdata: {\"type\":\"message_stop\"}\r\r")
+	var out strings.Builder
+	for _, c := range chunks {
+		must(t, st.Send(&extprocv3.ProcessingRequest{Request: &extprocv3.ProcessingRequest_ResponseBody{
+			ResponseBody: &extprocv3.HttpBody{Body: []byte(c)}}}))
+		out.WriteString(string(recv(t, st).GetResponseBody().GetResponse().GetBodyMutation().GetStreamedResponse().GetBody()))
+	}
+	sendTrailersResp(t, st)
+	flush := recv(t, st)
+	sr := flush.GetResponseBody().GetResponse().GetBodyMutation().GetStreamedResponse()
+	if sr == nil {
+		t.Fatalf("no body before the trailers: %v; forwarded so far: %q", flush, out.String())
+	}
+	out.Write(sr.GetBody())
+	if r := recv(t, st); r.GetResponseTrailers() == nil {
+		t.Fatalf("after the flush, want the trailers answer: %v", r)
+	}
+	must(t, st.CloseSend())
+	if got := out.String(); !strings.Contains(got, `{"type":"message_stop"}`) || strings.Contains(got, `"index":2`) {
+		t.Fatalf("message_stop lost or stream not renumbered:\n%q", got)
+	}
+}
+
+func sendTrailersResp(t *testing.T, st extprocv3.ExternalProcessor_ProcessClient) {
+	t.Helper()
+	must(t, st.Send(&extprocv3.ProcessingRequest{Request: &extprocv3.ProcessingRequest_ResponseTrailers{
+		ResponseTrailers: &extprocv3.HttpTrailers{}}}))
+}

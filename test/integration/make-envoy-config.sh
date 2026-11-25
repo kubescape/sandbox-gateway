@@ -15,6 +15,12 @@ s = s.replace(old, new).rstrip() + """
   - name: mock_anthropic
     type: STRICT_DNS
     connect_timeout: 1s
+    # The mock's s4-a-trailers response ends in an HTTP/1.1 trailer; Envoy drops those
+    # unless asked, and the SDK run checks the processor's trailers path with it.
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config: { http_protocol_options: { enable_trailers: true } }
     load_assignment:
       cluster_name: mock_anthropic
       endpoints: [{ lb_endpoints: [{ endpoint: { address: { socket_address: { address: mock-anthropic, port_value: 8080 } } } }] }]

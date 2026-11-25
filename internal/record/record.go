@@ -52,8 +52,9 @@ type Record struct {
 
 	// The join key: the pod socket's address and port (as in the conns key),
 	// where the pod was connecting to, and the request's position on its
-	// connection. RequestPosition is 0 when it is not known (HTTP/2), and is
-	// then left out of the attributes.
+	// connection. RequestPosition is 0 when it is not known, and is then left
+	// out of the attributes. The processor never knows it: see "Request
+	// position" in docs/features/processor.md.
 	ConnLocalAddr   string
 	ConnLocalPort   uint16
 	OrigDst         string

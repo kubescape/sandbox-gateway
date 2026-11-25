@@ -17,7 +17,6 @@ func (r Record) C7() record.Record {
 		WouldDeny:               r.WouldDeny,
 		Degraded:                r.Degraded,
 		UpstreamContentEncoding: r.ContentEncoding,
-		RequestPosition:         r.RequestPosition,
 		DestinationState:        record.DestinationInspected,
 		Verdict:                 plugin.ActionAllow,
 	}

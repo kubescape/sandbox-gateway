@@ -45,6 +45,16 @@ if [ "${SDK:-}" = 1 ]; then
   done
   "${COMPOSE[@]}" --profile sdk run --rm -T sdk-node > generated/sdk-node.jsonl
   cat generated/sdk-python.jsonl generated/sdk-node.jsonl
+  echo "--- an edited response that ends in trailers keeps its last event"
+  # s4-a-trailers: the tool is removed, the last event's blank line is a lone CR, and the
+  # body ends with a trailer, so the processor must flush the editor before the trailers.
+  "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt \
+    --model s4-a-trailers | tee generated/trailers.json
+  grep -q '"message_stop":true' generated/trailers.json
+  sleep 1
+  "${COMPOSE[@]}" logs --no-color --no-log-prefix processor | grep '"msg":"transaction"' | tail -1 | tee generated/trailers-record.json
+  grep -q '"ended":"trailers"' generated/trailers-record.json
+
   "${COMPOSE[@]}" --profile sdk run --rm -T -v "$PWD/generated:/out:ro" sdk-python \
     python check.py /out/sdk-python.jsonl /out/sdk-node.jsonl
   echo "PASS"
@@ -68,16 +78,15 @@ grep -q '"stop_reason":"end_turn"' generated/record.json
 grep -Eq '"sse_events":[1-9]' generated/record.json
 grep -q '"pod":"it-pod"' generated/record.json
 
-echo "--- request_position: the ordinal on an HTTP/1.1 connection, none on HTTP/2"
+echo "--- no request_position: the processor cannot prove it saw a connection's first request"
 grep -q '"protocol":"HTTP/2"' generated/record.json
-if grep -q '"request_position"' generated/record.json; then
-  echo "FAIL: an HTTP/2 request has a request_position"; exit 1
-fi
 "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt --http1 --repeat 3 >/dev/null
 sleep 1
-"${COMPOSE[@]}" logs --no-color --no-log-prefix processor | grep '"msg":"transaction"' | tail -3 \
-  | grep -o '"request_position":[0-9]*' | tr '\n' ' ' | tee generated/positions.txt; echo
-[ "$(cat generated/positions.txt)" = '"request_position":1 "request_position":2 "request_position":3 ' ]
+"${COMPOSE[@]}" logs --no-color --no-log-prefix processor | grep '"msg":"transaction"' | tail -3 > generated/http1-records.jsonl
+[ "$(grep -c '"protocol":"HTTP/1.1"' generated/http1-records.jsonl)" = 3 ]
+if grep -q '"request_position"' generated/record.json generated/http1-records.jsonl; then
+  echo "FAIL: a record has a request_position"; exit 1
+fi
 
 echo "--- the test evaluator blocks a request for the denied model, with its DenyResponse"
 "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt \
