@@ -48,12 +48,12 @@ if [ "${SDK:-}" = 1 ]; then
     "${COMPOSE[@]}" logs --no-color origdst 2>/dev/null | grep -q 'attached: SO_ORIGINAL_DST' && break
     sleep 1
   done
+  # Envoy gets its listeners from the node controller after it starts. streamcheck
+  # retries until a streamed call goes through as it-pod; the SDK clients try once.
+  echo "--- the redirect listener serves it-pod"
+  "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:18443 --ca /certs/ca.crt --wait 60s >/dev/null
   echo "--- SDKs on streams with the first tool call removed"
-  # Retries: the first run can race Envoy's listener coming up.
-  for _ in 1 2 3; do
-    "${COMPOSE[@]}" --profile sdk run --rm -T sdk-python > generated/sdk-python.jsonl && break
-    sleep 2
-  done
+  "${COMPOSE[@]}" --profile sdk run --rm -T sdk-python > generated/sdk-python.jsonl
   "${COMPOSE[@]}" --profile sdk run --rm -T sdk-node > generated/sdk-node.jsonl
   cat generated/sdk-python.jsonl generated/sdk-node.jsonl
   echo "--- an edited response that ends in trailers keeps its last event"
