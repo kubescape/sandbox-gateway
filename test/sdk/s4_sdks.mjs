@@ -1,13 +1,27 @@
 // What the Node SDKs see of a stream the processor edited: the same scenarios,
-// modes and output as s4_sdks.py. Node trusts only the gateway CA because the
-// image runs it with --use-openssl-ca and SSL_CERT_FILE pointing at that CA.
+// modes and output as s4_sdks.py. Both SDKs fetch through an undici connector
+// that trusts only the gateway CA and, standing in for the redirect, sends
+// connections to the providers' hosts on port 443 to GATEWAY_ADDR (Envoy's
+// redirect listener). The URL, SNI and Host header stay the provider's.
 import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
 import { readFileSync } from "node:fs";
+import { Agent, buildConnector, fetch as undiciFetch } from "undici";
+
+const [gwHost, gwPort] = (process.env.GATEWAY_ADDR ?? "envoy:18443").split(":");
+const providers = new Set(["api.anthropic.com", "api.openai.com"]);
+const tls = buildConnector({ ca: readFileSync(process.env.GATEWAY_CA ?? "/certs/ca.crt") });
+const agent = new Agent({
+  connect: (opts, cb) => {
+    const redirect = providers.has(opts.hostname) && String(opts.port || 443) === "443";
+    tls(redirect ? { ...opts, hostname: gwHost, port: gwPort, servername: opts.hostname } : opts, cb);
+  },
+});
+const fetch = (url, init) => undiciFetch(url, { ...init, dispatcher: agent });
 
 const MSG = [{ role: "user", content: "run ls" }];
-const ac = new Anthropic({ maxRetries: 0, timeout: 20000, apiKey: "sk-ant-mock" });
-const oc = new OpenAI({ maxRetries: 0, timeout: 20000, apiKey: "sk-mock" });
+const ac = new Anthropic({ maxRetries: 0, timeout: 20000, apiKey: "sk-ant-mock", fetch });
+const oc = new OpenAI({ maxRetries: 0, timeout: 20000, apiKey: "sk-mock", fetch });
 
 async function run(scenario, sdk, mode, fn) {
   const out = { scenario, sdk, mode };

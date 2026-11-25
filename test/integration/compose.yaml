@@ -1,30 +1,46 @@
 # Integration stack: the node controller image, the processor built against a stub connection
 # table (test/processor-it), Envoy at the pinned version, and the mock provider. There is no eBPF
-# redirect and no node-agent here, so the client dials Envoy directly and the stub table says
-# which pod it is. run.sh also checks that the shipped processor image refuses to start without
-# the kernel tables.
+# redirect and no node-agent here, so the clients dial Envoy directly, and test/origdst
+# stands in for the kernel's record of where each connection was going. The node
+# controller reads the node from node.yaml and serves Envoy its listeners; the processor's
+# stub table says which pod a connection is. run.sh also checks that the shipped processor
+# image refuses to start without the kernel tables.
 #
 #   test/integration/run.sh
+#
+# Two checkouts on one machine share the Docker daemon. To run both at once, give one of
+# them its own project name and image tag: IT_PROJECT=it-b IT_TAG=it-b test/integration/run.sh
+# (the client addresses are fixed, so each run still needs the 172.30.0.0/24 network free).
 
 name: sandbox-gateway-it
 
 services:
   node-controller:
     build: { context: ../.., dockerfile: build/Dockerfile.node-controller }
-    image: sandbox-gateway/node-controller:it
+    image: sandbox-gateway/node-controller:${IT_TAG:-it}
     # The images run as a non-root user. Sockets are 0660 and handed to Envoy's group
     # (gid 101 in the official image), which the process must belong to.
     group_add: ["101"]
     environment:
       SANDBOX_GATEWAY_SOCKET_GID: "101"
-    command: ["--gen-ca", "--listen", "unix:///run/kubescape-sandbox/sds.sock",
-              "--allow-hosts", "api.anthropic.com,api.openai.com"]
+    # No API server here: the node (two pods and their policy objects) is node.yaml.
+    # Decrypted requests go to the mock provider's cluster, not to the real hosts.
+    command: ["--gen-ca", "--ca-cert", "/certs/ca.crt", "--ca-key", "/certs/ca.key",
+              "--node-name", "it-node", "--view-file", "/etc/it/node.yaml",
+              "--decrypt-cluster", "mock_anthropic",
+              # Small and fast on purpose, so run.sh can watch the rules work: a cap of
+              # three names (two exact hosts and one learned), and leaves that live 40
+              # seconds, so they are renewed several times during the run.
+              "--name-cap", "3", "--leaf-ttl", "40s", "--renew-every", "5s",
+              "--debug-addr", "0.0.0.0:9101"]
     volumes:
     - run-gateway:/run/kubescape-sandbox
     - certs:/certs
+    - ./node.yaml:/etc/it/node.yaml:ro
+    - envoy-admin:/run/sandbox-gateway
 
   processor:
-    image: sandbox-gateway/test-fixtures:it
+    image: sandbox-gateway/test-fixtures:${IT_TAG:-it}
     depends_on: [mock-anthropic]
     group_add: ["101"]
     environment:
@@ -45,51 +61,148 @@ services:
   # pinned maps; the stack itself runs processor-it.
   processor-image:
     build: { context: ../.., dockerfile: build/Dockerfile.processor }
-    image: sandbox-gateway/processor:it
+    image: sandbox-gateway/processor:${IT_TAG:-it}
     profiles: [tools]
 
   mock-anthropic:
     build: { context: ../.., dockerfile: test/Dockerfile }
-    image: sandbox-gateway/test-fixtures:it
-    command: ["mock-anthropic", "--listen", ":8080"]
+    image: sandbox-gateway/test-fixtures:${IT_TAG:-it}
+    # --tls-listen :443 at a fixed address: this is the "original destination" the test's
+    # connection table records for both pods. A passthrough connection must land here, on
+    # a leaf that is not the gateway's (CN mock-internal), whatever SNI the client sent.
+    command: ["mock-anthropic", "--listen", ":8080", "--tls-listen", ":443"]
+    networks:
+      default:
+        ipv4_address: 172.30.0.30
+
+  # Stands in for the part of the redirect that tells Envoy where a connection was going
+  # (test/origdst). No redirect runs here, so it fills the connection table for every
+  # port of the two pods' addresses. It attaches a BPF program at the cgroup root, hence
+  # privileged and the host's cgroup namespace; the program only answers for sockets on
+  # the gateway listener's port.
+  origdst:
+    build: { context: ../.., dockerfile: test/origdst/Dockerfile }
+    image: sandbox-gateway/origdst:${IT_TAG:-it}
+    privileged: true
+    cgroup: host
+    network_mode: none
+    command: ["--pin", "/sys/fs/bpf/${IT_PROJECT:-sandbox-gateway-it}",
+              "--fill", "172.30.0.21=172.30.0.30:443,172.30.0.22=172.30.0.30:443"]
+    volumes:
+    - /sys/fs/cgroup:/sys/fs/cgroup
+    - /sys/fs/bpf:/sys/fs/bpf
 
   envoy:
     image: envoyproxy/envoy:${ENVOY_VERSION:-v1.40.2}
-    depends_on: [node-controller, processor, mock-anthropic]
+    depends_on:
+      node-controller: { condition: service_started }
+      processor: { condition: service_started }
+      mock-anthropic: { condition: service_started }
+      origdst: { condition: service_started }
+      admin-dir: { condition: service_completed_successfully }
     command: ["envoy", "-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
     volumes:
     - run-gateway:/run/kubescape-sandbox
+    - envoy-admin:/run/sandbox-gateway
     - ./generated/envoy.yaml:/etc/envoy/envoy.yaml:ro
-    # The SDK clients use the providers' real host names, which resolve to Envoy here.
-    networks:
-      default:
-        aliases: [api.anthropic.com, api.openai.com]
 
-  client:
-    image: sandbox-gateway/test-fixtures:it
+  # Envoy creates its admin socket in a directory only the gateway's containers share. A
+  # new volume belongs to root, so this hands it to Envoy's user (101) before Envoy starts.
+  # In a pod this is an emptyDir.
+  admin-dir:
+    image: envoyproxy/envoy:${ENVOY_VERSION:-v1.40.2}
+    user: "0:0"
+    entrypoint: ["sh", "-c", "chown 101:101 /run/sandbox-gateway && chmod 0750 /run/sandbox-gateway"]
+    volumes:
+    - envoy-admin:/run/sandbox-gateway
+
+  # Reaches the two unix sockets a pod on the node cannot: the node controller's gateway
+  # socket (to post a DNS sighting, as node-agent would) and Envoy's admin socket (to read
+  # listener stats). Envoy's user and group, which both sockets are open to.
+  sock-probe:
+    image: sandbox-gateway/test-fixtures:${IT_TAG:-it}
+    profiles: [tools]
+    user: "101:101"
+    volumes:
+    - run-gateway:/run/kubescape-sandbox
+    - envoy-admin:/run/sandbox-gateway
+
+  # Removes the stand-in root, so the node controller starts with a new one.
+  new-root:
+    image: envoyproxy/envoy:${ENVOY_VERSION:-v1.40.2}
+    profiles: [tools]
+    user: "0:0"
+    entrypoint: ["sh", "-c", "rm -f /certs/ca.crt /certs/ca.key"]
+    volumes:
+    - certs:/certs
+
+  # The two clients stand for two pods. Each has the address node.yaml gives its pod,
+  # because the listener picks a chain by the connection's source address.
+  client: &client
+    image: sandbox-gateway/test-fixtures:${IT_TAG:-it}
     profiles: [tools]
     depends_on: [envoy]
-    command: ["streamcheck", "--addr", "envoy:443", "--ca", "/certs/ca.crt"]
+    command: ["streamcheck", "--addr", "envoy:18443", "--ca", "/certs/ca.crt"]
     volumes:
     - certs:/certs:ro
+    networks:
+      default:
+        ipv4_address: 172.30.0.21
 
-  # The SDK run (run.sh with SDK=1): the provider SDKs, through Envoy, trusting only the gateway CA.
+  client-other:
+    <<: *client
+    networks:
+      default:
+        ipv4_address: 172.30.0.22
+
+  # A pod in node.yaml that the connection table has no entry for.
+  client-noentry:
+    <<: *client
+    networks:
+      default:
+        ipv4_address: 172.30.0.24
+
+  # An address that is no pod's in node.yaml.
+  client-unknown:
+    <<: *client
+    networks:
+      default:
+        ipv4_address: 172.30.0.23
+
+  # The SDK run (run.sh with SDK=1): the provider SDKs as it-pod, trusting only the gateway
+  # CA. They call the real host names on port 443; with no redirect here, each client
+  # sends those connections to GATEWAY_ADDR itself (test/sdk), so the URL, SNI and Host
+  # stay the provider's. They run one at a time, so they share it-pod's address.
   sdk-python:
     build: { context: ../.., dockerfile: test/sdk/Dockerfile.python }
-    image: sandbox-gateway/sdk-python:it
+    image: sandbox-gateway/sdk-python:${IT_TAG:-it}
     profiles: [sdk]
     depends_on: [envoy]
+    environment: { GATEWAY_ADDR: "envoy:18443" }
     volumes:
     - certs:/certs:ro
+    networks:
+      default:
+        ipv4_address: 172.30.0.21
 
   sdk-node:
     build: { context: ../.., dockerfile: test/sdk/Dockerfile.node }
-    image: sandbox-gateway/sdk-node:it
+    image: sandbox-gateway/sdk-node:${IT_TAG:-it}
     profiles: [sdk]
     depends_on: [envoy]
+    environment: { GATEWAY_ADDR: "envoy:18443" }
     volumes:
     - certs:/certs:ro
+    networks:
+      default:
+        ipv4_address: 172.30.0.21
+
+networks:
+  default:
+    ipam:
+      config: [{ subnet: 172.30.0.0/24, ip_range: 172.30.0.128/25 }]
 
 volumes:
+  envoy-admin: {}
   run-gateway: {}
   certs: {}

@@ -3,6 +3,7 @@ package sds
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,21 +18,28 @@ import (
 )
 
 func dial(t *testing.T) (secretv3.SecretDiscoveryServiceClient, *Server) {
-	return dialWith(t, ca.Options{AllowSuffixes: []string{"anthropic.com"}}, 0)
+	c, srv, _ := dialWith(t, time.Hour, 0)
+	return c, srv
 }
 
-func dialWith(t *testing.T, opts ca.Options, renew time.Duration) (secretv3.SecretDiscoveryServiceClient, *Server) {
+// dialWith starts a server over an authority with a stand-in intermediate. The
+// gate allows names under anthropic.com, as a host set would.
+func dialWith(t *testing.T, leafTTL, renew time.Duration) (secretv3.SecretDiscoveryServiceClient, *Server, *ca.SelfSigned) {
 	t.Helper()
-	caCert, caKey, err := ca.NewSelfSignedCA("test", time.Hour*48)
+	authority := ca.NewAuthority(leafTTL, nil)
+	issuer, err := ca.NewSelfSigned(authority, nil, nil, 48*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := New(ca.NewMinter(caCert, caKey, opts), nil)
+	if err := issuer.Issue(); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(Gated{Allow: func(n string) bool { return strings.HasSuffix(n, ".anthropic.com") }, Leaves: authority}, nil)
 	srv.RenewEvery = renew
 	lis := bufconn.Listen(1 << 20)
 	g := grpc.NewServer()
 	secretv3.RegisterSecretDiscoveryServiceServer(g, srv)
-	go g.Serve(lis)
+	go func() { _ = g.Serve(lis) }()
 	t.Cleanup(g.Stop)
 	conn, err := grpc.NewClient("passthrough:///buf",
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),
@@ -39,8 +47,8 @@ func dialWith(t *testing.T, opts ca.Options, renew time.Duration) (secretv3.Secr
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { conn.Close() })
-	return secretv3.NewSecretDiscoveryServiceClient(conn), srv
+	t.Cleanup(func() { _ = conn.Close() })
+	return secretv3.NewSecretDiscoveryServiceClient(conn), srv, issuer
 }
 
 func TestDeltaMintsAndRefuses(t *testing.T) {
@@ -118,9 +126,9 @@ func TestSotWAckIsNotAnswered(t *testing.T) {
 	}
 }
 
-// Gap 4: a subscribed leaf is pushed again once the minter renews it.
+// A subscribed leaf is pushed again once it is renewed, with no request.
 func TestDeltaPushesRenewedLeaf(t *testing.T) {
-	client, srv := dialWith(t, ca.Options{AllowSuffixes: []string{"anthropic.com"}, LeafTTL: 400 * time.Millisecond}, 50*time.Millisecond)
+	client, srv, _ := dialWith(t, 400*time.Millisecond, 50*time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	st, err := client.DeltaSecrets(ctx)
@@ -143,5 +151,111 @@ func TestDeltaPushesRenewedLeaf(t *testing.T) {
 	}
 	if srv.Snapshot()["renewed"] < 1 {
 		t.Fatal("renewed counter not bumped")
+	}
+}
+
+// A new intermediate re-mints every leaf. Kick pushes them at once, without
+// waiting for the renewal timer.
+func TestKickPushesLeavesOfANewIntermediate(t *testing.T) {
+	client, srv, issuer := dialWith(t, time.Hour, 0) // no timer: only Kick can push
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st, err := client.DeltaSecrets(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Send(&discoveryv3.DeltaDiscoveryRequest{TypeUrl: SecretTypeURL, ResourceNamesSubscribe: []string{"api.anthropic.com"}}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := st.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := issuer.Issue(); err != nil {
+		t.Fatal(err)
+	}
+	srv.Kick()
+	second, err := st.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Resources[0].Version == second.Resources[0].Version {
+		t.Fatal("the leaf of the new intermediate must be a new version")
+	}
+	var a, b tlsv3.Secret
+	_ = first.Resources[0].Resource.UnmarshalTo(&a)
+	_ = second.Resources[0].Resource.UnmarshalTo(&b)
+	if string(a.GetTlsCertificate().GetCertificateChain().GetInlineBytes()) == string(b.GetTlsCertificate().GetCertificateChain().GetInlineBytes()) {
+		t.Fatal("the chain must carry the new intermediate")
+	}
+}
+
+func TestNothingIsAnsweredBeforeReady(t *testing.T) {
+	client, srv := dial(t)
+	ready := make(chan struct{})
+	srv.Ready = ready
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st, err := client.DeltaSecrets(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An Envoy that kept running reconnects at once and asks for its chains'
+	// secrets, before the host set knows them. It must not be told they are gone.
+	if err := st.Send(&discoveryv3.DeltaDiscoveryRequest{
+		TypeUrl:                SecretTypeURL,
+		ResourceNamesSubscribe: []string{"api.anthropic.com"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan *discoveryv3.DeltaDiscoveryResponse, 1)
+	go func() {
+		resp, err := st.Recv()
+		if err == nil {
+			got <- resp
+		}
+		close(got)
+	}()
+	select {
+	case resp := <-got:
+		t.Fatalf("answered before ready: %v", resp)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(ready)
+	resp := <-got
+	if resp == nil || len(resp.Resources) != 1 || len(resp.RemovedResources) != 0 {
+		t.Fatalf("after ready: %v", resp)
+	}
+}
+
+func TestSotWWaitsForReady(t *testing.T) {
+	client, srv := dial(t)
+	ready := make(chan struct{})
+	srv.Ready = ready
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st, err := client.StreamSecrets(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Send(&discoveryv3.DiscoveryRequest{TypeUrl: SecretTypeURL, ResourceNames: []string{"api.anthropic.com"}}); err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan *discoveryv3.DiscoveryResponse, 1)
+	go func() {
+		resp, err := st.Recv()
+		if err == nil {
+			got <- resp
+		}
+		close(got)
+	}()
+	select {
+	case resp := <-got:
+		t.Fatalf("answered before ready: %v", resp)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(ready)
+	if resp := <-got; resp == nil || len(resp.Resources) != 1 {
+		t.Fatalf("after ready: %v", resp)
 	}
 }

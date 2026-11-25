@@ -9,8 +9,10 @@ set -euo pipefail
 cd "$(dirname "$0")/../integration"
 export ENVOY_VERSION="${ENVOY_VERSION:-v1.40.2}"
 # Its own compose project, so an integration run elsewhere on the same Docker daemon
-# cannot stop this stack mid-measurement.
-COMPOSE=(docker compose -p "${BENCH_PROJECT:-sandbox-gateway-bench}" -f compose.yaml -f ../bench/compose.yaml)
+# cannot stop this stack mid-measurement. (The stack's fixed subnet still means one run
+# at a time.) IT_PROJECT also names the original-destination stand-in's pinned maps.
+export IT_PROJECT="${BENCH_PROJECT:-sandbox-gateway-bench}" IT_TAG="${IT_TAG:-it}"
+COMPOSE=(docker compose -p "$IT_PROJECT" -f compose.yaml -f ../bench/compose.yaml)
 
 cleanup() {
   status=$?
@@ -24,8 +26,8 @@ trap cleanup EXIT
 "${COMPOSE[@]}" build -q
 "${COMPOSE[@]}" up -d
 # Wait until a proxied call works, so the first measured runs do not race startup.
-for _ in $(seq 30); do
-  "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:443 --ca /certs/ca.crt --wait 0 >/dev/null 2>&1 && break
+for _ in $(seq 60); do
+  "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:18443 --ca /certs/ca.crt --wait 0 >/dev/null 2>&1 && break
   sleep 1
 done
 out=$("${COMPOSE[@]}" --profile bench run --rm -T latbench)

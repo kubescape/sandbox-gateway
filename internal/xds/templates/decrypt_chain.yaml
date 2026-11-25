@@ -1,0 +1,128 @@
+# One decrypt chain. The node controller renders this once per name in the host set and
+# serves the result over LDS. {{.Name}} is the hostname; nothing else varies between chains.
+#
+# The chain is picked by the listener's matcher from the pod's address and the SNI together,
+# so it has no filter_chain_match of its own.
+name: decrypt/{{.Name}}
+transport_socket:
+  name: envoy.transport_sockets.tls
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+    # A resumed session would skip the certificate this chain serves.
+    disable_stateless_session_resumption: true
+    disable_stateful_session_resumption: true
+    common_tls_context:
+      alpn_protocols: [h2, http/1.1]
+      # A plain SDS secret, named after the host. Envoy subscribes when the chain is added,
+      # so no handshake waits on SDS. initial_fetch_timeout 0: a chain whose leaf has not
+      # arrived never goes live, and the name keeps passing through until it does.
+      tls_certificate_sds_secret_configs:
+      - name: {{.Name}}
+        sds_config:
+          resource_api_version: V3
+          initial_fetch_timeout: 0s
+          api_config_source:
+            api_type: DELTA_GRPC
+            transport_api_version: V3
+            grpc_services: [{ envoy_grpc: { cluster_name: {{.XDSCluster}} } }]
+filters:
+- name: envoy.filters.network.http_connection_manager
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+    # One prefix per chain: the node controller reads downstream_cx_active under it to
+    # know whether the name has open connections.
+    stat_prefix: {{.StatPrefix}}
+    codec_type: AUTO
+    # The remote address is the socket's, never the X-Forwarded-For header's. The
+    # processor keys the pod's identity on it. skip_xff_append keeps the pod's address
+    # out of the request to the provider.
+    use_remote_address: true
+    skip_xff_append: true
+    upgrade_configs: [{ upgrade_type: websocket }]
+    stream_idle_timeout: 300s
+    access_log:
+    - name: envoy.access_loggers.stdout
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+        log_format:
+          json_format:
+            kind: access
+            start: "%START_TIME%"
+            request_id: "%REQ(X-REQUEST-ID)%"
+            authority: "%REQ(:AUTHORITY)%"
+            path: "%REQ(:PATH)%"
+            status: "%RESPONSE_CODE%"
+            flags: "%RESPONSE_FLAGS%"
+            duration_ms: "%DURATION%"
+            ttfb_ms: "%RESPONSE_DURATION%"
+            sni: "%REQUESTED_SERVER_NAME%"
+            chain: "%FILTER_CHAIN_NAME%"
+            downstream: "%DOWNSTREAM_REMOTE_ADDRESS%"
+            upstream_host: "%UPSTREAM_HOST%"
+            orig_dst: "%DYNAMIC_METADATA(kubescape.sandbox.audit:orig_dst)%"
+            namespace: "%DYNAMIC_METADATA(kubescape.sandbox.audit:namespace)%"
+            pod: "%DYNAMIC_METADATA(kubescape.sandbox.audit:pod)%"
+            fail_posture: "%DYNAMIC_METADATA(kubescape.sandbox.audit:fail_posture)%"
+            rule_id: "%DYNAMIC_METADATA(kubescape.sandbox.audit:rule_id)%"
+            action: "%DYNAMIC_METADATA(kubescape.sandbox.audit:action)%"
+            mode: "%DYNAMIC_METADATA(kubescape.sandbox.audit:mode)%"
+            would_deny: "%DYNAMIC_METADATA(kubescape.sandbox.audit:would_deny)%"
+            degraded: "%DYNAMIC_METADATA(kubescape.sandbox.audit:degraded)%"
+            model: "%DYNAMIC_METADATA(kubescape.sandbox.audit:model)%"
+            stop_reason: "%DYNAMIC_METADATA(kubescape.sandbox.audit:stop_reason)%"
+            early_eos: "%DYNAMIC_METADATA(kubescape.sandbox.audit:early_eos)%"
+    http_filters:
+    - name: envoy.filters.http.ext_proc
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+        grpc_service: { envoy_grpc: { cluster_name: {{.ExtProcCluster}} } }
+        # false: a dead processor fails the request. A stalled processor has no Envoy
+        # timeout in FULL_DUPLEX_STREAMED; the processor's own watchdog ends the stream.
+        failure_mode_allow: false
+        processing_mode:
+          request_header_mode: SEND
+          response_header_mode: SEND
+          request_body_mode: FULL_DUPLEX_STREAMED
+          response_body_mode: FULL_DUPLEX_STREAMED
+          request_trailer_mode: SEND
+          response_trailer_mode: SEND
+        # The processor looks the downstream remote address up in the connection table,
+        # and puts the request's protocol on its record.
+        request_attributes: [source.address, request.protocol]
+        # kubescape.sandbox.attribution is empty with this config. It stays forwarded so
+        # that, if a proxy_protocol filter is ever added, the processor flags the identity
+        # a client claims and does not use it.
+        metadata_options:
+          forwarding_namespaces: { untyped: [kubescape.sandbox.attribution] }
+          receiving_namespaces: { untyped: [kubescape.sandbox.audit] }
+    - name: envoy.filters.http.dynamic_forward_proxy
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
+        # Must equal the dfp cluster's cache in the bootstrap.
+        dns_cache_config:
+          name: dfp_cache
+          dns_lookup_family: V4_ONLY
+    - name: envoy.filters.http.router
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+    route_config:
+      name: {{.StatPrefix}}
+      # Clients must not learn about HTTP/3: UDP 443 to these hosts is blocked at the node.
+      response_headers_to_remove: [alt-svc]
+      # Ask the provider for an uncompressed response, so the processor reads the stream.
+      # Applied at the router, after ext_proc, so the processor still records what the
+      # client asked for.
+      request_headers_to_add:
+      - header: { key: accept-encoding, value: identity }
+        append_action: OVERWRITE_IF_EXISTS_OR_ADD
+      # use_remote_address can add this header with the pod's address.
+      request_headers_to_remove: [x-envoy-external-address]
+      # Only this chain's name is routable. The client controls the Host header; one that
+      # differs from the SNI it was decrypted for gets a 404 and reaches no upstream. The
+      # dynamic forward proxy resolves the Host, so this also pins the upstream to the name.
+      virtual_hosts:
+      - name: {{.Name}}
+        domains: ["{{.Name}}", "{{.Name}}:443"]
+        routes:
+        - match: { prefix: "/" }
+          route: { cluster: {{.DecryptCluster}}, timeout: 0s, idle_timeout: 300s }

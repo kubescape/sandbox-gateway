@@ -5,9 +5,14 @@ of each response is removed and the items after it renumbered. Each scenario
 (the model name picks the mock's script) runs twice: the raw event iterator and
 the SDK's accumulating stream helper. One JSON line per run, which check.py
 reads. The clients reach the mock through Envoy and trust only the gateway CA.
+
+There is no redirect in the integration stack, so this client does its job:
+connections to the providers' hosts on port 443 go to GATEWAY_ADDR (Envoy's
+redirect listener). The URL, SNI and Host header stay the provider's.
 """
 import json
 import os
+import socket
 import sys
 
 import anthropic
@@ -15,6 +20,18 @@ import httpx2
 import openai
 
 CA = os.environ.get("GATEWAY_CA", "/certs/ca.crt")
+GW_HOST, GW_PORT = os.environ.get("GATEWAY_ADDR", "envoy:18443").rsplit(":", 1)
+PROVIDERS = {"api.anthropic.com", "api.openai.com"}
+_getaddrinfo = socket.getaddrinfo
+
+
+def redirected(host, port, *args, **kwargs):
+    if host in PROVIDERS and int(port) == 443:
+        return _getaddrinfo(GW_HOST, int(GW_PORT), *args, **kwargs)
+    return _getaddrinfo(host, port, *args, **kwargs)
+
+
+socket.getaddrinfo = redirected
 MSG = [{"role": "user", "content": "run ls"}]
 
 ac = anthropic.Anthropic(api_key="sk-ant-mock", max_retries=0, timeout=20,
