@@ -92,15 +92,25 @@ Overload settings are not configured yet. Envoy's global request shedding also a
 
 `internal/controller` rebuilds the listener when the node view changes, when a sighting arrives, when the intermediate is replaced, and every 5 seconds. One run:
 
-1. Reads `http.egress_*.downstream_cx_active` from Envoy's admin socket. When Envoy cannot be asked, every name counts as busy.
-2. If Envoy has accepted the last listener sent, sweeps the retired names that are idle (see "Names with open connections").
-3. Applies the node view to the host set.
-4. Mints a leaf for every name in the set. A name whose leaf cannot be minted gets no chain. With no intermediate there are no decrypt chains and everything passes through.
-5. Computes each pod's names, builds the listener and hands it to the LDS server, which pushes only when it differs from the last one.
+1. The first run only: reads the decrypt chains Envoy already holds (`/config_dump?resource=dynamic_listeners`) and adopts them into the host set (see "Restarts").
+2. Reads whether Envoy has accepted the last listener sent. This comes before the counts, on purpose.
+3. Reads `http.egress_*.downstream_cx_active` and `listener_manager.total_listeners_warming` from Envoy's admin socket. When Envoy cannot be asked, every name counts as busy.
+4. If Envoy had accepted the last listener before step 3, and no listener update is warming, sweeps the retired names that are idle (see "Names with open connections"). Counts read before the acknowledgement may predate the listener that unmapped a name, so they never let a chain go.
+5. Applies the node view to the host set. Room for waiting names is made here, on the counts just read.
+6. Mints a leaf for every name in the set. A name whose leaf cannot be minted gets no chain. With no intermediate there are no decrypt chains and everything passes through.
+7. Computes each pod's names, builds the listener and hands it to the LDS server, which pushes only when it differs from the last one.
 
 Nothing is built before the node view has synced: a listener from half a view would drop chains in use.
 
-LDS is state of the world over one gRPC stream. A listener Envoy rejects (NACK) is logged and counted, and Envoy keeps the last one it accepted.
+### Restarts
+
+Envoy and the node controller are separate containers, so the node controller can restart while Envoy keeps running with the listener it was given. A new process starts with an empty host set: it has not seen the sightings the old one learned names from. Publishing from that set would drop those chains and cut the streams on them.
+
+So before its first publish, the node controller asks Envoy which decrypt chains it holds, in any state (active, warming, draining), and adopts them. An adopted name still wanted as an exact host, or still covered by a pattern, is back in the set as before. Any other adopted name is retired: it keeps its chain, maps to no pod, and leaves at a sweep once it is idle. Adopted names count against the cap.
+
+Until Envoy's admin socket answers, nothing is published. On a fresh pod Envoy's admin starts before Envoy asks for listeners, so this costs at most one reconcile interval.
+
+LDS is state of the world over one gRPC stream. A listener Envoy rejects (NACK) is logged and counted, and Envoy keeps the last one it accepted. The stream reads the listeners, their version and the signal for the next change together, and sends any version it has not sent before it waits again, so an update that lands mid-send is not lost.
 
 ## Certificates
 
@@ -201,8 +211,12 @@ A pattern that fails learns nothing, and `RejectedPatterns` lists it. An exact h
 The set is node-wide. Who is decrypted for a name is decided per pod. `NamesFor` takes the lists of the policy objects that select one pod and returns:
 
 - its exact hosts that are in the set,
-- the learned names one of its own patterns covers,
+- the names node-agent has sighted that one of its own patterns covers,
 - minus its `passthrough` entries. An entry with `*` is a pattern, any other is an exact name.
+
+Whether a name was sighted is kept apart from how its slot is counted. A sighted name that another pod's policy then lists as an exact host is counted as exact, and stays decrypted for the pod whose pattern covers it. A name a pattern covers but node-agent never sighted is decrypted only for the pods that list it as exact, and does not turn into a learned name when they stop.
+
+A name has one slot at most: a waiting name that is admitted as an exact host stops waiting.
 
 So a pod is never decrypted for a host that only another pod's policy names, even when both hosts share an address.
 
@@ -242,6 +256,7 @@ Pods the view leaves out:
 | Adding a chain drains nothing | a connection held open across a sighting still answers; Envoy reports an in-place update |
 | A busy chain is kept | with the cap full and a connection on the only learned name, a new sighting waits and is counted over the cap |
 | An idle chain is removed | once the connection ends, the learned name is evicted, the waiting one joins, and the evicted name is passed through again |
+| A restart keeps Envoy's chains | a node-controller-only restart with a connection open on a learned chain: the chain is adopted, no chain starts draining, the connection still answers, and the name is still decrypted for its pod |
 | Leaves are renewed in place | past the first leaves' expiry a call still verifies, and `decryptValidUntil` has moved |
 | No handshake waits on SDS | with the node controller stopped a decrypted call still works |
 | Each health path has its own process | stopping the processor or the node controller fails that path only |

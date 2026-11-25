@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,13 +36,15 @@ type Activity struct {
 	// satisfies it.
 	Stats func(ctx context.Context, filter string) (map[string]int64, error)
 
-	mu     sync.Mutex
-	active map[string]int64
-	known  bool
+	mu      sync.Mutex
+	active  map[string]int64
+	warming int64
+	known   bool
 }
 
-// activeFilter selects the open-connection gauge of every decrypt chain.
-const activeFilter = `^http\.egress_.*\.downstream_cx_active$`
+// activeFilter selects the open-connection gauge of every decrypt chain, and
+// the count of listener updates Envoy has accepted but not put in force yet.
+const activeFilter = `^(http\.egress_.*\.downstream_cx_active|listener_manager\.total_listeners_warming)$`
 
 // Refresh reads the gauges. After a failed read every name is busy until a
 // read succeeds.
@@ -53,8 +56,16 @@ func (a *Activity) Refresh(ctx context.Context) error {
 		a.known = false
 		return err
 	}
-	a.active, a.known = stats, true
+	a.active, a.warming, a.known = stats, stats["listener_manager.total_listeners_warming"], true
 	return nil
+}
+
+// Settled reports whether the last Refresh succeeded and found no listener
+// update still warming: the listener Envoy acknowledged is the one in force.
+func (a *Activity) Settled() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.known && a.warming == 0
 }
 
 // Busy reports whether name has open connections, as of the last Refresh.
@@ -77,6 +88,10 @@ type Controller struct {
 	Activity *Activity
 	// KickSecrets pushes re-minted leaves at once. *sds.Server.Kick.
 	KickSecrets func()
+	// Installed returns the filter chains Envoy holds now for the redirect
+	// listener. *envoyadmin.Client.InstalledChains, for xds.EgressListener.
+	// Nil means Envoy has none (tests).
+	Installed func(ctx context.Context) ([]string, error)
 	// NodeAddrs returns the node's own addresses, for the health listener's
 	// on-node check. Nil means none beyond the pods' and loopback.
 	NodeAddrs func() []netip.Addr
@@ -91,6 +106,8 @@ type Controller struct {
 
 	kickOnce sync.Once
 	kick     chan struct{}
+	// adopted is set once the chains Envoy held at start are in the set.
+	adopted bool
 
 	// Reconciles counts completed runs; Errors the ones that failed.
 	Reconciles, Errors atomic.Int64
@@ -163,6 +180,28 @@ func (c *Controller) Run(ctx context.Context) {
 	}
 }
 
+// adopt puts the decrypt chains Envoy holds into the set.
+func (c *Controller) adopt(ctx context.Context) error {
+	if c.Installed == nil {
+		return nil
+	}
+	chains, err := c.Installed(ctx)
+	if err != nil {
+		return err
+	}
+	var names []string
+	for _, ch := range chains {
+		if name, ok := strings.CutPrefix(ch, xds.DecryptChain("")); ok {
+			names = append(names, name)
+		}
+	}
+	c.Set.Adopt(names)
+	if len(names) > 0 {
+		c.Log.Info("adopted the chains Envoy already holds", "names", len(names))
+	}
+	return nil
+}
+
 // Reconcile builds the listener for the node as it is now and hands it to
 // Listeners. Before the view has synced it does nothing: a listener built
 // from half a view would drop chains that are in use.
@@ -170,14 +209,31 @@ func (c *Controller) Reconcile(ctx context.Context) error {
 	if !c.View.Synced() {
 		return nil
 	}
+	// A node controller that restarted while Envoy kept running starts with an
+	// empty set. Envoy may still carry streams on chains the old one served.
+	// Those chains are adopted before anything is published, so the first
+	// listener keeps them and they leave only through the normal retirement.
+	if !c.adopted {
+		if err := c.adopt(ctx); err != nil {
+			c.Log.Warn("cannot read the chains Envoy holds; nothing is published until it answers", "error", err)
+			return nil
+		}
+		c.adopted = true
+	}
+	// The acknowledgement is read before the connection counts. Only counts
+	// sampled after Envoy put in force the listener that unmapped a retired
+	// name can show that no connection can reach its chain any more.
+	current, acked, _, _ := c.Listeners.Version()
+	inForce := current != "" && acked == current
 	if err := c.Activity.Refresh(ctx); err != nil {
 		// Not fatal: with no reading every name is busy and nothing is removed.
 		c.Log.Warn("envoy stats unavailable; no chain will be removed", "error", err)
 	}
-	// Names retired in an earlier run are swept only once Envoy has accepted
-	// the listener that stopped mapping pods to them. From then on no new
-	// connection can reach their chains, so a count of zero stays zero.
-	if current, acked, _, _ := c.Listeners.Version(); current != "" && acked == current {
+	// Names retired in an earlier run are swept only when Envoy had accepted
+	// the latest listener before the counts were read, and had no update
+	// still warming. From then on no new connection reaches their chains, so
+	// a count of zero stays zero.
+	if inForce && c.Activity.Settled() {
 		c.Set.Sweep()
 	}
 	snap := c.View.Snapshot()

@@ -172,3 +172,32 @@ func TestAnotherTypeIsRefused(t *testing.T) {
 		t.Fatal("want an error")
 	}
 }
+
+// A Set that lands after a response was sent and before the stream waits for
+// the next change must still reach Envoy, with no further request from it.
+func TestASetBetweenSendAndWaitIsNotMissed(t *testing.T) {
+	srv, stream := startLDS(t)
+	in := reader(stream)
+	_, _ = srv.Set(build(t, "api.anthropic.com"))
+	var once bool
+	afterSend = func() {
+		if !once {
+			once = true
+			_, _ = srv.Set(build(t, "api.anthropic.com", "api.openai.com"))
+		}
+	}
+	t.Cleanup(func() { afterSend = nil })
+	_ = stream.Send(&discoveryv3.DiscoveryRequest{TypeUrl: ListenerTypeURL})
+	first := in.within(5 * time.Second)
+	if first == nil {
+		t.Fatal("no first response")
+	}
+	// Envoy sends nothing more: no ACK, no new request.
+	second := in.within(2 * time.Second)
+	if second == nil {
+		t.Fatal("the version set right after the first send was never pushed")
+	}
+	if current, _, _, _ := srv.Version(); second.GetVersionInfo() != current || current == first.GetVersionInfo() {
+		t.Fatalf("pushed %s, current %s, first %s", second.GetVersionInfo(), current, first.GetVersionInfo())
+	}
+}

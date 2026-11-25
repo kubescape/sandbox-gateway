@@ -13,7 +13,8 @@
 # The node controller's rules are watched too: a pod is decrypted only for its own names, a
 # passthrough connection goes to its original destination, the health listener's three
 # paths, an SNI flood, chains added and removed under live connections with a cap of
-# three names, leaf renewal, an SDS outage, and a change of root.
+# three names, leaf renewal, a node controller restart under a live connection, an SDS
+# outage, and a change of root.
 set -euo pipefail
 cd "$(dirname "$0")"
 export ENVOY_VERSION="${ENVOY_VERSION:-v1.40.2}"
@@ -274,6 +275,32 @@ echo "$first -> $later"
 "${COMPOSE[@]}" run --rm -T --no-deps client streamcheck --addr envoy:18443 --ca /certs/ca.crt --wait 0 | tail -1 | grep -q '"stop_reason":"end_turn"'
 ncstats | grep -Eo '"renewed":[0-9]+' | tee generated/renewed.txt
 grep -Eq '"renewed":[1-9]' generated/renewed.txt
+
+echo "--- a node controller restart keeps the chains Envoy holds, and the connections on them"
+# b.learned.example.com was learned from a sighting. The new process never sees that
+# sighting; it has to take the chain back from Envoy before it publishes anything.
+# Envoy keeps a removed chain on its draining count for the whole drain time, so the
+# check is that the restart adds none, not that the count is zero.
+draining() { envoystat 'listener_manager.total_filter_chains_draining$' | grep -Eo '[0-9]+$' | tail -1; }
+draining_before=$(draining)
+"${COMPOSE[@]}" run --rm -T --no-deps client tlshold --addr envoy:18443 --ca /certs/ca.crt --host b.learned.example.com --hold 20s > generated/hold-restart.txt 2>/dev/null &
+hold=$!
+sleep 3
+"${COMPOSE[@]}" stop node-controller >/dev/null 2>&1
+"${COMPOSE[@]}" up -d --no-deps node-controller >/dev/null 2>&1
+until_stats '"lds":\{"acked":"[0-9a-f]+"'
+ncstats | tee generated/restart-stats.txt
+grep -Eq '"names":\[[^]]*"b\.learned\.example\.com"' generated/restart-stats.txt
+"${COMPOSE[@]}" logs --no-color --no-log-prefix node-controller | grep -q 'adopted the chains Envoy already holds'
+draining_after=$(draining)
+echo "filter chains draining: $draining_before -> $draining_after"
+[ -n "$draining_after" ] && [ "$draining_after" -le "$draining_before" ]
+wait "$hold" || true
+cat generated/hold-restart.txt
+grep -q '^alive ' generated/hold-restart.txt
+# The adopted chain is still mapped to the pod whose pattern covers it.
+"${COMPOSE[@]}" run --rm -T --no-deps client streamcheck --addr envoy:18443 --ca /certs/ca.crt \
+  --host b.learned.example.com --expect-status 403 --wait 20s | grep -q '"leaf_issuer":"Kubescape Sandbox Gateway'
 
 echo "--- one process down fails its own health path and not the other two"
 "${COMPOSE[@]}" stop processor >/dev/null 2>&1

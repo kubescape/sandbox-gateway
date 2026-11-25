@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 )
 
@@ -77,5 +79,36 @@ func TestDownEnvoyIsAnError(t *testing.T) {
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "no", http.StatusServiceUnavailable) })
 	if _, err := serve(t, mux).Stats(context.Background(), "x"); err == nil {
 		t.Fatal("a non-200 answer is an error")
+	}
+}
+
+func TestInstalledChains(t *testing.T) {
+	sample, err := os.ReadFile("testdata/config_dump_listeners.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	var gotResource string
+	mux.HandleFunc("/config_dump", func(w http.ResponseWriter, r *http.Request) {
+		gotResource = r.URL.Query().Get("resource")
+		_, _ = w.Write(sample)
+	})
+	c := serve(t, mux)
+	got, err := c.InstalledChains(context.Background(), "egress_tls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotResource != "dynamic_listeners" {
+		t.Fatalf("resource = %q", gotResource)
+	}
+	sort.Strings(got)
+	// The sample is Envoy 1.40.2's dump of the integration stack, trimmed,
+	// with a warming update that adds a chain.
+	want := []string{"decrypt/api.anthropic.com", "decrypt/api.openai.com", "decrypt/myres.openai.azure.com", "passthrough"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("chains = %v, want %v", got, want)
+	}
+	if none, err := c.InstalledChains(context.Background(), "no_such_listener"); err != nil || len(none) != 0 {
+		t.Fatalf("an absent listener: %v %v", none, err)
 	}
 }

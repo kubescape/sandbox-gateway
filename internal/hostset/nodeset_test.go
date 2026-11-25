@@ -300,3 +300,134 @@ func TestObserveNeverRetiresAName(t *testing.T) {
 		t.Fatalf("a must still be decrypted, got %v", got)
 	}
 }
+
+// Finding: a sighted name that waits for a slot and is then admitted as an
+// exact host must stop waiting, so it neither takes a second slot nor makes
+// room by evicting another name.
+func TestAWaitingNameAdmittedAsExactStopsWaiting(t *testing.T) {
+	s := NewNodeSet(2, nil)
+	w := Wanted{Exact: []string{"api.anthropic.com"}, Patterns: []string{"*.openai.azure.com"}}
+	s.Apply(w)
+	s.Observe("a.openai.azure.com")
+	s.Observe("b.openai.azure.com") // the set is full: b waits
+	if c := s.Counts(); c.OverCap != 1 {
+		t.Fatalf("counts = %+v", c)
+	}
+	// A policy now lists b as an exact host. The cap has no free slot, so b
+	// stays out as an exact host, and it must not also wait as learned.
+	w.Exact = append(w.Exact, "b.openai.azure.com")
+	s.Apply(w)
+	if c := s.Counts(); c.Evictions != 1 {
+		t.Fatalf("one name was needed and one evicted: %+v", c)
+	}
+	s.Sweep()
+	s.Apply(w)
+	if !s.Contains("b.openai.azure.com") || s.Contains("a.openai.azure.com") {
+		t.Fatalf("names = %v", s.Names())
+	}
+	c := s.Counts()
+	if c.Exact != 2 || c.Learned != 0 || c.OverCap != 0 {
+		t.Fatalf("b must be in once, as exact: %+v", c)
+	}
+	// Another Apply with the set full and nothing waiting evicts nothing.
+	s.Apply(w)
+	if c := s.Counts(); c.Evictions != 1 {
+		t.Fatalf("nothing waits, nothing more is evicted: %+v", c)
+	}
+}
+
+func TestExactAndLearnedStayDisjoint(t *testing.T) {
+	s := NewNodeSet(8, nil)
+	w := Wanted{Patterns: []string{"*.openai.azure.com"}}
+	s.Apply(w)
+	s.Observe("a.openai.azure.com")
+	w.Exact = []string{"a.openai.azure.com"}
+	s.Apply(w)
+	s.Observe("a.openai.azure.com")
+	s.Apply(w)
+	if c := s.Counts(); c.Exact != 1 || c.Learned != 0 {
+		t.Fatalf("counts = %+v", c)
+	}
+	if got := s.Names(); !reflect.DeepEqual(got, []string{"a.openai.azure.com"}) {
+		t.Fatalf("names = %v", got)
+	}
+}
+
+// Finding: when another pod's policy lists a sighted name as exact, a pod
+// whose own pattern covers that name must keep being decrypted for it.
+func TestPatternCoverageSurvivesPromotionToExact(t *testing.T) {
+	s := NewNodeSet(8, nil)
+	w := Wanted{Patterns: []string{"*.openai.azure.com"}}
+	s.Apply(w)
+	s.Observe("myres.openai.azure.com")
+	podA := func() []string { return s.NamesFor(nil, []string{"*.openai.azure.com"}, nil) }
+	if got := podA(); !reflect.DeepEqual(got, []string{"myres.openai.azure.com"}) {
+		t.Fatalf("pod A before: %v", got)
+	}
+	w.Exact = []string{"myres.openai.azure.com"} // pod B's policy
+	s.Apply(w)
+	if got := podA(); !reflect.DeepEqual(got, []string{"myres.openai.azure.com"}) {
+		t.Fatalf("pod A lost the name when pod B listed it as exact: %v", got)
+	}
+	// And when pod B drops it again, it is still learned for pod A.
+	w.Exact = nil
+	s.Apply(w)
+	if got := podA(); !reflect.DeepEqual(got, []string{"myres.openai.azure.com"}) {
+		t.Fatalf("pod A after pod B dropped it: %v", got)
+	}
+}
+
+// A name a pattern covers but node-agent never saw is only decrypted for the
+// pods that list it as exact, and it does not become learned when they stop.
+func TestAnUnsightedExactNameIsNotCoveredByPatterns(t *testing.T) {
+	s := NewNodeSet(8, nil)
+	w := Wanted{Exact: []string{"myres.openai.azure.com"}, Patterns: []string{"*.openai.azure.com"}}
+	s.Apply(w)
+	if got := s.NamesFor(nil, []string{"*.openai.azure.com"}, nil); len(got) != 0 {
+		t.Fatalf("not sighted, not covered: %v", got)
+	}
+	w.Exact = nil
+	s.Apply(w)
+	if got := s.NamesFor(nil, []string{"*.openai.azure.com"}, nil); len(got) != 0 {
+		t.Fatalf("an unsighted name must not turn learned: %v", got)
+	}
+	// A sighting of an exact member is recorded and changes what pods get.
+	w.Exact = []string{"myres.openai.azure.com"}
+	s.Sweep()
+	s.Apply(w)
+	if !s.Observe("myres.openai.azure.com") {
+		t.Fatal("the first sighting of an exact member is a change")
+	}
+	if got := s.NamesFor(nil, []string{"*.openai.azure.com"}, nil); !reflect.DeepEqual(got, []string{"myres.openai.azure.com"}) {
+		t.Fatalf("got %v", got)
+	}
+}
+
+// Finding: names whose chains Envoy already has are kept until idle, or
+// taken back when still wanted.
+func TestAdoptKeepsInstalledChains(t *testing.T) {
+	busy := busySet{"old.openai.azure.com": true}
+	s := NewNodeSet(8, busy.is)
+	s.Adopt([]string{"api.anthropic.com", "old.openai.azure.com", "gone.example.com", "not a name"})
+	w := Wanted{Exact: []string{"api.anthropic.com"}, Patterns: []string{"*.openai.azure.com"}}
+	s.Apply(w)
+	// Still wanted: back as exact. Still covered by a pattern: back as learned,
+	// and pods with that pattern keep being decrypted for it.
+	if got := s.NamesFor([]string{"api.anthropic.com"}, w.Patterns, nil); !reflect.DeepEqual(got, []string{"api.anthropic.com", "old.openai.azure.com"}) {
+		t.Fatalf("names for a pod: %v", got)
+	}
+	// Not wanted: kept, mapped to no pod, until it is idle.
+	if !s.Contains("gone.example.com") {
+		t.Fatal("an adopted chain must not be dropped before it is idle")
+	}
+	if s.Contains("not a name") {
+		t.Fatal("a name that is not a hostname is not adopted")
+	}
+	s.Sweep()
+	if s.Contains("gone.example.com") {
+		t.Fatal("an idle adopted name goes at the sweep")
+	}
+	if c := s.Counts(); c.Exact != 1 || c.Learned != 1 {
+		t.Fatalf("counts = %+v", c)
+	}
+}

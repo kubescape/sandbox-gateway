@@ -66,7 +66,12 @@ type NodeSet struct {
 	rejected []string            // patterns and exact entries refused, sorted
 	overE    int                 // wanted exact hosts left out
 	overL    map[string]struct{} // sighted names waiting for a slot
-	evicted  int64
+	// sighted holds the members that node-agent has seen in DNS answers. It
+	// is kept apart from how a member is counted: a sighted name that a
+	// policy also lists as exact stays sighted, so a pod whose own pattern
+	// covers it keeps being decrypted for it.
+	sighted map[string]bool
+	evicted int64
 }
 
 // retiree is a name on its way out.
@@ -89,7 +94,7 @@ func NewNodeSet(cap int, busy func(name string) bool) *NodeSet {
 	return &NodeSet{
 		cap: cap, busy: busy,
 		exact: map[string]bool{}, lru: list.New(), learned: map[string]*list.Element{},
-		retired: map[string]retiree{}, overL: map[string]struct{}{},
+		retired: map[string]retiree{}, overL: map[string]struct{}{}, sighted: map[string]bool{},
 	}
 }
 
@@ -156,7 +161,9 @@ func (s *NodeSet) Apply(w Wanted) (changed bool) {
 			continue
 		}
 		delete(s.exact, name)
-		if s.matches(name) {
+		// It stays as a learned name only if node-agent has seen it: a name
+		// joins through a pattern after a sighting, never before.
+		if s.sighted[name] && s.matches(name) {
 			s.learned[name] = s.lru.PushFront(name)
 		} else {
 			s.retired[name] = retiree{kind: kindExact}
@@ -193,8 +200,10 @@ func (s *NodeSet) Apply(w Wanted) (changed bool) {
 		changed = true
 	}
 	// Sighted names that were waiting, with the slots exact hosts left.
+	// A waiting name that is now a member (an exact host admitted above, for
+	// one) no longer waits: it must not take a second slot or make room.
 	for name := range s.overL {
-		if !s.matches(name) {
+		if !s.matches(name) || s.isMember(name) {
 			delete(s.overL, name)
 		}
 	}
@@ -212,6 +221,7 @@ func (s *NodeSet) Apply(w Wanted) (changed bool) {
 		}
 		delete(s.overL, name)
 		s.learned[name] = s.lru.PushFront(name)
+		s.sighted[name] = true
 		changed = true
 	}
 	// Whoever is still left out needs a slot: start idle learned names on
@@ -271,14 +281,18 @@ func (s *NodeSet) Observe(name string) (changed bool) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.exact[name] {
+	if !s.matches(name) {
 		return false
+	}
+	if s.exact[name] {
+		// Already decrypted for the pods that list it. Recording the sighting
+		// lets the pods whose pattern covers it be decrypted for it too.
+		changed = !s.sighted[name]
+		s.sighted[name] = true
+		return changed
 	}
 	if el, ok := s.learned[name]; ok {
 		s.lru.MoveToFront(el)
-		return false
-	}
-	if !s.matches(name) {
 		return false
 	}
 	if r, ok := s.retired[name]; ok && !r.evicted {
@@ -297,7 +311,43 @@ func (s *NodeSet) Observe(name string) (changed bool) {
 	}
 	delete(s.overL, name)
 	s.learned[name] = s.lru.PushFront(name)
+	s.sighted[name] = true
 	return true
+}
+
+// isMember reports whether name has a slot, in any state. The caller holds
+// the lock.
+func (s *NodeSet) isMember(name string) bool {
+	if s.exact[name] {
+		return true
+	}
+	if _, ok := s.learned[name]; ok {
+		return true
+	}
+	_, ok := s.retired[name]
+	return ok
+}
+
+// Adopt takes in names that already have a chain in Envoy, from before this
+// process started. Each is kept, retired, until an Apply finds it wanted
+// again or a Sweep finds it idle. Without this, a node controller that
+// restarts while Envoy keeps running would publish a listener without the
+// chains the old one served, and cut the streams on them.
+//
+// An adopted name counts against the cap. Its earlier sighting is not known,
+// so it is treated as sighted: a name only reaches Envoy as a learned chain
+// after a sighting, or as an exact host.
+func (s *NodeSet) Adopt(names []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, raw := range names {
+		name := normalize(raw)
+		if !validHostname(name) || s.isMember(name) {
+			continue
+		}
+		s.retired[name] = retiree{kind: kindLearned}
+		s.sighted[name] = true
+	}
 }
 
 // Sweep removes retired names that are idle and reports whether any went.
@@ -309,6 +359,7 @@ func (s *NodeSet) Sweep() (changed bool) {
 	for name := range s.retired {
 		if !s.busy(name) {
 			delete(s.retired, name)
+			delete(s.sighted, name)
 			changed = true
 		}
 	}
@@ -389,7 +440,18 @@ func (s *NodeSet) NamesFor(exact, patterns, passthrough []string) []string {
 			out = append(out, h)
 		}
 	}
+	// A pod's pattern covers the names node-agent has seen, whether a name is
+	// counted as learned or, because another pod lists it, as exact.
+	var covered []string
 	for name := range s.learned {
+		covered = append(covered, name)
+	}
+	for name := range s.exact {
+		if s.sighted[name] {
+			covered = append(covered, name)
+		}
+	}
+	for _, name := range covered {
 		if seen[name] || skip(name) {
 			continue
 		}

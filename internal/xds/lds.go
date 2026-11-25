@@ -21,6 +21,10 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
+// afterSend, when set by a test, runs right after a response is sent. It
+// lets a test land a Set in the gap between a send and the next wait.
+var afterSend func()
+
 // ListenerTypeURL is the xDS type of a Listener resource.
 const ListenerTypeURL = "type.googleapis.com/envoy.config.listener.v3.Listener"
 
@@ -131,20 +135,30 @@ func (s *LDS) StreamListeners(stream listenerservicev3.ListenerDiscoveryService_
 
 	subscribed := false
 	sent := "" // version last sent on this stream
-	send := func() error {
-		resources, version, _ := s.snapshot()
-		if version == "" || version == sent {
-			return nil
-		}
+	send := func(resources []*anypb.Any, version string) error {
 		sent = version
 		s.Stats.Pushes.Add(1)
-		return stream.Send(&discoveryv3.DiscoveryResponse{
+		err := stream.Send(&discoveryv3.DiscoveryResponse{
 			TypeUrl: ListenerTypeURL, VersionInfo: version, Resources: resources,
 			Nonce: strconv.FormatUint(s.nonce.Add(1), 10),
 		})
+		if afterSend != nil {
+			afterSend()
+		}
+		return err
 	}
 	for {
-		_, _, changed := s.snapshot()
+		// The resources, their version and the channel that the next Set
+		// closes are read together, under one lock. A version set after the
+		// last send is sent before waiting again, so a Set that lands between
+		// a send and the wait is never missed.
+		resources, version, changed := s.snapshot()
+		if subscribed && version != "" && version != sent {
+			if err := send(resources, version); err != nil {
+				return err
+			}
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return nil
@@ -173,16 +187,7 @@ func (s *LDS) StreamListeners(stream listenerservicev3.ListenerDiscoveryService_
 				s.mu.Unlock()
 			}
 			subscribed = true
-			if err := send(); err != nil {
-				return err
-			}
 		case <-changed:
-			if !subscribed {
-				continue
-			}
-			if err := send(); err != nil {
-				return err
-			}
 		}
 	}
 }

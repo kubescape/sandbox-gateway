@@ -1,0 +1,84 @@
+{
+ "configs": [
+  {
+   "@type": "type.googleapis.com/envoy.admin.v3.ListenersConfigDump.DynamicListener",
+   "name": "egress_tls",
+   "active_state": {
+    "version_info": "306e725ba11070c4",
+    "listener": {
+     "@type": "type.googleapis.com/envoy.config.listener.v3.Listener",
+     "name": "egress_tls",
+     "address": {
+      "socket_address": {
+       "address": "0.0.0.0",
+       "port_value": 18443
+      }
+     },
+     "filter_chains": [
+      {
+       "name": "decrypt/api.anthropic.com"
+      },
+      {
+       "name": "decrypt/api.openai.com"
+      },
+      {
+       "name": "passthrough"
+      }
+     ]
+    },
+    "last_updated": "2026-11-25T09:18:18.842Z"
+   },
+   "warming_state": {
+    "version_info": "next",
+    "listener": {
+     "@type": "type.googleapis.com/envoy.config.listener.v3.Listener",
+     "name": "egress_tls",
+     "address": {
+      "socket_address": {
+       "address": "0.0.0.0",
+       "port_value": 18443
+      }
+     },
+     "filter_chains": [
+      {
+       "name": "decrypt/api.anthropic.com"
+      },
+      {
+       "name": "decrypt/api.openai.com"
+      },
+      {
+       "name": "decrypt/myres.openai.azure.com"
+      },
+      {
+       "name": "passthrough"
+      }
+     ]
+    },
+    "last_updated": "2026-11-25T09:18:18.842Z"
+   }
+  },
+  {
+   "@type": "type.googleapis.com/envoy.admin.v3.ListenersConfigDump.DynamicListener",
+   "name": "health",
+   "active_state": {
+    "version_info": "306e725ba11070c4",
+    "listener": {
+     "@type": "type.googleapis.com/envoy.config.listener.v3.Listener",
+     "name": "health",
+     "address": {
+      "socket_address": {
+       "address": "0.0.0.0",
+       "port_value": 18444
+      }
+     },
+     "filter_chains": [
+      {
+       "name": "health"
+      }
+     ]
+    },
+    "last_updated": "2026-11-25T09:18:18.844Z"
+   }
+  }
+ ]
+}

@@ -112,6 +112,9 @@ func main() {
 	ctrl := &controller.Controller{
 		View: view, Set: set, Authority: authority, Listeners: lds, Activity: activity,
 		KickSecrets: secrets.Kick, Log: log, NodeAddrs: localAddrs,
+		Installed: func(ctx context.Context) ([]string, error) {
+			return admin.InstalledChains(ctx, xds.EgressListener)
+		},
 		Config: xds.Config{Port: uint32(*port), HealthPort: uint32(*healthPort), DecryptCluster: *decryptCluster, PassthroughCluster: *passthroughCluster},
 	}
 	go ctrl.Run(ctx)

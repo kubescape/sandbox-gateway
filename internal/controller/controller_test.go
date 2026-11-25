@@ -91,12 +91,15 @@ func (f *fakeListeners) mapped(source string) []string {
 }
 
 type harness struct {
-	c      *Controller
-	view   *fakeView
-	out    *fakeListeners
-	active map[string]int64
-	fail   error
-	issuer *ca.SelfSigned
+	c       *Controller
+	view    *fakeView
+	out     *fakeListeners
+	active  map[string]int64
+	warming int64
+	fail    error
+	issuer  *ca.SelfSigned
+	// duringStats runs while the connection counts are read.
+	duringStats func()
 }
 
 func newHarness(t *testing.T, cap int) *harness {
@@ -106,7 +109,10 @@ func newHarness(t *testing.T, cap int) *harness {
 		if h.fail != nil {
 			return nil, h.fail
 		}
-		out := map[string]int64{}
+		if h.duringStats != nil {
+			h.duringStats()
+		}
+		out := map[string]int64{"listener_manager.total_listeners_warming": h.warming}
 		for name, n := range h.active {
 			out["http."+xds.StatPrefix(name)+".downstream_cx_active"] = n
 		}
@@ -355,5 +361,111 @@ func TestHealthListenerTakesOnNodeSourcesOnly(t *testing.T) {
 	}
 	if h.out.health.GetFilterChainMatcher().GetOnNoMatch() != nil {
 		t.Fatal("a source that is not on the node must get no chain")
+	}
+}
+
+// Finding: the counts that let a retired chain go must be read after Envoy
+// acknowledged the listener that unmapped it. An ACK that lands while the
+// counts are being read is not enough: those counts may predate it.
+func TestAnAckDuringTheSampleDoesNotLetAChainGo(t *testing.T) {
+	h := newHarness(t, 8)
+	h.view.snap.Pods = []nodeview.Pod{podOf("a", "10.0.0.1", "api.anthropic.com", "api.openai.com")}
+	h.reconcile(t)
+	h.out.ack()
+	// The policy drops api.openai.com: it is retired, the listener unmapping
+	// it goes out, and Envoy has not acknowledged it yet.
+	h.view.snap.Pods = []nodeview.Pod{podOf("a", "10.0.0.1", "api.anthropic.com")}
+	h.reconcile(t)
+	// The counts read zero, and the ACK arrives while they are being read.
+	h.duringStats = h.out.ack
+	h.reconcile(t)
+	h.duringStats = nil
+	if !contains(h.out.chains(), "decrypt/api.openai.com") {
+		t.Fatal("the chain went on counts that may predate the ACK")
+	}
+	// The fake bumps the version on every Set; Envoy accepts that one too.
+	// The next run reads the counts after the ACK: now it may go.
+	h.out.ack()
+	h.reconcile(t)
+	if contains(h.out.chains(), "decrypt/api.openai.com") {
+		t.Fatal("acknowledged before the counts were read, and idle: the chain goes")
+	}
+}
+
+func TestAWarmingListenerHoldsTheSweep(t *testing.T) {
+	h := newHarness(t, 8)
+	h.view.snap.Pods = []nodeview.Pod{podOf("a", "10.0.0.1", "api.anthropic.com", "api.openai.com")}
+	h.reconcile(t)
+	h.out.ack()
+	h.view.snap.Pods = []nodeview.Pod{podOf("a", "10.0.0.1", "api.anthropic.com")}
+	h.reconcile(t)
+	h.out.ack()
+	h.warming = 1 // acknowledged, but Envoy has not put it in force
+	h.reconcile(t)
+	h.out.ack()
+	if !contains(h.out.chains(), "decrypt/api.openai.com") {
+		t.Fatal("nothing goes while a listener update is warming")
+	}
+	h.warming = 0
+	h.reconcile(t)
+	if contains(h.out.chains(), "decrypt/api.openai.com") {
+		t.Fatal("settled, acknowledged and idle: the chain goes")
+	}
+}
+
+// Finding: a node controller that restarts while Envoy keeps running must
+// publish the chains Envoy already holds, so the streams on them survive.
+func TestARestartKeepsTheChainsEnvoyHolds(t *testing.T) {
+	h := newHarness(t, 8)
+	h.c.Set.Apply(hostset.Wanted{}) // a fresh process: nothing learned yet
+	h.active["myres.openai.azure.com"] = 1
+	h.active["gone.example.com"] = 1
+	h.c.Installed = func(context.Context) ([]string, error) {
+		return []string{"decrypt/api.anthropic.com", "decrypt/myres.openai.azure.com", "decrypt/gone.example.com", "passthrough"}, nil
+	}
+	pod := podOf("a", "10.0.0.1", "api.anthropic.com")
+	pod.Patterns = []string{"*.openai.azure.com"}
+	h.view.snap.Pods = []nodeview.Pod{pod}
+	h.reconcile(t)
+	for _, want := range []string{"decrypt/api.anthropic.com", "decrypt/myres.openai.azure.com", "decrypt/gone.example.com"} {
+		if !contains(h.out.chains(), want) {
+			t.Fatalf("the first listener after a restart lacks %s: %v", want, h.out.chains())
+		}
+	}
+	// The learned name is still decrypted for the pod whose pattern covers it;
+	// the name nobody wants is mapped to no pod.
+	if got := h.out.mapped("10.0.0.1"); strings.Join(got, ",") != "api.anthropic.com,myres.openai.azure.com" {
+		t.Fatalf("pod a is decrypted for %v", got)
+	}
+	// It leaves through the normal retirement once idle.
+	h.out.ack()
+	h.active["gone.example.com"] = 0
+	h.reconcile(t)
+	h.out.ack()
+	h.reconcile(t)
+	if contains(h.out.chains(), "decrypt/gone.example.com") {
+		t.Fatal("an idle adopted chain goes after the sweep")
+	}
+}
+
+func TestNothingIsPublishedUntilEnvoysChainsAreKnown(t *testing.T) {
+	h := newHarness(t, 8)
+	h.view.snap.Pods = []nodeview.Pod{podOf("a", "10.0.0.1", "api.anthropic.com")}
+	down := errors.New("admin socket not there yet")
+	h.c.Installed = func(context.Context) ([]string, error) { return nil, down }
+	h.reconcile(t)
+	if h.out.sets != 0 {
+		t.Fatal("a listener published blind could drop chains Envoy holds")
+	}
+	h.c.Installed = func(context.Context) ([]string, error) { return nil, nil }
+	h.reconcile(t)
+	if h.out.sets != 1 {
+		t.Fatal("once Envoy answers, the listener is published")
+	}
+	// Adoption happens once.
+	h.c.Installed = func(context.Context) ([]string, error) { return nil, down }
+	h.reconcile(t)
+	if h.out.sets != 2 {
+		t.Fatal("after adoption, Envoy's admin is not needed to publish")
 	}
 }

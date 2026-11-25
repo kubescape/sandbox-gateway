@@ -97,3 +97,45 @@ func (c *Client) ServerInfo(ctx context.Context) (Info, error) {
 	}
 	return info, nil
 }
+
+// InstalledChains returns the names of the filter chains Envoy holds for the
+// listener named listener, in every state Envoy reports it in: active,
+// warming and draining. Nil when Envoy has no such listener.
+func (c *Client) InstalledChains(ctx context.Context, listener string) ([]string, error) {
+	var raw struct {
+		Configs []map[string]json.RawMessage `json:"configs"`
+	}
+	if err := c.get(ctx, "/config_dump", url.Values{"resource": {"dynamic_listeners"}}, &raw); err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, cfg := range raw.Configs {
+		var name string
+		if err := json.Unmarshal(cfg["name"], &name); err != nil || name != listener {
+			continue
+		}
+		for key, state := range cfg {
+			if !strings.HasSuffix(key, "_state") {
+				continue
+			}
+			var st struct {
+				Listener struct {
+					FilterChains []struct {
+						Name string `json:"name"`
+					} `json:"filter_chains"`
+				} `json:"listener"`
+			}
+			if err := json.Unmarshal(state, &st); err != nil {
+				return nil, fmt.Errorf("envoyadmin: config_dump %s.%s: %w", listener, key, err)
+			}
+			for _, fc := range st.Listener.FilterChains {
+				if fc.Name != "" && !seen[fc.Name] {
+					seen[fc.Name] = true
+					out = append(out, fc.Name)
+				}
+			}
+		}
+	}
+	return out, nil
+}
