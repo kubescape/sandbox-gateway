@@ -469,3 +469,22 @@ func TestNothingIsPublishedUntilEnvoysChainsAreKnown(t *testing.T) {
 		t.Fatal("after adoption, Envoy's admin is not needed to publish")
 	}
 }
+
+func TestPublishedIsCalledOnceTheFirstListenerIsOut(t *testing.T) {
+	h := newHarness(t, 8)
+	h.view.snap.Pods = []nodeview.Pod{podOf("a", "10.0.0.1", "api.anthropic.com")}
+	calls := 0
+	h.c.Published = func() { calls++ }
+	down := errors.New("admin socket not there yet")
+	h.c.Installed = func(context.Context) ([]string, error) { return nil, down }
+	h.reconcile(t)
+	if calls != 0 {
+		t.Fatal("the set is not known until Envoy's chains are adopted")
+	}
+	h.c.Installed = func(context.Context) ([]string, error) { return nil, nil }
+	h.reconcile(t)
+	h.reconcile(t)
+	if calls != 1 {
+		t.Fatalf("published called %d times", calls)
+	}
+}

@@ -189,3 +189,73 @@ func TestKickPushesLeavesOfANewIntermediate(t *testing.T) {
 		t.Fatal("the chain must carry the new intermediate")
 	}
 }
+
+func TestNothingIsAnsweredBeforeReady(t *testing.T) {
+	client, srv := dial(t)
+	ready := make(chan struct{})
+	srv.Ready = ready
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st, err := client.DeltaSecrets(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An Envoy that kept running reconnects at once and asks for its chains'
+	// secrets, before the host set knows them. It must not be told they are gone.
+	if err := st.Send(&discoveryv3.DeltaDiscoveryRequest{
+		TypeUrl:                SecretTypeURL,
+		ResourceNamesSubscribe: []string{"api.anthropic.com"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan *discoveryv3.DeltaDiscoveryResponse, 1)
+	go func() {
+		resp, err := st.Recv()
+		if err == nil {
+			got <- resp
+		}
+		close(got)
+	}()
+	select {
+	case resp := <-got:
+		t.Fatalf("answered before ready: %v", resp)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(ready)
+	resp := <-got
+	if resp == nil || len(resp.Resources) != 1 || len(resp.RemovedResources) != 0 {
+		t.Fatalf("after ready: %v", resp)
+	}
+}
+
+func TestSotWWaitsForReady(t *testing.T) {
+	client, srv := dial(t)
+	ready := make(chan struct{})
+	srv.Ready = ready
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st, err := client.StreamSecrets(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Send(&discoveryv3.DiscoveryRequest{TypeUrl: SecretTypeURL, ResourceNames: []string{"api.anthropic.com"}}); err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan *discoveryv3.DiscoveryResponse, 1)
+	go func() {
+		resp, err := st.Recv()
+		if err == nil {
+			got <- resp
+		}
+		close(got)
+	}()
+	select {
+	case resp := <-got:
+		t.Fatalf("answered before ready: %v", resp)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(ready)
+	if resp := <-got; resp == nil || len(resp.Resources) != 1 {
+		t.Fatalf("after ready: %v", resp)
+	}
+}

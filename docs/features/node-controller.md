@@ -110,6 +110,8 @@ So before its first publish, the node controller asks Envoy which decrypt chains
 
 Until Envoy's admin socket answers, nothing is published. On a fresh pod Envoy's admin starts before Envoy asks for listeners, so this costs at most one reconcile interval.
 
+Envoy also reconnects its SDS streams as soon as the new process's socket is up, and asks again for the secrets of the chains it holds. The SDS server holds every request until the first listener is published (`sds.Server.Ready`, closed by `Controller.Published`). Answering earlier would refuse names the host set has not adopted yet, and a refused name goes back to Envoy in `removed_resources`, which strips a live chain of its certificate.
+
 LDS is state of the world over one gRPC stream. A listener Envoy rejects (NACK) is logged and counted, and Envoy keeps the last one it accepted. The stream reads the listeners, their version and the signal for the next change together, and sends any version it has not sent before it waits again, so an update that lands mid-send is not lost.
 
 ## Certificates
@@ -214,7 +216,7 @@ The set is node-wide. Who is decrypted for a name is decided per pod. `NamesFor`
 - the names node-agent has sighted that one of its own patterns covers,
 - minus its `passthrough` entries. An entry with `*` is a pattern, any other is an exact name.
 
-Whether a name was sighted is kept apart from how its slot is counted. A sighted name that another pod's policy then lists as an exact host is counted as exact, and stays decrypted for the pod whose pattern covers it. A name a pattern covers but node-agent never sighted is decrypted only for the pods that list it as exact, and does not turn into a learned name when they stop.
+Whether a name was sighted is kept apart from how its slot is counted. A sighted name that another pod's policy then lists as an exact host is counted as exact, and stays decrypted for the pod whose pattern covers it. This holds also when the name was still waiting for a slot when a policy listed it, and when it was a retired exact host sighted again. A waiting name that a policy lists as exact while the set is full waits once, as an exact host: it is counted once over the cap and makes room for one name. A name a pattern covers but node-agent never sighted is decrypted only for the pods that list it as exact, and does not turn into a learned name when they stop.
 
 A name has one slot at most: a waiting name that is admitted as an exact host stops waiting.
 

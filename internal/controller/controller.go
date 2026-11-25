@@ -95,6 +95,11 @@ type Controller struct {
 	// NodeAddrs returns the node's own addresses, for the health listener's
 	// on-node check. Nil means none beyond the pods' and loopback.
 	NodeAddrs func() []netip.Addr
+	// Published is called once, after the first listener was handed to
+	// Listeners. By then the chains Envoy held are adopted and the view is
+	// applied, so the host set answers for every chain Envoy can ask a
+	// secret for. Use it to open the SDS gate (sds.Server.Ready).
+	Published func()
 	Config    xds.Config
 	Log       *slog.Logger
 	// Every is how often the loop runs with nothing to react to, to sweep
@@ -108,6 +113,8 @@ type Controller struct {
 	kick     chan struct{}
 	// adopted is set once the chains Envoy held at start are in the set.
 	adopted bool
+	// published is set once Published was called.
+	published bool
 
 	// Reconciles counts completed runs; Errors the ones that failed.
 	Reconciles, Errors atomic.Int64
@@ -281,6 +288,12 @@ func (c *Controller) Reconcile(ctx context.Context) error {
 		return err
 	}
 	c.Reconciles.Add(1)
+	if !c.published {
+		c.published = true
+		if c.Published != nil {
+			c.Published()
+		}
+	}
 	if changed {
 		counts := c.Set.Counts()
 		c.Log.Info("listener updated", "chains", len(chains), "pods", len(in.Pods),

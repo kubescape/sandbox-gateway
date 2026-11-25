@@ -66,10 +66,11 @@ type NodeSet struct {
 	rejected []string            // patterns and exact entries refused, sorted
 	overE    int                 // wanted exact hosts left out
 	overL    map[string]struct{} // sighted names waiting for a slot
-	// sighted holds the members that node-agent has seen in DNS answers. It
-	// is kept apart from how a member is counted: a sighted name that a
-	// policy also lists as exact stays sighted, so a pod whose own pattern
-	// covers it keeps being decrypted for it.
+	// sighted holds the names node-agent has seen in DNS answers, among the
+	// members and the wanted exact hosts left out by the cap. It is kept
+	// apart from how a member is counted: a sighted name that a policy also
+	// lists as exact stays sighted, so a pod whose own pattern covers it keeps
+	// being decrypted for it. Names in overL are sighted too, implicitly.
 	sighted map[string]bool
 	evicted int64
 }
@@ -199,14 +200,32 @@ func (s *NodeSet) Apply(w Wanted) (changed bool) {
 		s.exact[name] = true
 		changed = true
 	}
-	// Sighted names that were waiting, with the slots exact hosts left.
-	// A waiting name that is now a member (an exact host admitted above, for
-	// one) no longer waits: it must not take a second slot or make room.
+	// A waiting name that a policy now lists as exact no longer waits as
+	// learned: it is admitted above or counted once in overE, and must not
+	// take a second slot or make room twice. Its sighting is kept, so the pods
+	// whose pattern covers it are decrypted for it once it is in.
 	for name := range s.overL {
-		if !s.matches(name) || s.isMember(name) {
+		switch {
+		case want[name] || s.isMember(name):
+			delete(s.overL, name)
+			s.sighted[name] = true
+		case !s.matches(name):
 			delete(s.overL, name)
 		}
 	}
+	// A sighting is kept for members and for wanted exact hosts still left
+	// out. A sighted name that is neither any more waits again as learned if a
+	// pattern covers it, and is forgotten if not.
+	for name := range s.sighted {
+		if s.isMember(name) || want[name] {
+			continue
+		}
+		delete(s.sighted, name)
+		if s.matches(name) && len(s.overL) < overCapMemory {
+			s.overL[name] = struct{}{}
+		}
+	}
+	// Sighted names that were waiting, with the slots exact hosts left.
 	var waiting []string
 	for name := range s.overL {
 		waiting = append(waiting, name)
@@ -296,9 +315,12 @@ func (s *NodeSet) Observe(name string) (changed bool) {
 		return false
 	}
 	if r, ok := s.retired[name]; ok && !r.evicted {
+		// Taken back. Pods whose pattern covers it are decrypted for it again,
+		// and stay so if a policy later lists it as exact.
 		delete(s.retired, name)
 		s.learned[name] = s.lru.PushFront(name)
-		return false
+		s.sighted[name] = true
+		return true
 	}
 	if _, leaving := s.retired[name]; leaving || s.size() >= s.cap {
 		// The name waits. Room is made for it at the next Apply and not here:

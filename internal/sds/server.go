@@ -79,6 +79,13 @@ type Server struct {
 	// pushes any leaf the minter has renewed. Envoy asks for a secret once and keeps
 	// it, so without this push a leaf expires in place. 0 disables it.
 	RenewEvery time.Duration
+	// Ready, when set, holds every request until it is closed. A node
+	// controller that restarts while Envoy keeps running is asked for the
+	// secrets of the chains Envoy holds as soon as its socket is up, before
+	// its host set knows those names; answering then would refuse them and
+	// strip live chains of their certificates. Close it once the host set has
+	// been filled. Set it before serving. Nil means ready at once.
+	Ready <-chan struct{}
 
 	kickMu sync.Mutex
 	kick   chan struct{} // closed and remade by Kick
@@ -136,6 +143,19 @@ func version(leaf ca.Leaf) string {
 }
 
 func (s *Server) nextNonce() string { return strconv.FormatUint(s.nonce.Add(1), 10) }
+
+// waitReady blocks until Ready is closed or ctx ends.
+func (s *Server) waitReady(ctx context.Context) error {
+	if s.Ready == nil {
+		return nil
+	}
+	select {
+	case <-s.Ready:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 // DeltaSecrets is the incremental transport. Each subscribe gets an answer:
 // a certificate, or the name in removed_resources.
@@ -235,6 +255,9 @@ func (s *Server) DeltaSecrets(stream secretv3.SecretDiscoveryService_DeltaSecret
 			mu.Unlock()
 		}
 		if names := req.GetResourceNamesSubscribe(); len(names) > 0 {
+			if err := s.waitReady(stream.Context()); err != nil {
+				return err
+			}
 			if err := send(names, false); err != nil {
 				return err
 			}
@@ -263,6 +286,9 @@ func (s *Server) StreamSecrets(stream secretv3.SecretDiscoveryService_StreamSecr
 		if req.GetResponseNonce() != "" && key == lastSent {
 			continue // ACK of what we already sent
 		}
+		if err := s.waitReady(stream.Context()); err != nil {
+			return err
+		}
 		resp, err := s.sotwResponse(req.GetResourceNames())
 		if err != nil {
 			return err
@@ -275,7 +301,10 @@ func (s *Server) StreamSecrets(stream secretv3.SecretDiscoveryService_StreamSecr
 }
 
 // FetchSecrets is the unary REST-style transport, handy for curl-free tests.
-func (s *Server) FetchSecrets(_ context.Context, req *discoveryv3.DiscoveryRequest) (*discoveryv3.DiscoveryResponse, error) {
+func (s *Server) FetchSecrets(ctx context.Context, req *discoveryv3.DiscoveryRequest) (*discoveryv3.DiscoveryResponse, error) {
+	if err := s.waitReady(ctx); err != nil {
+		return nil, err
+	}
 	return s.sotwResponse(req.GetResourceNames())
 }
 

@@ -109,9 +109,14 @@ func main() {
 	lds := xds.NewLDS(log)
 	secrets := sds.New(sds.Gated{Allow: set.Contains, Leaves: authority}, log)
 	secrets.RenewEvery = *renew
+	// No secret is answered until the host set holds the chains Envoy may
+	// already run (see sds.Server.Ready).
+	secretsReady := make(chan struct{})
+	secrets.Ready = secretsReady
 	ctrl := &controller.Controller{
 		View: view, Set: set, Authority: authority, Listeners: lds, Activity: activity,
 		KickSecrets: secrets.Kick, Log: log, NodeAddrs: localAddrs,
+		Published: func() { close(secretsReady) },
 		Installed: func(ctx context.Context) ([]string, error) {
 			return admin.InstalledChains(ctx, xds.EgressListener)
 		},

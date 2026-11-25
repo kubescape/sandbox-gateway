@@ -431,3 +431,79 @@ func TestAdoptKeepsInstalledChains(t *testing.T) {
 		t.Fatalf("counts = %+v", c)
 	}
 }
+
+func TestAWaitingNameWantedAsExactAtTheCapNeedsOneSlot(t *testing.T) {
+	s := NewNodeSet(3, nil)
+	w := Wanted{Exact: []string{"api.anthropic.com"}, Patterns: []string{"*.openai.azure.com"}}
+	s.Apply(w)
+	s.Observe("a.openai.azure.com")
+	s.Observe("b.openai.azure.com")
+	s.Observe("c.openai.azure.com") // the set is full: c waits
+	// A policy now lists c as an exact host. It is one name left out, not two.
+	w.Exact = append(w.Exact, "c.openai.azure.com")
+	s.Apply(w)
+	if c := s.Counts(); c.OverCap != 1 || c.Evictions != 1 {
+		t.Fatalf("one name waits, one learned name makes room for it: %+v", c)
+	}
+	s.Sweep()
+	s.Apply(w)
+	if !s.Contains("c.openai.azure.com") || !s.Contains("b.openai.azure.com") {
+		t.Fatalf("names = %v", s.Names())
+	}
+}
+
+func TestAWaitingNameAdmittedAsExactKeepsItsSighting(t *testing.T) {
+	s := NewNodeSet(2, nil)
+	pattern := []string{"*.openai.azure.com"}
+	w := Wanted{Exact: []string{"api.anthropic.com"}, Patterns: pattern}
+	s.Apply(w)
+	s.Observe("a.openai.azure.com")
+	s.Observe("b.openai.azure.com") // the set is full: b waits
+	// Another pod lists b as exact, and api leaves: once api's slot is free, b
+	// is admitted as exact.
+	w.Exact = []string{"b.openai.azure.com"}
+	s.Apply(w)
+	s.Sweep()
+	s.Apply(w)
+	if c := s.Counts(); c.Exact != 1 || c.OverCap != 0 {
+		t.Fatalf("b is in as exact: %+v (%v)", c, s.Names())
+	}
+	// node-agent posted b once. A pod whose pattern covers it is decrypted for
+	// it. (a was evicted to make room.)
+	if got := s.NamesFor(nil, pattern, nil); !reflect.DeepEqual(got, []string{"b.openai.azure.com"}) {
+		t.Fatalf("pattern pod gets %v", got)
+	}
+}
+
+func TestARetiredExactNameSightedAgainKeepsItsSighting(t *testing.T) {
+	s := NewNodeSet(8, nil)
+	pattern := []string{"*.openai.azure.com"}
+	w := Wanted{Exact: []string{"x.openai.azure.com"}, Patterns: pattern}
+	s.Apply(w)
+	w.Exact = nil
+	s.Apply(w) // x was never sighted: it retires
+	if !s.Observe("x.openai.azure.com") {
+		t.Fatal("taking x back changes what pods are decrypted for")
+	}
+	w.Exact = []string{"x.openai.azure.com"}
+	s.Apply(w)
+	if got := s.NamesFor(nil, pattern, nil); !reflect.DeepEqual(got, []string{"x.openai.azure.com"}) {
+		t.Fatalf("pattern pod gets %v", got)
+	}
+}
+
+func TestASightedExactNameLeftOutWaitsAgainWhenNoLongerExact(t *testing.T) {
+	s := NewNodeSet(2, busySet{"a.openai.azure.com": true, "b.openai.azure.com": true}.is)
+	w := Wanted{Patterns: []string{"*.openai.azure.com"}}
+	s.Apply(w)
+	s.Observe("a.openai.azure.com")
+	s.Observe("b.openai.azure.com")
+	s.Observe("c.openai.azure.com") // waits; a and b are busy
+	w.Exact = []string{"c.openai.azure.com"}
+	s.Apply(w) // c is wanted as exact and still left out
+	w.Exact = nil
+	s.Apply(w) // no longer exact: c, sighted, waits as learned again
+	if c := s.Counts(); c.OverCap != 1 {
+		t.Fatalf("c still waits: %+v", c)
+	}
+}
