@@ -1,1 +1,3 @@
 test/integration/generated/
+__pycache__/
+*.pyc

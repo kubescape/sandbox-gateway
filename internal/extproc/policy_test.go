@@ -124,6 +124,9 @@ func TestMissingReferenceDegradesAfterFiveMinutes(t *testing.T) {
 	if r := f.lastRequest(); r.Degraded || len(r.Sections) != 1 {
 		t.Fatalf("first request: degraded=%v sections=%d", r.Degraded, len(r.Sections))
 	}
+	// Records are emitted when a transaction ends; wait for the first so the
+	// two cannot arrive out of order.
+	h.waitRecords(t, 1)
 	clk.advance(5 * time.Minute)
 	oneRequest(t, h, "api.anthropic.com")
 	if !f.lastRequest().Degraded {

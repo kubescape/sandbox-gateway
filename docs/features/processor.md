@@ -43,7 +43,7 @@ The pod's namespace, pod name, container, binding id, fail posture and original 
 
 ### What the Envoy config must do
 
-The identity is only as good as `source.address`, so the listener must report the socket's own address. `deploy/envoy/envoy.yaml` does two things for that, and a config that drops either lets a pod be taken for another pod:
+The identity is only as good as `source.address`, so the listener must report the socket's own address. The decrypting chain the node controller serves (`internal/xds/templates/decrypt_chain.yaml`) does two things for that, and a config that drops either lets a pod be taken for another pod:
 
 - It has no `proxy_protocol` listener filter. That filter replaces the remote address with the one in the PROXY header, which the pod writes.
 - The HTTP connection manager sets `use_remote_address: true`. Without it Envoy takes the remote address from an `X-Forwarded-For` header.
@@ -51,6 +51,14 @@ The identity is only as good as `source.address`, so the listener must report th
 `test/integration/run.sh` sends both a forged `X-Forwarded-For` header and a PROXY protocol line and fails if the processor sees the forged address.
 
 The proof of concept's explicit-proxy listener (port 3128) is gone from the gateway's Envoy config. A connection that arrived through it had no socket address to look up and no `conns` entry, so the processor refused every request on it with `no_source_address`.
+
+### Request position
+
+The verdict record's join key ends in `request_position`. The C7 contract defines it as the HTTP/2 stream id, or the request's ordinal on an HTTP/1.1 connection. The processor sends neither, so the record has no `request_position`, and the backend uses the contract's fallback join: the connection plus method, path and a time window. The record keeps the method and path (as `gateway.method` and `gateway.path`) and its timestamp for that join.
+
+We checked the stream id against Envoy v1.40.2, with an ext_proc server that printed every attribute it received. The client opened three HTTP/2 streams on one connection, then sent three HTTP/1.1 requests on another. Envoy has no stream id attribute and drops unknown attribute names without a word. The `%STREAM_ID%` access-log field is Envoy's own id for the stream, not the HTTP/2 one. The three HTTP/2 streams reached the processor in the order a, c, b, so a count of them gives the order they reached the processor, not the order the client opened them.
+
+The HTTP/1.1 ordinal looks easy, since `connection.id` arrives with every request and the requests on a connection run one after another. But a count is only right if the processor saw the connection's first request, and nothing Envoy sends says so: there is no connection start time and no request count per connection. After a processor restart, a connection that was already open looks like a new one, and the next request would be numbered 1. A wrong position that looks valid would join a verdict to another request's capture, which is worse than no position.
 
 ### Map layout
 
@@ -121,11 +129,35 @@ Both blocks above happen at the request headers, so none of the request reaches 
 | `pkg/jsonscan` | reads named top-level string fields, such as `model`, from a JSON request body in constant memory |
 | `internal/sse` | splits a server-sent event stream into events, whatever the chunk boundaries |
 | `internal/streamfmt` | recognises Anthropic Messages, OpenAI Chat Completions and OpenAI Responses events, and tracks the items, the stop reason and the end of the stream |
-| `internal/renumber` | removes items from a stream and renumbers the ones after them; nothing in the processor calls it yet |
+| `internal/renumber` | removes items from a stream and renumbers the ones after them |
 | `internal/eventstream` | AWS event-stream frames (Bedrock) |
 | `internal/wsframe` | WebSocket frames after an upgrade |
 
 The record's `stop_reason` comes from `streamfmt`: Anthropic's `stop_reason`, OpenAI's `finish_reason`, or the status of a Responses stream's closing event.
+
+Removal has no policy rule yet. `extproc.Config.Remove` (`app.Config.Remove`) turns it on: once per SSE response it gives the filter that picks the items to remove, and the processor runs `internal/renumber` over what it forwards. Only `test/processor-it -remove-first-tool` sets it. The record still counts the stream the provider sent. If the editor meets an event too large to edit once it knows the stream's format, it ends the stream with the evaluator's `StreamError` and the record ends `edit_error`, because forwarding that event unedited could leak a removed item.
+
+## The record
+
+Every transaction ends in one record, whatever ended it: an allowed request, a blocked one, a rejected connection, or the stall watchdog. The JSON log line (and `-records`) carries the full transaction. OTLP gets the verdict record of contract C7: one log record per transaction, family `R-L7-GW` (the instrumentation scope name), with no request or response bytes (`internal/record`).
+
+Its attributes use the C7 names as they are:
+
+| Attribute | Value |
+|---|---|
+| `crd_uid`, `crd_revision`, `rule`, `origin`, `verdict`, `mode` | from the verdict. A connection refused before any policy applied is `deny` in `enforce` mode, with rule `framework.` plus the reject reason (`framework.no-connection-entry`, for one) |
+| `would_deny`, `degraded` | as on the log line |
+| `tier` | always `gateway` |
+| `fail_posture`, `namespace`, `pod`, `container`, `controller_kind`, `controller_name` | the identity |
+| `provider`, `model` | what `Classify` returned |
+| `destination_state` | `blocked` for a denied or rejected request, otherwise `inspected`. The processor never sees passthrough traffic |
+| `fail_open_window` | the pod's health gate was failing open or recovering when the request arrived |
+| `upstream_content_encoding` | only when the upstream answered with an encoding other than `identity` |
+| `conn_local_addr`, `conn_local_port`, `orig_dst` | the join key. `request_position` is never sent (above) |
+
+Everything else the processor measured goes under `gateway.`: the transaction id, authority, method, path and protocol, status, how the transaction ended, byte and event counts, timings, the reject reason, and the kernel half of the identity.
+
+Each export carries three resource attributes: `service.name` (`sandbox-egress-gateway`), `k8s.node.name` (from `NODE_NAME`) and `account`, the tenant, from `ACCOUNT_ID`. The backend's ingester keys records on `account` (SUB-9954).
 
 ## Flags
 
@@ -146,6 +178,19 @@ The record's `stop_reason` comes from `streamfmt`: Anthropic's `stop_reason`, Op
 
 `go test -race ./...` covers the packages. `internal/extproc` tests the evaluator seam against a fake evaluator whose calls can be made to stall or panic. The pinned-map test in `internal/conntable` needs root and runs as root in CI.
 
-`test/integration/run.sh` runs Envoy with `test/processor-it`, which is the same server against an in-memory table that names one fixed pod, because the stack has no eBPF redirect. The fixture runs with `-evaluator`, a test evaluator that denies the model `denied-model`, and with `-policies test/integration/policies.yaml` instead of an API server. It checks a streamed call end to end, that the record names the pod, that a request for the denied model gets the evaluator's 403 and a `denied` record, that a decrypted host the policy does not list is refused by the decrypt-list guard, that a client cannot change the address the processor sees, that an empty table refuses the request, and that the shipped processor image will not start without the maps.
+`TestThirtyMiBPromptUnder16MiB` sends a 30 MiB prompt in 64 KiB chunks through an enforce-mode evaluator that scans the whole body with `jsonscan`. The processor runs in a child process, so the test client's own allocations are not counted, and samples its heap every millisecond. Its live heap (what each GC finds still reachable) must grow by less than 16 MiB. The 16 MiB budget is a budget for live heap, the memory the processor holds on to. On a laptop it grows by about 11 MiB, most of it gRPC's buffer pool, and by 10 to 12 MiB for prompts from 10 to 60 MiB, so the body is streamed, not held. The peak `HeapAlloc` is about 22 MiB over a 1 MiB base and is only logged: it also counts each chunk's short-lived copies (gRPC's receive buffer and protobuf's copy of the body) until the next GC, so it measures GC pacing, which `GOGC` and `GOMEMLIMIT` set, rather than what the processor keeps.
+
+`test/integration/run.sh` runs Envoy with `test/processor-it`, which is the same server against an in-memory table that names one fixed pod, because the stack has no eBPF redirect. The fixture runs with `-evaluator`, a test evaluator that denies the model `denied-model`, and with `-policies test/integration/policies.yaml` instead of an API server. It checks a streamed call end to end, that the record names the pod, that no record carries a `request_position`, for three HTTP/1.1 requests on one connection or for an HTTP/2 request, that a request for the denied model gets the evaluator's 403 and a `denied` record, that a decrypted host the policy does not list is refused by the decrypt-list guard, that a client cannot change the address the processor sees, that an empty table refuses the request, and that the shipped processor image will not start without the maps.
+
+`SDK=1 test/integration/run.sh` (CI job "SDK streams") runs the stack with `-remove-first-tool` and a policy that decrypts both hosts, then streams three mock scenarios with the provider SDKs through Envoy as `it-pod`, trusting only the gateway CA. With no redirect in the stack, each client sends its connections to the providers' hosts on port 443 to Envoy's redirect listener itself, keeping the provider's URL, SNI and Host. The SDKs are Python `anthropic` 2.6.0 and `openai` 3.46.0, Node `@anthropic-ai/sdk` 1.6.0 and `openai` 7.53.0, each with the raw event iterator and the stream helper (`test/sdk`). The scenarios are Anthropic text, tool, text (`s4-a-text-tool-text`), an OpenAI chat response with two tool calls (`s4-o-baseline`), and a Responses function call followed by a message (`s4-r-baseline`). It also streams `s4-a-trailers` with streamcheck: the tool is removed, the last event's blank line is a lone CR, and the body ends in an HTTP trailer (the generated Envoy config enables trailers on the mock's cluster). The processor must forward the event the editor still holds before it answers the trailers. `test/sdk/check.py` requires that no SDK raises, that the removed call is gone and the remaining indexes run from 0, that Anthropic's second text block (index 2 upstream) arrives as index 1 with the stop reason still `tool_use`, that Responses sequence numbers stay contiguous, and that no helper's final object holds the removed item.
 
 `test/smoke/run.sh` (CI job "Processor image smoke") runs the shipped image itself in kind: as its own user, against empty `conns` and `bindings` maps pinned in the node's bpffs (`test/smoke/pinmaps`), with a service account against a real API server and the storage CRDs. The account starts with no RBAC, so the health path must answer 503; once a ClusterRole with `list` and `watch` on both kinds is bound to it, the informers sync and it must answer 200 with `"evaluator":"unavailable"`. The same image with no maps must exit with "open the connection tables". The processor opens the maps as a non-root user with no capabilities. A kernel that refuses `bpf()` to unprivileged users (`kernel.unprivileged_bpf_disabled` on older kernels) would need `CAP_BPF` for it; the smoke job shows what the CI runner's kernel allows.
+
+### Latency
+
+`test/bench/latency.sh` starts the integration stack in its own compose project, with the test evaluator in enforce mode and the mock streaming 40 text deltas 20 ms apart. `latbench` sends the same streamed request 200 times straight to the mock's TLS listener and 200 times through Envoy and the processor, each on a new connection. The script prints, for time to first token and the gap between events, the p99 of the proxied path minus the direct path, and fails above +10 ms or +1 ms. It also prints the processor's own time per response chunk from its records.
+
+The CI job "Latency bench" runs it three times on GitHub's Ubuntu runner, where Docker runs natively. It reports and does not gate yet, because shared runners are noisy too. Its first three runs added 1.74, 1.64 and 1.79 ms to TTFT at p99, and 0.24, 0.26 and 0.27 ms to the event gap. The processor spent 28 µs per chunk on average, and the slowest chunk of a call was at most 108 to 183 µs at p99.
+
+A laptop is not the place to judge the 1 ms budget. Three runs on an Apple M1 Pro (8 cores, 16 GB, macOS 15.7, Docker Desktop with 8 CPUs) added 3.3, 13.0 and 7.3 ms to TTFT at p99, and 1.88, 1.98 and 0.84 ms to the event gap. The processor's own work is about 40 to 65 µs per chunk on average, but single chunks took up to 9 ms. With `GODEBUG=gctrace=1`, the processor's GC stop-the-world phases took 0.7 to 2.3 ms of wall clock in Docker Desktop's VM, against tens of microseconds on a native Linux host, and the direct path's own p99 event gap was 30 ms for events sent 20 ms apart. The VM's scheduling is larger than the budget being measured.
+

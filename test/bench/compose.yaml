@@ -1,0 +1,21 @@
+# The latency bench: an overlay on the integration stack (test/integration/compose.yaml).
+# The processor runs the test evaluator in enforce mode, as there. The mock streams 40
+# text deltas 20 ms apart, on its plain listener for Envoy and on its TLS listener (:443,
+# its own self-signed leaf) for the direct path. latbench runs both paths as it-pod, the
+# address the redirect listener decrypts for.
+#
+#   test/bench/latency.sh
+
+services:
+  mock-anthropic:
+    command: ["mock-anthropic", "--listen", ":8080", "--tls-listen", ":443",
+              "--words", "40", "--chunk-delay", "20ms"]
+
+  latbench:
+    image: sandbox-gateway/test-fixtures:${IT_TAG:-it}
+    profiles: [bench]
+    depends_on: [envoy]
+    command: ["latbench", "-n", "${BENCH_RUNS:-200}", "-direct", "mock-anthropic:443", "-proxied", "envoy:18443"]
+    networks:
+      default:
+        ipv4_address: 172.30.0.21

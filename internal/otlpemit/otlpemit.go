@@ -18,6 +18,8 @@ import (
 	collogs "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 	logsv1 "go.opentelemetry.io/proto/otlp/logs/v1"
+
+	"github.com/kubescape/sandbox-gateway/internal/record"
 	resv1 "go.opentelemetry.io/proto/otlp/resource/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -37,6 +39,8 @@ type Exporter struct {
 }
 
 // New returns an exporter for an OTLP/HTTP endpoint (e.g. http://collector:4318).
+// accountID is the tenant, sent as the "account" resource attribute, which
+// the backend's ingester keys records on (SUB-9954).
 func New(endpoint, nodeName, accountID string) *Exporter {
 	return &Exporter{
 		endpoint: endpoint,
@@ -74,7 +78,7 @@ func (e *Exporter) Flush() error {
 	}
 	req := &collogs.ExportLogsServiceRequest{ResourceLogs: []*logsv1.ResourceLogs{{
 		Resource:  &resv1.Resource{Attributes: e.resource},
-		ScopeLogs: []*logsv1.ScopeLogs{{Scope: &commonv1.InstrumentationScope{Name: "egress-gateway-poc"}, LogRecords: batch}},
+		ScopeLogs: []*logsv1.ScopeLogs{{Scope: &commonv1.InstrumentationScope{Name: record.Family}, LogRecords: batch}},
 	}}}
 	b, err := proto.Marshal(req)
 	if err != nil {

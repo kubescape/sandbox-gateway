@@ -86,8 +86,9 @@ filters:
           response_body_mode: FULL_DUPLEX_STREAMED
           request_trailer_mode: SEND
           response_trailer_mode: SEND
-        # The processor looks the downstream remote address up in the connection table.
-        request_attributes: [source.address]
+        # The processor looks the downstream remote address up in the connection table,
+        # and puts the request's protocol on its record.
+        request_attributes: [source.address, request.protocol]
         # kubescape.sandbox.attribution is empty with this config. It stays forwarded so
         # that, if a proxy_protocol filter is ever added, the processor flags the identity
         # a client claims and does not use it.

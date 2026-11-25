@@ -1,0 +1,18 @@
+# The policy object for the SDK run (run.sh with SDK=1): it decrypts both
+# hosts, so the OpenAI SDKs reach the mock through the processor too.
+apiVersion: kubescape.io/v1alpha1
+kind: SandboxPolicy
+metadata:
+  name: it-sdk
+  namespace: it
+  uid: 00000000-0000-0000-0000-000000000002
+  generation: 1
+spec:
+  selector: {podSelector: {}}
+  containers: ["*"]
+  mode: enforce
+  http:
+    default: {llm: allow, mcp: allow, other: allow}
+    onUnavailable: allow
+    decrypt:
+      exactHosts: [api.anthropic.com, api.openai.com]

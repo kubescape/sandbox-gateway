@@ -15,6 +15,11 @@
 # paths, an SNI flood, chains added and removed under live connections with a cap of
 # three names, leaf renewal, a node controller restart under a live connection, an SDS
 # outage, and a change of root.
+#
+# SDK=1 runs the SDK job instead: the processor removes the first tool or
+# function call of each response (-remove-first-tool), and the Python and Node
+# provider SDKs stream three scenarios through Envoy, trusting only the gateway
+# CA. test/sdk/check.py checks what they saw.
 set -euo pipefail
 cd "$(dirname "$0")"
 export ENVOY_VERSION="${ENVOY_VERSION:-v1.40.2}"
@@ -32,7 +37,41 @@ cleanup() {
 trap cleanup EXIT
 
 ./make-envoy-config.sh
+mkdir -p generated
 "${COMPOSE[@]}" build
+
+if [ "${SDK:-}" = 1 ]; then
+  export IT_POLICIES=./policies-sdk.yaml PROCESSOR_EDIT=--remove-first-tool
+  "${COMPOSE[@]}" --profile sdk build sdk-python sdk-node
+  "${COMPOSE[@]}" up -d
+  for _ in $(seq 1 60); do
+    "${COMPOSE[@]}" logs --no-color origdst 2>/dev/null | grep -q 'attached: SO_ORIGINAL_DST' && break
+    sleep 1
+  done
+  # Envoy gets its listeners from the node controller after it starts. streamcheck
+  # retries until a streamed call goes through as it-pod; the SDK clients try once.
+  echo "--- the redirect listener serves it-pod"
+  "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:18443 --ca /certs/ca.crt --wait 60s >/dev/null
+  echo "--- SDKs on streams with the first tool call removed"
+  "${COMPOSE[@]}" --profile sdk run --rm -T sdk-python > generated/sdk-python.jsonl
+  "${COMPOSE[@]}" --profile sdk run --rm -T sdk-node > generated/sdk-node.jsonl
+  cat generated/sdk-python.jsonl generated/sdk-node.jsonl
+  echo "--- an edited response that ends in trailers keeps its last event"
+  # s4-a-trailers: the tool is removed, the last event's blank line is a lone CR, and the
+  # body ends with a trailer, so the processor must flush the editor before the trailers.
+  "${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:18443 --ca /certs/ca.crt \
+    --model s4-a-trailers | tee generated/trailers.json
+  grep -q '"message_stop":true' generated/trailers.json
+  sleep 1
+  "${COMPOSE[@]}" logs --no-color --no-log-prefix processor | grep '"msg":"transaction"' | tail -1 | tee generated/trailers-record.json
+  grep -q '"ended":"trailers"' generated/trailers-record.json
+
+  "${COMPOSE[@]}" --profile sdk run --rm -T -v "$PWD/generated:/out:ro" sdk-python \
+    python check.py /out/sdk-python.jsonl /out/sdk-node.jsonl
+  echo "PASS"
+  exit 0
+fi
+
 "${COMPOSE[@]}" --profile tools build processor-image
 "${COMPOSE[@]}" up -d
 echo "--- original-destination stand-in"
@@ -71,6 +110,16 @@ sleep 1
 grep -q '"stop_reason":"end_turn"' generated/record.json
 grep -Eq '"sse_events":[1-9]' generated/record.json
 grep -q '"pod":"it-pod"' generated/record.json
+
+echo "--- no request_position: the processor cannot prove it saw a connection's first request"
+grep -q '"protocol":"HTTP/2"' generated/record.json
+"${COMPOSE[@]}" run --rm -T client streamcheck --addr envoy:18443 --ca /certs/ca.crt --http1 --repeat 3 >/dev/null
+sleep 1
+"${COMPOSE[@]}" logs --no-color --no-log-prefix processor | grep '"msg":"transaction"' | tail -3 > generated/http1-records.jsonl
+[ "$(grep -c '"protocol":"HTTP/1.1"' generated/http1-records.jsonl)" = 3 ]
+if grep -q '"request_position"' generated/record.json generated/http1-records.jsonl; then
+  echo "FAIL: a record has a request_position"; exit 1
+fi
 
 echo "--- a pod is decrypted only for the hosts its own policy names"
 # other-pod's policy names api.openai.com. It is decrypted for that host: the leaf is the

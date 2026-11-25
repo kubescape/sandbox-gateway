@@ -113,10 +113,10 @@ func TestRunServesAndStops(t *testing.T) {
 }
 
 func TestRecordAttrsIdentity(t *testing.T) {
-	a := RecordAttrs(extproc.Record{Ended: "eos", Identity: &extproc.Identity{
+	a := (extproc.Record{Ended: "eos", Identity: &extproc.Identity{
 		Namespace: "agents", Pod: "p", Container: "c", ControllerKind: "Deployment", ControllerName: "d",
 		Posture: "deny", ConnLocalAddr: "10.0.0.5", ConnLocalPort: 4242, OrigDst: "1.2.3.4:443",
-	}})
+	}}).C7().Attrs()
 	for k, want := range map[string]any{"namespace": "agents", "pod": "p", "container": "c", "controller_kind": "Deployment",
 		"controller_name": "d", "fail_posture": "deny", "conn_local_addr": "10.0.0.5", "conn_local_port": 4242, "orig_dst": "1.2.3.4:443"} {
 		if a[k] != want {

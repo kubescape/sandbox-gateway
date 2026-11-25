@@ -43,13 +43,23 @@ func main() {
 	expect := flag.Int("expect-status", 0, "pass when the response has this status, without reading a stream")
 	xff := flag.String("x-forwarded-for", "", "send this X-Forwarded-For header, to check that the gateway does not take the client's address from it")
 	proxyLine := flag.String("proxy-header", "", "write this PROXY protocol v1 line before the TLS handshake, to check that the gateway does not accept one")
+	http1 := flag.Bool("http1", false, "speak HTTP/1.1 instead of HTTP/2")
+	repeat := flag.Int("repeat", 1, "send the request this many times, reusing one connection")
 	flag.Parse()
 
 	deadline := time.Now().Add(*wait)
 	for {
-		res, err := call(*addr, *host, *hostHeader, *caPath, *model, *xff, *proxyLine, *expect)
+		res, err := call(*addr, *host, *hostHeader, *caPath, *model, *xff, *proxyLine, *expect, *http1)
 		if err == nil {
 			_ = json.NewEncoder(os.Stdout).Encode(res)
+			for i := 1; i < *repeat; i++ {
+				res, err := call(*addr, *host, *hostHeader, *caPath, *model, *xff, *proxyLine, *expect, *http1)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "streamcheck: repeat:", err)
+					os.Exit(1)
+				}
+				_ = json.NewEncoder(os.Stdout).Encode(res)
+			}
 			return
 		}
 		if time.Now().After(deadline) {
@@ -61,18 +71,32 @@ func main() {
 	}
 }
 
-func call(addr, host, hostHeader, caPath, model, xff, proxyLine string, expect int) (result, error) {
+// client is kept across calls, so -repeat reuses its connection.
+var client *http.Client
+
+func call(addr, host, hostHeader, caPath, model, xff, proxyLine string, expect int, http1 bool) (result, error) {
 	var res result
+	if client == nil {
+		c, err := newClient(addr, host, caPath, proxyLine, http1)
+		if err != nil {
+			return res, err
+		}
+		client = c
+	}
+	return send(client, host, hostHeader, model, xff, expect, res)
+}
+
+func newClient(addr, host, caPath, proxyLine string, http1 bool) (*http.Client, error) {
 	pem, err := os.ReadFile(caPath)
 	if err != nil {
-		return res, err
+		return nil, err
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(pem) {
-		return res, fmt.Errorf("no certificate in %s", caPath)
+		return nil, fmt.Errorf("no certificate in %s", caPath)
 	}
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	client := &http.Client{Transport: &http.Transport{
+	tr := &http.Transport{
 		// Every connection goes to the gateway, whatever the URL says. This
 		// stands in for the redirect.
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
@@ -87,8 +111,17 @@ func call(addr, host, hostHeader, caPath, model, xff, proxyLine string, expect i
 			return conn, nil
 		},
 		TLSClientConfig:   &tls.Config{RootCAs: pool, ServerName: host, MinVersion: tls.VersionTLS12},
-		ForceAttemptHTTP2: true,
-	}}
+		ForceAttemptHTTP2: !http1,
+		MaxConnsPerHost:   1,
+	}
+	if http1 {
+		tr.TLSClientConfig.NextProtos = []string{"http/1.1"}
+		tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{} // no HTTP/2
+	}
+	return &http.Client{Transport: tr}, nil
+}
+
+func send(client *http.Client, host, hostHeader, model, xff string, expect int, res result) (result, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	body := fmt.Sprintf(`{"model":%q,"stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`, model)

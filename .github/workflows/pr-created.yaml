@@ -95,6 +95,33 @@ jobs:
       - name: Streamed call through Envoy
         run: test/integration/run.sh
 
+  sdk:
+    name: SDK streams
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false }
+      - name: Provider SDKs on streams with a tool call removed
+        run: test/integration/run.sh
+        env: { SDK: "1" }
+
+  # What the gateway adds to a streamed call, on a Linux host with Docker native (a laptop's
+  # Docker VM adds GC and scheduling pauses of its own). Three runs; the budget is +10 ms p99
+  # TTFT and +1 ms p99 per event. It reports and does not gate yet: shared runners are noisy
+  # too, and the gate waits for numbers from them.
+  latency:
+    name: Latency bench
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false }
+      - name: Proxied minus direct, three runs
+        run: |
+          status=0
+          for i in 1 2 3; do echo "::group::run $i"; test/bench/latency.sh || status=1; echo "::endgroup::"; done
+          exit "$status"
+
   smoke:
     name: Processor image smoke
     runs-on: ubuntu-latest

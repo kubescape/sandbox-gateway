@@ -52,11 +52,29 @@ func anthropicScenario(w http.ResponseWriter, model string) bool {
 		return false
 	}
 	w.Header().Set("content-type", "text/event-stream")
+	if model == "s4-a-trailers" {
+		w.Header().Set("Trailer", "X-S4-End") // announced before the body
+	}
 	aStart(w, model)
 	switch model {
-	case "s4-a-baseline": // text, tool, text; stop_reason tool_use
+	case "s4-a-trailers": // text, tool, text, end_turn; the response ends in a trailer, and the
+		// last event's blank line is a lone CR, which only the end of the stream completes.
 		aText(w, 0, "Let me look.")
 		aTool(w, 1)
+		aText(w, 2, "Done.")
+		sse(w, "message_delta", `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":10}}`)
+		fmt.Fprint(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\r")
+		w.Header().Set("X-S4-End", "done")
+		return true
+	case "s4-a-baseline": // text, tool; stop_reason tool_use
+		aText(w, 0, "Let me look.")
+		aTool(w, 1)
+		aEnd(w, "tool_use")
+	case "s4-a-text-tool-text": // text, tool, text; stop_reason tool_use. Removing the
+		// tool renumbers the second text block, which s4-a-baseline cannot show.
+		aText(w, 0, "Let me look.")
+		aTool(w, 1)
+		aText(w, 2, "Done.")
 		aEnd(w, "tool_use")
 	case "s4-a-renumbered": // tool removed, later block renumbered, stop rewritten
 		aText(w, 0, "Let me look.")

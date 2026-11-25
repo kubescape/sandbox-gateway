@@ -48,12 +48,14 @@ services:
     # PROCESSOR_MODE=--reject-all empties the stub table; run.sh sets it for one check.
     # --evaluator: a test evaluator that denies the model "denied-model" (run.sh checks it).
     # --policies: the policy objects come from policies.yaml, not an API server.
+    # The SDK run sets IT_POLICIES to a file that decrypts both hosts, and
+    # PROCESSOR_EDIT=--remove-first-tool to remove the first tool call of each response.
     command: ["processor-it", "--listen", "unix:///run/kubescape-sandbox/extproc.sock",
               "--evaluator", "--mode=enforce", "--policies", "/etc/it/policies.yaml",
-              "${PROCESSOR_MODE:---posture=allow}"]
+              "${PROCESSOR_MODE:---posture=allow}", "${PROCESSOR_EDIT:---remove-first-tool=false}"]
     volumes:
     - run-gateway:/run/kubescape-sandbox
-    - ./policies.yaml:/etc/it/policies.yaml:ro
+    - ${IT_POLICIES:-./policies.yaml}:/etc/it/policies.yaml:ro
 
   # The image this repo ships. Built so run.sh can check that it will not start without the
   # pinned maps; the stack itself runs processor-it.
@@ -166,6 +168,34 @@ services:
     networks:
       default:
         ipv4_address: 172.30.0.23
+
+  # The SDK run (run.sh with SDK=1): the provider SDKs as it-pod, trusting only the gateway
+  # CA. They call the real host names on port 443; with no redirect here, each client
+  # sends those connections to GATEWAY_ADDR itself (test/sdk), so the URL, SNI and Host
+  # stay the provider's. They run one at a time, so they share it-pod's address.
+  sdk-python:
+    build: { context: ../.., dockerfile: test/sdk/Dockerfile.python }
+    image: sandbox-gateway/sdk-python:${IT_TAG:-it}
+    profiles: [sdk]
+    depends_on: [envoy]
+    environment: { GATEWAY_ADDR: "envoy:18443" }
+    volumes:
+    - certs:/certs:ro
+    networks:
+      default:
+        ipv4_address: 172.30.0.21
+
+  sdk-node:
+    build: { context: ../.., dockerfile: test/sdk/Dockerfile.node }
+    image: sandbox-gateway/sdk-node:${IT_TAG:-it}
+    profiles: [sdk]
+    depends_on: [envoy]
+    environment: { GATEWAY_ADDR: "envoy:18443" }
+    volumes:
+    - certs:/certs:ro
+    networks:
+      default:
+        ipv4_address: 172.30.0.21
 
 networks:
   default:

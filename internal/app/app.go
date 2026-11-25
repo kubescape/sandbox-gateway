@@ -23,6 +23,7 @@ import (
 	"github.com/kubescape/sandbox-gateway/internal/conntable"
 	"github.com/kubescape/sandbox-gateway/internal/extproc"
 	"github.com/kubescape/sandbox-gateway/internal/otlpemit"
+	"github.com/kubescape/sandbox-gateway/internal/renumber"
 	"github.com/kubescape/sandbox-gateway/internal/runutil"
 	"github.com/kubescape/sandbox-gateway/internal/stale"
 	"github.com/kubescape/sandbox-gateway/pkg/plugin"
@@ -45,6 +46,8 @@ type Config struct {
 	HealthSocket string
 	ChunkBudget  time.Duration
 	Faults       extproc.Faults
+	// Remove is extproc.Config.Remove; only test programs set it.
+	Remove       func() renumber.Filter
 	RecordsFile  string // also append records here as JSON lines
 	OTLPEndpoint string
 	DebugAddr    string
@@ -129,12 +132,13 @@ func Run(ctx context.Context, c Config) error {
 		Conns:             c.Conns,
 		Lookup:            c.Lookup,
 		Faults:            c.Faults,
+		Remove:            c.Remove,
 		ChunkBudget:       c.ChunkBudget,
 		Log:               log,
 		Emit: func(r extproc.Record) {
 			log.Info("transaction", "record", r)
 			if otlp != nil {
-				otlp.Add(time.Now(), RecordAttrs(r))
+				otlp.Add(time.Now(), r.C7().Attrs())
 			}
 			if out != nil {
 				mu.Lock()
@@ -208,52 +212,4 @@ func stats(srv *extproc.Server, e plugin.Evaluator) map[string]any {
 		"evaluator": EvaluatorState(e), "stuckEvaluatorCalls": srv.StuckEvaluatorCalls(),
 		"degradedDecisions": srv.DegradedDecisions(),
 	}
-}
-
-// RecordAttrs maps a transaction record onto OTLP attributes. Keys follow the
-// sandbox event schema and OTel semantic conventions where one exists.
-func RecordAttrs(r extproc.Record) map[string]any {
-	a := map[string]any{
-		"http.capture.transaction_id":   r.TransactionID,
-		"http.request.method":           r.Method,
-		"server.address":                r.Authority,
-		"url.path":                      r.Path,
-		"http.response.status_code":     r.Status,
-		"gateway.request_bytes":         r.RequestBytes,
-		"gateway.response_bytes":        r.ResponseBytes,
-		"gateway.sse_events":            r.SSEEvents,
-		"gateway.ended":                 r.Ended,
-		"gateway.reject_reason":         r.RejectReason,
-		"gateway.ppv2_ignored":          r.PPv2Ignored,
-		"gateway.first_chunk_after_ms":  r.FirstChunkAfterMs,
-		"gateway.watchdog_fired":        r.WatchdogFired,
-		"gateway.early_eos":             r.EarlyEOS,
-		"gen_ai.response.finish_reason": r.StopReason,
-	}
-	if id := r.Identity; id != nil {
-		a["namespace"], a["pod"], a["container"] = id.Namespace, id.Pod, id.Container
-		a["controller_kind"], a["controller_name"] = id.ControllerKind, id.ControllerName
-		a["fail_posture"] = id.Posture
-		a["conn_local_addr"], a["conn_local_port"] = id.ConnLocalAddr, int(id.ConnLocalPort)
-		a["orig_dst"] = id.OrigDst
-		a["gateway.binding_id"] = int(id.BindingID)
-		a["gateway.cgroup_id"] = int64(id.CgroupID) //nolint:gosec // an id, carried as is
-		a["gateway.pid"] = int(id.PID)
-		a["gateway.lookup_failing_since"] = id.LookupFailingSince
-		a["gateway.lookup_error"] = id.LookupError
-	}
-	a["gen_ai.system"] = r.Provider
-	a["gen_ai.request.model"] = r.Model
-	a["policy.would_deny"] = r.WouldDeny
-	a["policy.degraded"] = r.Degraded
-	a["gateway.evaluator_error"] = r.EvaluatorError
-	if v := r.Verdict; v != nil {
-		a["policy.rule_id"] = v.Rule
-		a["policy.action"] = v.Action
-		a["policy.mode"] = v.Mode
-		a["policy.uid"] = v.PolicyUID
-		a["policy.revision"] = v.PolicyRevision
-		a["policy.origin"] = v.Origin
-	}
-	return a
 }

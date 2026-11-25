@@ -72,7 +72,8 @@
                     "responseTrailerMode": "SEND"
                   },
                   "requestAttributes": [
-                    "source.address"
+                    "source.address",
+                    "request.protocol"
                   ],
                   "metadataOptions": {
                     "forwardingNamespaces": {
@@ -254,7 +255,8 @@
                     "responseTrailerMode": "SEND"
                   },
                   "requestAttributes": [
-                    "source.address"
+                    "source.address",
+                    "request.protocol"
                   ],
                   "metadataOptions": {
                     "forwardingNamespaces": {
@@ -436,7 +438,8 @@
                     "responseTrailerMode": "SEND"
                   },
                   "requestAttributes": [
-                    "source.address"
+                    "source.address",
+                    "request.protocol"
                   ],
                   "metadataOptions": {
                     "forwardingNamespaces": {
