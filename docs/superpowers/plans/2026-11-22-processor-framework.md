@@ -392,7 +392,7 @@ The fixture binary covers behaviour with stub maps and a static policy source. T
 **Produces:** `record.Record` with one field per C7 attribute and `func (r Record) Attrs() map[string]any`, whose keys are the C7 names verbatim: `crd_uid`, `crd_revision`, `rule`, `origin`, `verdict`, `mode`, `would_deny`, `tier`, `fail_posture`, `provider`, `model`, `destination_state`, `degraded`, `fail_open_window`, `upstream_content_encoding`, `namespace`, `pod`, `container`, `controller_kind`, `controller_name`, `conn_local_addr`, `conn_local_port`, `orig_dst`, `request_position`. Stream counters and timings stay, under a `gateway.` prefix.
 
 - [ ] Write failing tests: `TestAttrsMatchC7` (a full record produces exactly the C7 keys plus `gateway.*`, with `tier` equal to `gateway`); `TestContentEncodingOnlyWhenNotIdentity`; `TestNoBodyBytesInRecord` (a request and response with a marker string: the marker is in no attribute); in `internal/extproc`, `TestOneRecordPerTransaction` for allowed, blocked, rejected and watchdog endings, `TestDegradedMarkedOnRecord`, and `TestFailOpenWindowFromGate`.
-- [ ] Implement. Replace `extproc.Record` and `recordAttrs`; drop the `account` resource attribute and the `egress-gateway-poc` scope name from `internal/otlpemit`. Commit.
+- [ ] Implement. Replace `extproc.Record` and `recordAttrs`; drop the `egress-gateway-poc` scope name from `internal/otlpemit`. Keep the `account` resource attribute: the backend's ingester keys records on it (SUB-9954). (An earlier version of this step dropped it too; corrected 2026-11-25.) Commit.
 
 ### Task 6.3: memory proof
 

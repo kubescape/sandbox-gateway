@@ -103,7 +103,7 @@ func Run(ctx context.Context, c Config) error {
 	}
 	var otlp *otlpemit.Exporter
 	if c.OTLPEndpoint != "" {
-		otlp = otlpemit.New(c.OTLPEndpoint, os.Getenv("NODE_NAME"))
+		otlp = otlpemit.New(c.OTLPEndpoint, os.Getenv("NODE_NAME"), os.Getenv("ACCOUNT_ID"))
 		stop := make(chan struct{})
 		defer close(stop)
 		go otlp.Run(time.Second, stop, func(err error) { log.Warn("otlp export", "error", err) })

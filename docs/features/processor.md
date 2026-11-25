@@ -157,6 +157,8 @@ Its attributes use the C7 names as they are:
 
 Everything else the processor measured goes under `gateway.`: the transaction id, authority, method, path and protocol, status, how the transaction ended, byte and event counts, timings, the reject reason, and the kernel half of the identity.
 
+Each export carries three resource attributes: `service.name` (`sandbox-egress-gateway`), `k8s.node.name` (from `NODE_NAME`) and `account`, the tenant, from `ACCOUNT_ID`. The backend's ingester keys records on `account` (SUB-9954).
+
 ## Flags
 
 | Flag | Default | |

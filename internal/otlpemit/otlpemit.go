@@ -39,13 +39,15 @@ type Exporter struct {
 }
 
 // New returns an exporter for an OTLP/HTTP endpoint (e.g. http://collector:4318).
-func New(endpoint, nodeName string) *Exporter {
+// accountID is the tenant, sent as the "account" resource attribute, which
+// the backend's ingester keys records on (SUB-9954).
+func New(endpoint, nodeName, accountID string) *Exporter {
 	return &Exporter{
 		endpoint: endpoint,
 		client:   &http.Client{Timeout: 5 * time.Second},
 		resource: []*commonv1.KeyValue{
 			kv("service.name", "sandbox-egress-gateway"), kv("schema_version", "0.1"),
-			kv("k8s.node.name", nodeName),
+			kv("k8s.node.name", nodeName), kv("account", accountID),
 		},
 	}
 }
