@@ -1,0 +1,35 @@
+# The passthrough chain: no TLS termination, no certificate. A connection lands here when
+# the pod's policy does not ask to decrypt the name it sent.
+#
+# It goes where the pod was connecting to: the original destination the kernel recorded
+# for the connection, which the original_dst listener filter restored. The SNI is the
+# workload's to choose and is never used to pick the destination; forwarding by it would
+# let a pod reach any host through the gateway.
+#
+# A connection with no recorded destination has nowhere to go: the ORIGINAL_DST cluster
+# refuses it and Envoy resets it. It cannot loop back into the listener.
+name: passthrough
+filters:
+- name: envoy.filters.network.tcp_proxy
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+    stat_prefix: passthrough
+    cluster: {{.PassthroughCluster}}
+    access_log:
+    - name: envoy.access_loggers.stdout
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+        log_format:
+          json_format:
+            kind: passthrough
+            start: "%START_TIME%"
+            sni: "%REQUESTED_SERVER_NAME%"
+            chain: "%FILTER_CHAIN_NAME%"
+            downstream: "%DOWNSTREAM_REMOTE_ADDRESS%"
+            # The restored original destination, or the listener's own address when the
+            # connection had none.
+            orig_dst: "%DOWNSTREAM_LOCAL_ADDRESS%"
+            upstream_host: "%UPSTREAM_HOST%"
+            flags: "%RESPONSE_FLAGS%"
+            bytes_sent: "%BYTES_SENT%"
+            bytes_received: "%BYTES_RECEIVED%"

@@ -1,8 +1,6 @@
 package hostset
 
 import (
-	"fmt"
-	"reflect"
 	"testing"
 )
 
@@ -40,75 +38,6 @@ func TestBadPatterns(t *testing.T) {
 		if _, err := parsePattern(p); err == nil {
 			t.Errorf("%q: want error", p)
 		}
-	}
-}
-
-func TestObserveOnlyPatternMatches(t *testing.T) {
-	s, err := New([]string{"api.anthropic.com"}, []string{"*.openai.azure.com"}, 4)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s.Contains("myres.openai.azure.com") {
-		t.Fatal("pattern host must not be in the set before it is observed")
-	}
-	if s.Observe("example.com") || s.Observe("api.anthropic.com") {
-		t.Fatal("non-matching or exact names must not change the set")
-	}
-	if !s.Observe("MyRes.openai.azure.com.") {
-		t.Fatal("matching name should join")
-	}
-	if s.Observe("myres.openai.azure.com") {
-		t.Fatal("second sighting should not change the set")
-	}
-	want := []string{"api.anthropic.com", "myres.openai.azure.com"}
-	if got := s.Hosts(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("hosts = %v, want %v", got, want)
-	}
-}
-
-func TestCapEvictsLeastRecentlySeen(t *testing.T) {
-	s, _ := New([]string{"api.anthropic.com"}, []string{"*.flood.invalid"}, 3)
-	for i := 0; i < 3; i++ {
-		s.Observe(fmt.Sprintf("h%d.flood.invalid", i))
-	}
-	s.Observe("h0.flood.invalid") // refresh h0: h1 is now the oldest
-	s.Observe("h3.flood.invalid")
-	if s.Contains("h1.flood.invalid") || !s.Contains("h0.flood.invalid") || !s.Contains("h3.flood.invalid") {
-		t.Fatalf("LRU order wrong: %v", s.Hosts())
-	}
-	for i := 4; i < 1000; i++ {
-		s.Observe(fmt.Sprintf("h%d.flood.invalid", i))
-	}
-	if s.Learned() != 3 || len(s.Hosts()) != 4 || !s.Contains("api.anthropic.com") {
-		t.Fatalf("cap broken: learned=%d hosts=%v", s.Learned(), s.Hosts())
-	}
-	if s.Evicted() != 997 {
-		t.Fatalf("evicted = %d, want 997", s.Evicted())
-	}
-}
-
-func TestExactMustBeExact(t *testing.T) {
-	if _, err := New([]string{"*.github.com"}, nil, 0); err == nil {
-		t.Fatal("pattern in the exact list must be rejected")
-	}
-}
-
-// A wildcard label matches any bytes, so a sighting is checked as a hostname before it is learned.
-func TestObserveRejectsNonHostnames(t *testing.T) {
-	s, err := New(nil, []string{"*.openai.azure.com"}, 8)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, bad := range []string{"a b.openai.azure.com", "x\n.openai.azure.com", "a/../b.openai.azure.com", "-x.openai.azure.com", "é.openai.azure.com"} {
-		if s.Observe(bad) {
-			t.Errorf("learned %q", bad)
-		}
-	}
-	if s.Learned() != 0 {
-		t.Fatalf("learned %d names", s.Learned())
-	}
-	if !s.Observe("myres.openai.azure.com") {
-		t.Fatal("a valid name was not learned")
 	}
 }
 

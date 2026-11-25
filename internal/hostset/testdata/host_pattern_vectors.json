@@ -1,0 +1,31 @@
+{
+  "description": "Host pattern width rule. A pattern passes when (1) at most one label carries '*', (2) its last two labels are literal, and (3) a letter or digit stands outside the last two labels (a hyphen alone does not count). A name without '*' always passes. The policy compiler applies the same rule to the same vectors; keep the two files equal.",
+  "vectors": [
+    {"pattern": "api.anthropic.com", "form": "exact", "ok": true, "why": "no wildcard"},
+    {"pattern": "*.openai.azure.com", "form": "leading", "ok": true, "why": "literal label openai outside the last two"},
+    {"pattern": "*.ml.cloud.ibm.com", "form": "leading", "ok": true, "why": "literal labels ml and cloud"},
+    {"pattern": "*.endpoints.huggingface.cloud", "form": "leading", "ok": true, "why": "literal label endpoints"},
+    {"pattern": "*.foo.co.uk", "form": "leading", "ok": true, "why": "known gap: no public-suffix list, foo counts as outside the last two"},
+    {"pattern": "bedrock-runtime.*.amazonaws.com", "form": "mid", "ok": true, "why": "literal label bedrock-runtime"},
+    {"pattern": "runtime.sagemaker.*.amazonaws.com", "form": "mid", "ok": true, "why": "literal labels runtime and sagemaker"},
+    {"pattern": "bedrock-runtime.eu-*.amazonaws.com", "form": "inLabel", "ok": true, "why": "literal label and a literal part of the wildcard label"},
+    {"pattern": "*-aiplatform.googleapis.com", "form": "inLabel", "ok": true, "why": "literal part -aiplatform in the wildcard label"},
+    {"pattern": "eu-*-aiplatform.googleapis.com", "form": "inLabel", "ok": true, "why": "one wildcard label with literal parts"},
+    {"pattern": "*.amazonaws.com", "form": "leading", "ok": false, "why": "rule 3: nothing literal outside the last two labels"},
+    {"pattern": "*.googleapis.com", "form": "leading", "ok": false, "why": "rule 3"},
+    {"pattern": "*.co.uk", "form": "leading", "ok": false, "why": "rule 3"},
+    {"pattern": "*.com", "form": "leading", "ok": false, "why": "rule 2: the wildcard is in the last two labels"},
+    {"pattern": "*", "form": "leading", "ok": false, "why": "match-all is not a pattern"},
+    {"pattern": "*.*.amazonaws.com", "form": "leading", "ok": false, "why": "rule 1: two wildcard labels"},
+    {"pattern": "a.*-b.*.example.com", "form": "mid", "ok": false, "why": "rule 1: two wildcard labels"},
+    {"pattern": "bedrock-runtime.*.*.com", "form": "mid", "ok": false, "why": "rule 1 and rule 2"},
+    {"pattern": "api.*.com", "form": "mid", "ok": false, "why": "rule 2: wildcard in the last two labels"},
+    {"pattern": "*-x.com", "form": "inLabel", "ok": false, "why": "rule 2: wildcard in the last two labels"},
+    {"pattern": "*-*.googleapis.com", "form": "inLabel", "ok": false, "why": "rule 3: a hyphen alone is not a literal part"},
+    {"pattern": "*-.amazonaws.com", "form": "inLabel", "ok": false, "why": "rule 3: a hyphen alone is not a literal part"},
+    {"pattern": "-*.amazonaws.com", "form": "inLabel", "ok": false, "why": "rule 3: a hyphen alone is not a literal part"},
+    {"pattern": "x.*.example.com.", "form": "mid", "ok": false, "why": "syntax: trailing dot"},
+    {"pattern": "Bedrock.*.amazonaws.com", "form": "mid", "ok": false, "why": "syntax: upper case"},
+    {"pattern": "a.b**c.example.com", "form": "inLabel", "ok": false, "why": "syntax: doubled wildcard"}
+  ]
+}

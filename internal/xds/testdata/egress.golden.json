@@ -1,0 +1,740 @@
+{
+  "name": "egress_tls",
+  "address": {
+    "socketAddress": {
+      "address": "0.0.0.0",
+      "portValue": 18443
+    }
+  },
+  "filterChains": [
+    {
+      "filters": [
+        {
+          "name": "envoy.filters.network.http_connection_manager",
+          "typedConfig": {
+            "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+            "statPrefix": "egress_api_anthropic_com",
+            "routeConfig": {
+              "name": "egress_api_anthropic_com",
+              "virtualHosts": [
+                {
+                  "name": "api.anthropic.com",
+                  "domains": [
+                    "api.anthropic.com",
+                    "api.anthropic.com:443"
+                  ],
+                  "routes": [
+                    {
+                      "match": {
+                        "prefix": "/"
+                      },
+                      "route": {
+                        "cluster": "dfp",
+                        "timeout": "0s",
+                        "idleTimeout": "300s"
+                      }
+                    }
+                  ]
+                }
+              ],
+              "responseHeadersToRemove": [
+                "alt-svc"
+              ],
+              "requestHeadersToAdd": [
+                {
+                  "header": {
+                    "key": "accept-encoding",
+                    "value": "identity"
+                  },
+                  "appendAction": "OVERWRITE_IF_EXISTS_OR_ADD"
+                }
+              ],
+              "requestHeadersToRemove": [
+                "x-envoy-external-address"
+              ]
+            },
+            "httpFilters": [
+              {
+                "name": "envoy.filters.http.ext_proc",
+                "typedConfig": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor",
+                  "grpcService": {
+                    "envoyGrpc": {
+                      "clusterName": "ext_proc"
+                    }
+                  },
+                  "processingMode": {
+                    "requestHeaderMode": "SEND",
+                    "responseHeaderMode": "SEND",
+                    "requestBodyMode": "FULL_DUPLEX_STREAMED",
+                    "responseBodyMode": "FULL_DUPLEX_STREAMED",
+                    "requestTrailerMode": "SEND",
+                    "responseTrailerMode": "SEND"
+                  },
+                  "requestAttributes": [
+                    "source.address"
+                  ],
+                  "metadataOptions": {
+                    "forwardingNamespaces": {
+                      "untyped": [
+                        "kubescape.sandbox.attribution"
+                      ]
+                    },
+                    "receivingNamespaces": {
+                      "untyped": [
+                        "kubescape.sandbox.audit"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "name": "envoy.filters.http.dynamic_forward_proxy",
+                "typedConfig": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig",
+                  "dnsCacheConfig": {
+                    "name": "dfp_cache",
+                    "dnsLookupFamily": "V4_ONLY"
+                  }
+                }
+              },
+              {
+                "name": "envoy.filters.http.router",
+                "typedConfig": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
+                }
+              }
+            ],
+            "streamIdleTimeout": "300s",
+            "accessLog": [
+              {
+                "name": "envoy.access_loggers.stdout",
+                "typedConfig": {
+                  "@type": "type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog",
+                  "logFormat": {
+                    "jsonFormat": {
+                      "action": "%DYNAMIC_METADATA(kubescape.sandbox.audit:action)%",
+                      "authority": "%REQ(:AUTHORITY)%",
+                      "chain": "%FILTER_CHAIN_NAME%",
+                      "degraded": "%DYNAMIC_METADATA(kubescape.sandbox.audit:degraded)%",
+                      "downstream": "%DOWNSTREAM_REMOTE_ADDRESS%",
+                      "duration_ms": "%DURATION%",
+                      "early_eos": "%DYNAMIC_METADATA(kubescape.sandbox.audit:early_eos)%",
+                      "fail_posture": "%DYNAMIC_METADATA(kubescape.sandbox.audit:fail_posture)%",
+                      "flags": "%RESPONSE_FLAGS%",
+                      "kind": "access",
+                      "mode": "%DYNAMIC_METADATA(kubescape.sandbox.audit:mode)%",
+                      "model": "%DYNAMIC_METADATA(kubescape.sandbox.audit:model)%",
+                      "namespace": "%DYNAMIC_METADATA(kubescape.sandbox.audit:namespace)%",
+                      "orig_dst": "%DYNAMIC_METADATA(kubescape.sandbox.audit:orig_dst)%",
+                      "path": "%REQ(:PATH)%",
+                      "pod": "%DYNAMIC_METADATA(kubescape.sandbox.audit:pod)%",
+                      "request_id": "%REQ(X-REQUEST-ID)%",
+                      "rule_id": "%DYNAMIC_METADATA(kubescape.sandbox.audit:rule_id)%",
+                      "sni": "%REQUESTED_SERVER_NAME%",
+                      "start": "%START_TIME%",
+                      "status": "%RESPONSE_CODE%",
+                      "stop_reason": "%DYNAMIC_METADATA(kubescape.sandbox.audit:stop_reason)%",
+                      "ttfb_ms": "%RESPONSE_DURATION%",
+                      "upstream_host": "%UPSTREAM_HOST%",
+                      "would_deny": "%DYNAMIC_METADATA(kubescape.sandbox.audit:would_deny)%"
+                    }
+                  }
+                }
+              }
+            ],
+            "useRemoteAddress": true,
+            "skipXffAppend": true,
+            "upgradeConfigs": [
+              {
+                "upgradeType": "websocket"
+              }
+            ]
+          }
+        }
+      ],
+      "transportSocket": {
+        "name": "envoy.transport_sockets.tls",
+        "typedConfig": {
+          "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+          "commonTlsContext": {
+            "tlsCertificateSdsSecretConfigs": [
+              {
+                "name": "api.anthropic.com",
+                "sdsConfig": {
+                  "apiConfigSource": {
+                    "apiType": "DELTA_GRPC",
+                    "transportApiVersion": "V3",
+                    "grpcServices": [
+                      {
+                        "envoyGrpc": {
+                          "clusterName": "xds"
+                        }
+                      }
+                    ]
+                  },
+                  "initialFetchTimeout": "0s",
+                  "resourceApiVersion": "V3"
+                }
+              }
+            ],
+            "alpnProtocols": [
+              "h2",
+              "http/1.1"
+            ]
+          },
+          "disableStatelessSessionResumption": true,
+          "disableStatefulSessionResumption": true
+        }
+      },
+      "name": "decrypt/api.anthropic.com"
+    },
+    {
+      "filters": [
+        {
+          "name": "envoy.filters.network.http_connection_manager",
+          "typedConfig": {
+            "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+            "statPrefix": "egress_api_openai_com",
+            "routeConfig": {
+              "name": "egress_api_openai_com",
+              "virtualHosts": [
+                {
+                  "name": "api.openai.com",
+                  "domains": [
+                    "api.openai.com",
+                    "api.openai.com:443"
+                  ],
+                  "routes": [
+                    {
+                      "match": {
+                        "prefix": "/"
+                      },
+                      "route": {
+                        "cluster": "dfp",
+                        "timeout": "0s",
+                        "idleTimeout": "300s"
+                      }
+                    }
+                  ]
+                }
+              ],
+              "responseHeadersToRemove": [
+                "alt-svc"
+              ],
+              "requestHeadersToAdd": [
+                {
+                  "header": {
+                    "key": "accept-encoding",
+                    "value": "identity"
+                  },
+                  "appendAction": "OVERWRITE_IF_EXISTS_OR_ADD"
+                }
+              ],
+              "requestHeadersToRemove": [
+                "x-envoy-external-address"
+              ]
+            },
+            "httpFilters": [
+              {
+                "name": "envoy.filters.http.ext_proc",
+                "typedConfig": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor",
+                  "grpcService": {
+                    "envoyGrpc": {
+                      "clusterName": "ext_proc"
+                    }
+                  },
+                  "processingMode": {
+                    "requestHeaderMode": "SEND",
+                    "responseHeaderMode": "SEND",
+                    "requestBodyMode": "FULL_DUPLEX_STREAMED",
+                    "responseBodyMode": "FULL_DUPLEX_STREAMED",
+                    "requestTrailerMode": "SEND",
+                    "responseTrailerMode": "SEND"
+                  },
+                  "requestAttributes": [
+                    "source.address"
+                  ],
+                  "metadataOptions": {
+                    "forwardingNamespaces": {
+                      "untyped": [
+                        "kubescape.sandbox.attribution"
+                      ]
+                    },
+                    "receivingNamespaces": {
+                      "untyped": [
+                        "kubescape.sandbox.audit"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "name": "envoy.filters.http.dynamic_forward_proxy",
+                "typedConfig": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig",
+                  "dnsCacheConfig": {
+                    "name": "dfp_cache",
+                    "dnsLookupFamily": "V4_ONLY"
+                  }
+                }
+              },
+              {
+                "name": "envoy.filters.http.router",
+                "typedConfig": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
+                }
+              }
+            ],
+            "streamIdleTimeout": "300s",
+            "accessLog": [
+              {
+                "name": "envoy.access_loggers.stdout",
+                "typedConfig": {
+                  "@type": "type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog",
+                  "logFormat": {
+                    "jsonFormat": {
+                      "action": "%DYNAMIC_METADATA(kubescape.sandbox.audit:action)%",
+                      "authority": "%REQ(:AUTHORITY)%",
+                      "chain": "%FILTER_CHAIN_NAME%",
+                      "degraded": "%DYNAMIC_METADATA(kubescape.sandbox.audit:degraded)%",
+                      "downstream": "%DOWNSTREAM_REMOTE_ADDRESS%",
+                      "duration_ms": "%DURATION%",
+                      "early_eos": "%DYNAMIC_METADATA(kubescape.sandbox.audit:early_eos)%",
+                      "fail_posture": "%DYNAMIC_METADATA(kubescape.sandbox.audit:fail_posture)%",
+                      "flags": "%RESPONSE_FLAGS%",
+                      "kind": "access",
+                      "mode": "%DYNAMIC_METADATA(kubescape.sandbox.audit:mode)%",
+                      "model": "%DYNAMIC_METADATA(kubescape.sandbox.audit:model)%",
+                      "namespace": "%DYNAMIC_METADATA(kubescape.sandbox.audit:namespace)%",
+                      "orig_dst": "%DYNAMIC_METADATA(kubescape.sandbox.audit:orig_dst)%",
+                      "path": "%REQ(:PATH)%",
+                      "pod": "%DYNAMIC_METADATA(kubescape.sandbox.audit:pod)%",
+                      "request_id": "%REQ(X-REQUEST-ID)%",
+                      "rule_id": "%DYNAMIC_METADATA(kubescape.sandbox.audit:rule_id)%",
+                      "sni": "%REQUESTED_SERVER_NAME%",
+                      "start": "%START_TIME%",
+                      "status": "%RESPONSE_CODE%",
+                      "stop_reason": "%DYNAMIC_METADATA(kubescape.sandbox.audit:stop_reason)%",
+                      "ttfb_ms": "%RESPONSE_DURATION%",
+                      "upstream_host": "%UPSTREAM_HOST%",
+                      "would_deny": "%DYNAMIC_METADATA(kubescape.sandbox.audit:would_deny)%"
+                    }
+                  }
+                }
+              }
+            ],
+            "useRemoteAddress": true,
+            "skipXffAppend": true,
+            "upgradeConfigs": [
+              {
+                "upgradeType": "websocket"
+              }
+            ]
+          }
+        }
+      ],
+      "transportSocket": {
+        "name": "envoy.transport_sockets.tls",
+        "typedConfig": {
+          "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+          "commonTlsContext": {
+            "tlsCertificateSdsSecretConfigs": [
+              {
+                "name": "api.openai.com",
+                "sdsConfig": {
+                  "apiConfigSource": {
+                    "apiType": "DELTA_GRPC",
+                    "transportApiVersion": "V3",
+                    "grpcServices": [
+                      {
+                        "envoyGrpc": {
+                          "clusterName": "xds"
+                        }
+                      }
+                    ]
+                  },
+                  "initialFetchTimeout": "0s",
+                  "resourceApiVersion": "V3"
+                }
+              }
+            ],
+            "alpnProtocols": [
+              "h2",
+              "http/1.1"
+            ]
+          },
+          "disableStatelessSessionResumption": true,
+          "disableStatefulSessionResumption": true
+        }
+      },
+      "name": "decrypt/api.openai.com"
+    },
+    {
+      "filters": [
+        {
+          "name": "envoy.filters.network.http_connection_manager",
+          "typedConfig": {
+            "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+            "statPrefix": "egress_myres_openai_azure_com",
+            "routeConfig": {
+              "name": "egress_myres_openai_azure_com",
+              "virtualHosts": [
+                {
+                  "name": "myres.openai.azure.com",
+                  "domains": [
+                    "myres.openai.azure.com",
+                    "myres.openai.azure.com:443"
+                  ],
+                  "routes": [
+                    {
+                      "match": {
+                        "prefix": "/"
+                      },
+                      "route": {
+                        "cluster": "dfp",
+                        "timeout": "0s",
+                        "idleTimeout": "300s"
+                      }
+                    }
+                  ]
+                }
+              ],
+              "responseHeadersToRemove": [
+                "alt-svc"
+              ],
+              "requestHeadersToAdd": [
+                {
+                  "header": {
+                    "key": "accept-encoding",
+                    "value": "identity"
+                  },
+                  "appendAction": "OVERWRITE_IF_EXISTS_OR_ADD"
+                }
+              ],
+              "requestHeadersToRemove": [
+                "x-envoy-external-address"
+              ]
+            },
+            "httpFilters": [
+              {
+                "name": "envoy.filters.http.ext_proc",
+                "typedConfig": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor",
+                  "grpcService": {
+                    "envoyGrpc": {
+                      "clusterName": "ext_proc"
+                    }
+                  },
+                  "processingMode": {
+                    "requestHeaderMode": "SEND",
+                    "responseHeaderMode": "SEND",
+                    "requestBodyMode": "FULL_DUPLEX_STREAMED",
+                    "responseBodyMode": "FULL_DUPLEX_STREAMED",
+                    "requestTrailerMode": "SEND",
+                    "responseTrailerMode": "SEND"
+                  },
+                  "requestAttributes": [
+                    "source.address"
+                  ],
+                  "metadataOptions": {
+                    "forwardingNamespaces": {
+                      "untyped": [
+                        "kubescape.sandbox.attribution"
+                      ]
+                    },
+                    "receivingNamespaces": {
+                      "untyped": [
+                        "kubescape.sandbox.audit"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "name": "envoy.filters.http.dynamic_forward_proxy",
+                "typedConfig": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig",
+                  "dnsCacheConfig": {
+                    "name": "dfp_cache",
+                    "dnsLookupFamily": "V4_ONLY"
+                  }
+                }
+              },
+              {
+                "name": "envoy.filters.http.router",
+                "typedConfig": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
+                }
+              }
+            ],
+            "streamIdleTimeout": "300s",
+            "accessLog": [
+              {
+                "name": "envoy.access_loggers.stdout",
+                "typedConfig": {
+                  "@type": "type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog",
+                  "logFormat": {
+                    "jsonFormat": {
+                      "action": "%DYNAMIC_METADATA(kubescape.sandbox.audit:action)%",
+                      "authority": "%REQ(:AUTHORITY)%",
+                      "chain": "%FILTER_CHAIN_NAME%",
+                      "degraded": "%DYNAMIC_METADATA(kubescape.sandbox.audit:degraded)%",
+                      "downstream": "%DOWNSTREAM_REMOTE_ADDRESS%",
+                      "duration_ms": "%DURATION%",
+                      "early_eos": "%DYNAMIC_METADATA(kubescape.sandbox.audit:early_eos)%",
+                      "fail_posture": "%DYNAMIC_METADATA(kubescape.sandbox.audit:fail_posture)%",
+                      "flags": "%RESPONSE_FLAGS%",
+                      "kind": "access",
+                      "mode": "%DYNAMIC_METADATA(kubescape.sandbox.audit:mode)%",
+                      "model": "%DYNAMIC_METADATA(kubescape.sandbox.audit:model)%",
+                      "namespace": "%DYNAMIC_METADATA(kubescape.sandbox.audit:namespace)%",
+                      "orig_dst": "%DYNAMIC_METADATA(kubescape.sandbox.audit:orig_dst)%",
+                      "path": "%REQ(:PATH)%",
+                      "pod": "%DYNAMIC_METADATA(kubescape.sandbox.audit:pod)%",
+                      "request_id": "%REQ(X-REQUEST-ID)%",
+                      "rule_id": "%DYNAMIC_METADATA(kubescape.sandbox.audit:rule_id)%",
+                      "sni": "%REQUESTED_SERVER_NAME%",
+                      "start": "%START_TIME%",
+                      "status": "%RESPONSE_CODE%",
+                      "stop_reason": "%DYNAMIC_METADATA(kubescape.sandbox.audit:stop_reason)%",
+                      "ttfb_ms": "%RESPONSE_DURATION%",
+                      "upstream_host": "%UPSTREAM_HOST%",
+                      "would_deny": "%DYNAMIC_METADATA(kubescape.sandbox.audit:would_deny)%"
+                    }
+                  }
+                }
+              }
+            ],
+            "useRemoteAddress": true,
+            "skipXffAppend": true,
+            "upgradeConfigs": [
+              {
+                "upgradeType": "websocket"
+              }
+            ]
+          }
+        }
+      ],
+      "transportSocket": {
+        "name": "envoy.transport_sockets.tls",
+        "typedConfig": {
+          "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+          "commonTlsContext": {
+            "tlsCertificateSdsSecretConfigs": [
+              {
+                "name": "myres.openai.azure.com",
+                "sdsConfig": {
+                  "apiConfigSource": {
+                    "apiType": "DELTA_GRPC",
+                    "transportApiVersion": "V3",
+                    "grpcServices": [
+                      {
+                        "envoyGrpc": {
+                          "clusterName": "xds"
+                        }
+                      }
+                    ]
+                  },
+                  "initialFetchTimeout": "0s",
+                  "resourceApiVersion": "V3"
+                }
+              }
+            ],
+            "alpnProtocols": [
+              "h2",
+              "http/1.1"
+            ]
+          },
+          "disableStatelessSessionResumption": true,
+          "disableStatefulSessionResumption": true
+        }
+      },
+      "name": "decrypt/myres.openai.azure.com"
+    },
+    {
+      "filters": [
+        {
+          "name": "envoy.filters.network.tcp_proxy",
+          "typedConfig": {
+            "@type": "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy",
+            "statPrefix": "passthrough",
+            "cluster": "orig_dst",
+            "accessLog": [
+              {
+                "name": "envoy.access_loggers.stdout",
+                "typedConfig": {
+                  "@type": "type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog",
+                  "logFormat": {
+                    "jsonFormat": {
+                      "bytes_received": "%BYTES_RECEIVED%",
+                      "bytes_sent": "%BYTES_SENT%",
+                      "chain": "%FILTER_CHAIN_NAME%",
+                      "downstream": "%DOWNSTREAM_REMOTE_ADDRESS%",
+                      "flags": "%RESPONSE_FLAGS%",
+                      "kind": "passthrough",
+                      "orig_dst": "%DOWNSTREAM_LOCAL_ADDRESS%",
+                      "sni": "%REQUESTED_SERVER_NAME%",
+                      "start": "%START_TIME%",
+                      "upstream_host": "%UPSTREAM_HOST%"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "name": "passthrough"
+    }
+  ],
+  "filterChainMatcher": {
+    "matcherTree": {
+      "input": {
+        "name": "source-ip",
+        "typedConfig": {
+          "@type": "type.googleapis.com/envoy.extensions.matching.common_inputs.network.v3.SourceIPInput"
+        }
+      },
+      "exactMatchMap": {
+        "map": {
+          "10.0.0.1": {
+            "matcher": {
+              "matcherTree": {
+                "input": {
+                  "name": "sni",
+                  "typedConfig": {
+                    "@type": "type.googleapis.com/envoy.extensions.matching.common_inputs.network.v3.ServerNameInput"
+                  }
+                },
+                "exactMatchMap": {
+                  "map": {
+                    "api.anthropic.com": {
+                      "action": {
+                        "name": "chain",
+                        "typedConfig": {
+                          "@type": "type.googleapis.com/google.protobuf.StringValue",
+                          "value": "decrypt/api.anthropic.com"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "onNoMatch": {
+                "action": {
+                  "name": "chain",
+                  "typedConfig": {
+                    "@type": "type.googleapis.com/google.protobuf.StringValue",
+                    "value": "passthrough"
+                  }
+                }
+              }
+            }
+          },
+          "10.0.0.2": {
+            "matcher": {
+              "matcherTree": {
+                "input": {
+                  "name": "sni",
+                  "typedConfig": {
+                    "@type": "type.googleapis.com/envoy.extensions.matching.common_inputs.network.v3.ServerNameInput"
+                  }
+                },
+                "exactMatchMap": {
+                  "map": {
+                    "api.openai.com": {
+                      "action": {
+                        "name": "chain",
+                        "typedConfig": {
+                          "@type": "type.googleapis.com/google.protobuf.StringValue",
+                          "value": "decrypt/api.openai.com"
+                        }
+                      }
+                    },
+                    "myres.openai.azure.com": {
+                      "action": {
+                        "name": "chain",
+                        "typedConfig": {
+                          "@type": "type.googleapis.com/google.protobuf.StringValue",
+                          "value": "decrypt/myres.openai.azure.com"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "onNoMatch": {
+                "action": {
+                  "name": "chain",
+                  "typedConfig": {
+                    "@type": "type.googleapis.com/google.protobuf.StringValue",
+                    "value": "passthrough"
+                  }
+                }
+              }
+            }
+          },
+          "10.0.0.3": {
+            "action": {
+              "name": "chain",
+              "typedConfig": {
+                "@type": "type.googleapis.com/google.protobuf.StringValue",
+                "value": "passthrough"
+              }
+            }
+          },
+          "fd00::1": {
+            "matcher": {
+              "matcherTree": {
+                "input": {
+                  "name": "sni",
+                  "typedConfig": {
+                    "@type": "type.googleapis.com/envoy.extensions.matching.common_inputs.network.v3.ServerNameInput"
+                  }
+                },
+                "exactMatchMap": {
+                  "map": {
+                    "api.anthropic.com": {
+                      "action": {
+                        "name": "chain",
+                        "typedConfig": {
+                          "@type": "type.googleapis.com/google.protobuf.StringValue",
+                          "value": "decrypt/api.anthropic.com"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "onNoMatch": {
+                "action": {
+                  "name": "chain",
+                  "typedConfig": {
+                    "@type": "type.googleapis.com/google.protobuf.StringValue",
+                    "value": "passthrough"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "listenerFilters": [
+    {
+      "name": "envoy.filters.listener.original_dst",
+      "typedConfig": {
+        "@type": "type.googleapis.com/envoy.extensions.filters.listener.original_dst.v3.OriginalDst"
+      }
+    },
+    {
+      "name": "envoy.filters.listener.tls_inspector",
+      "typedConfig": {
+        "@type": "type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector"
+      }
+    }
+  ]
+}
